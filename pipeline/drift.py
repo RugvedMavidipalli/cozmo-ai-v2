@@ -103,21 +103,98 @@ def sample_world_points(
     return np.vstack(chunks), np.concatenate(times)
 
 
+def refit_wall_offsets(
+    walls: list[WallSegment],
+    frame: HorizontalFrame,
+    points: np.ndarray,
+    times: np.ndarray,
+    band: float = 0.04,
+    visit_gap: float = 3.0,
+    min_points_per_visit: int = 250,
+    corner_margin: float = 0.15,
+) -> int:
+    """Re-place each wall at the median of its per-visit offsets.
+
+    A pooled fit puts the wall at the point-weighted centre of all its
+    observations, so the visit that lingered longest -- not the one that
+    measured best -- decides where the wall is.  Drift between visits then
+    becomes position error in proportion to how unevenly they were sampled.
+    Taking the median *per visit* first, and the median of those, gives every
+    visit one vote: with three or more visits an outlying pass (a grazing
+    sweep, a motion-blurred turn) stops moving the wall at all.
+
+    Mutates offsets and shifts endpoints along the wall normal; orientation is
+    left alone, because a single visit rarely constrains angle and the
+    Manhattan snap already owns it.  Returns how many walls were refitted.
+    """
+    plan = frame.to_plan(points)
+    refitted = 0
+
+    for wall in walls:
+        distance = plan @ wall.normal - wall.offset
+        along = (plan - wall.start) @ wall.direction
+        near = (
+            (np.abs(distance) < band)
+            & (along > corner_margin)
+            & (along < wall.length - corner_margin)
+        )
+        if near.sum() < min_points_per_visit:
+            continue
+
+        wall_times = times[near]
+        offsets_raw = (plan[near] @ wall.normal)
+        order = np.argsort(wall_times)
+        wall_times, offsets_raw = wall_times[order], offsets_raw[order]
+
+        boundaries = np.flatnonzero(np.diff(wall_times) > visit_gap)
+        starts = np.concatenate([[0], boundaries + 1])
+        ends = np.concatenate([boundaries + 1, [len(wall_times)]])
+
+        visit_offsets = [
+            float(np.median(offsets_raw[s:e]))
+            for s, e in zip(starts, ends)
+            if e - s >= min_points_per_visit
+        ]
+        if not visit_offsets:
+            continue
+
+        new_offset = float(np.median(visit_offsets))
+        shift = new_offset - wall.offset
+        if abs(shift) > band:  # re-association failed; don't teleport the wall
+            continue
+        wall.offset = new_offset
+        wall.start = wall.start + wall.normal * shift
+        wall.end = wall.end + wall.normal * shift
+        refitted += 1
+    return refitted
+
+
 def measure_drift(
     walls: list[WallSegment],
     frame: HorizontalFrame,
     points: np.ndarray,
     times: np.ndarray,
-    band: float = 0.06,
+    band: float = 0.04,
     visit_gap: float = 3.0,
     min_points_per_visit: int = 250,
     min_length: float = 1.5,
+    corner_margin: float = 0.15,
 ) -> DriftMeasurement:
     """Per-visit plane offsets for every wall seen more than once.
 
     A "visit" is a run of observations separated from the next by more than
     `visit_gap` seconds -- the operator sweeping past a wall, leaving, and
     coming back later.  Comparing visits isolates drift accumulated in between.
+
+    Two association guards keep the estimator honest about what is now known
+    to sit near a wall.  The band stays inside the clutter standoff:
+    suppressed parallel surfaces (trim, cabinet fronts) start at ~6 cm by
+    construction of `merge_collinear`, and a wider band drifts onto that slab
+    the moment a refit shifts the wall a centimetre toward it.  And
+    `corner_margin` excludes the junction zones at both ends, where the
+    perpendicular wall's own points fall inside any band.  Visit offsets are
+    medians, not means, for the same reason: a contaminated tail should not
+    move the estimate.
     """
     plan = frame.to_plan(points)
     visits: list[WallVisit] = []
@@ -131,7 +208,9 @@ def measure_drift(
         distance = np.abs(plan @ wall.normal - wall.offset)
         along = (plan - wall.start) @ wall.direction
         nearby = (
-            (distance < band) & (along > -0.1) & (along < wall.length + 0.1)
+            (distance < band)
+            & (along > corner_margin)
+            & (along < wall.length - corner_margin)
         )
         if nearby.sum() < min_points_per_visit * 2:
             continue
@@ -154,7 +233,7 @@ def measure_drift(
             # Refit only the offset, holding orientation fixed: a single visit
             # may see too short a span to constrain the angle, and the shared
             # orientation is what makes the offsets comparable.
-            offsets.append(float((wall_plan[start:end] @ wall.normal).mean()))
+            offsets.append(float(np.median(wall_plan[start:end] @ wall.normal)))
             visit_times.append(float(wall_times[start:end].mean()))
             counts.append(int(end - start))
 

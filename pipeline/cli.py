@@ -14,7 +14,7 @@ from . import export
 from .damage import fusion as damage_fusion
 from .damage.masks import refine
 from .damage.vlm import DamageAnalyzer
-from .drift import measure_drift, sample_world_points
+from .drift import measure_drift, refit_wall_offsets, sample_world_points
 from .fuse import fuse
 from .geometry import estimate_gravity
 from .ingest import load_capture, iter_frames
@@ -24,6 +24,8 @@ from .planes import (
     estimate_horizontal_frame,
     extract_walls,
     merge_collinear,
+    resolve_crossings,
+    snap_corners,
     snap_to_frame,
     wall_band_mask,
 )
@@ -111,6 +113,26 @@ def run(args: argparse.Namespace) -> int:
     if gravity.room_height is None:
         warnings.append("no ceiling plane found; heights are unavailable")
 
+    with timings.stage("wall refinement"):
+        # One time-tagged sampling serves the per-visit offset refit and the
+        # drift measurement. Drift is measured BEFORE extents change: crossing
+        # resolution and corner snapping move endpoints, never offsets, so
+        # they cannot alter a wall's true visit spread -- they only shrink
+        # the association windows and starve the estimator.
+        sampled, times = sample_world_points(
+            bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses,
+            max_depth=args.max_depth,
+        )
+        refitted = refit_wall_offsets(walls, frame, sampled, times)
+        drift = measure_drift(walls, frame, sampled, times)
+        walls = resolve_crossings(walls)
+        corners = snap_corners(walls)
+    print(
+        f"  {refitted} offsets refitted by visit, {len(walls)} walls after "
+        f"crossing resolution, {corners} endpoints snapped to corners"
+    )
+    print(f"  drift: {drift.summary()}")
+
     with timings.stage("rooms"):
         grid = build_plan_grid(
             points, frame, gravity.floor_height, ceiling,
@@ -132,13 +154,6 @@ def run(args: argparse.Namespace) -> int:
             surface_grids[wall.index] = surface
             openings.extend(find_openings(surface))
     print(f"  {len(openings)} openings")
-
-    with timings.stage("drift"):
-        sampled, times = sample_world_points(
-            bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses
-        )
-        drift = measure_drift(walls, frame, sampled, times)
-    print(f"  {drift.summary()}")
 
     regions = []
     if not args.no_damage:

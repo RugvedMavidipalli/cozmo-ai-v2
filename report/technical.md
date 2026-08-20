@@ -113,6 +113,44 @@ clips every candidate to the same height band before RANSAC runs, so it
 saturates at the band limits for walls and countertops alike. It is documented
 as unusable rather than quietly relied on.
 
+### 3.0b Precision refinement: visits, crossings, corners
+
+Three refinements close the gap between "a plane was fitted" and "a wall was
+measured", each owning one error source: ✅
+
+**Offsets are re-placed at the median of per-visit offsets.** A pooled fit puts
+the wall at the point-weighted centre of its observations, so the visit that
+*lingered longest* — not the one that measured best — decides where the wall is.
+Giving each visit one vote (median of visit medians) makes an outlying pass stop
+moving the wall entirely. Measured on identical wall populations, this cut
+median drift 11.8 → 9.9 mm on recordings-1 and put both captures under the 2 cm
+wall gate's error budget (recordings-2: 10.3 mm).
+
+**Impossible crossings are resolved.** Walls cannot pass through each other, and
+an interior–interior intersection has exactly two causes, separable by geometry:
+a T-junction overshoot (one wall's collinear inliers continue into the next
+room; the short overhang is trimmed back to the junction) and clutter cutting a
+wall (a stair rail or counter edge crossing near a wall's middle at a shallow
+angle — neither overhang is short, so the weaker surface is dropped).
+recordings-1 had 13 such crossings; it now has 0.
+
+**Endpoints snap to corner intersections.** An extent taken from observed points
+stops where the last inlier fell; the corner where two fitted lines intersect is
+where a tape measure is hooked. Only after this step do emitted lengths mean
+what the interval model already assumed. Median endpoint-to-corner gap went
+22.5 cm → 0.0 cm, with 41 of 72 endpoints snapped exactly; the rest are free
+ends at scan boundaries and stay covered by the inferred-span machinery.
+
+A measurement lesson worth keeping: the first version of this change appeared to
+*worsen* drift by 2.5×. The estimator was contaminated, not the geometry — visit
+offsets used means inside a ±6 cm band, and suppressed clutter sits at exactly
+~6 cm by construction, so the moment a refit legitimately moved a wall a
+centimetre toward its cluttered side, the band edge slid onto the clutter slab.
+Medians, a ±4 cm band inside the clutter standoff, and 15 cm corner-exclusion
+zones fixed the estimator; drift is also measured *before* extent edits, because
+trimming and snapping move endpoints, never offsets — they can only starve the
+association windows, not change a wall's true visit spread.
+
 ### 3.1 Why walls are fitted in 2D
 
 Once gravity is known, a vertical surface has **one** free orientation and

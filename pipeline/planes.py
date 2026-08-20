@@ -426,6 +426,171 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
     target.tags = sorted(set(target.tags) | set(other.tags))
 
 
+def _segment_intersection(
+    a: WallSegment, b: WallSegment
+) -> tuple[np.ndarray, float, float] | None:
+    """Intersection of the two walls' infinite lines, with along-coordinates.
+
+    Returns (point, u_a, u_b) where u_x is the along-wall coordinate of the
+    point on wall x (0 at start), or None for near-parallel lines.
+    """
+    da, db = a.direction, b.direction
+    denominator = da[0] * db[1] - da[1] * db[0]
+    if abs(denominator) < 0.15:  # < ~9 deg apart: no meaningful corner
+        return None
+    delta = b.start - a.start
+    u_a = (delta[0] * db[1] - delta[1] * db[0]) / denominator
+    point = a.start + da * u_a
+    u_b = float((point - b.start) @ db)
+    return point, float(u_a), u_b
+
+
+def resolve_crossings(
+    walls: list[WallSegment],
+    interior_margin: float = 0.15,
+    max_trim: float = 0.45,
+) -> list[WallSegment]:
+    """Enforce the one physical constraint the fitter cannot see: walls do not
+    pass through each other.
+
+    An interior-interior intersection has exactly two causes, distinguishable
+    by geometry:
+
+    * **T-junction overshoot** -- both surfaces are real, but one wall's
+      extent ran a few decimetres past the junction (its collinear inliers
+      continue on the far side, in the next room).  The overhang past the
+      crossing is short: trim it back to the junction.
+    * **Clutter cutting a wall** -- a stair rail, counter edge or furniture
+      diagonal fitted as a wall slices through a genuine wall near its middle,
+      typically at a shallow angle.  Neither overhang is short, so trimming
+      cannot fix it; the surface with weaker support is not a wall.  Drop it.
+
+    Deletion cascades correctly on families of mutually-crossing clutter
+    because survivors are re-checked against every remaining wall.
+    """
+    walls = list(walls)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(walls)):
+            for j in range(i + 1, len(walls)):
+                a, b = walls[i], walls[j]
+                hit = _segment_intersection(a, b)
+                if hit is None:
+                    continue
+                point, u_a, u_b = hit
+                interior_a = interior_margin < u_a < a.length - interior_margin
+                interior_b = interior_margin < u_b < b.length - interior_margin
+                if not (interior_a and interior_b):
+                    continue
+
+                overhang_a = min(u_a, a.length - u_a)
+                overhang_b = min(u_b, b.length - u_b)
+                if min(overhang_a, overhang_b) <= max_trim:
+                    victim = a if overhang_a <= overhang_b else b
+                    u = u_a if victim is a else u_b
+                    if u < victim.length - u:
+                        victim.start = point.copy()
+                        victim.observed_span = (
+                            max(0.0, victim.observed_span[0] - u),
+                            max(0.0, victim.observed_span[1] - u),
+                        )
+                    else:
+                        victim.end = point.copy()
+                        victim.observed_span = (
+                            min(victim.observed_span[0], victim.length),
+                            min(victim.observed_span[1], victim.length),
+                        )
+                    victim.tags.append("trimmed-at-junction")
+                else:
+                    weaker = a if a.inlier_count < b.inlier_count else b
+                    walls.remove(weaker)
+                changed = True
+                break
+            if changed:
+                break
+
+    # Indices are deliberately left alone: they are identities that per-wall
+    # drift measurements and surface grids are keyed by, not positions.
+    for wall in walls:
+        wall.tags = sorted(set(wall.tags))
+    return walls
+
+
+def snap_corners(
+    walls: list[WallSegment],
+    max_extension: float = 0.45,
+    max_trim: float = 0.30,
+) -> int:
+    """Move wall endpoints onto the intersections of their wall lines.
+
+    An extent taken from observed points stops where the last inlier fell --
+    short of the corner when the scan never reached it, past the corner when
+    collinear surface continued beyond.  The corner, where two fitted lines
+    intersect, is where a tape measure is hooked; only after this step do the
+    emitted lengths mean what the wall-length interval model already assumes
+    (a difference of two plane intersections).
+
+    Each endpoint adopts the candidate corner needing the smallest adjustment,
+    provided the intersection also lies on or near the partner wall -- a line
+    crossing three metres away is geometry, not a corner.  Endpoints with no
+    candidate keep their observed extent, and remain covered by the
+    occupancy/inferred machinery.  Returns the number of endpoints snapped.
+    """
+    proposals: list[tuple[float, int, str, np.ndarray]] = []
+    for i, wall in enumerate(walls):
+        for other in walls:
+            if other is wall:
+                continue
+            hit = _segment_intersection(wall, other)
+            if hit is None:
+                continue
+            point, u_self, u_other = hit
+            # The corner must lie on (or just beyond) the partner too.
+            if not (-max_extension <= u_other <= other.length + max_extension):
+                continue
+            for end_name, adjustment in (
+                ("start", -u_self),
+                ("end", u_self - wall.length),
+            ):
+                # Positive adjustment extends the wall, negative trims it.
+                if -max_trim <= adjustment <= max_extension:
+                    proposals.append((abs(adjustment), i, end_name, point))
+
+    proposals.sort(key=lambda entry: entry[0])
+    taken: set[tuple[int, str]] = set()
+    snapped = 0
+    for _, index, end_name, point in proposals:
+        key = (index, end_name)
+        if key in taken:
+            continue
+        wall = walls[index]
+        remaining = (
+            float(np.linalg.norm(wall.end - point))
+            if end_name == "start"
+            else float(np.linalg.norm(point - wall.start))
+        )
+        if remaining < 0.3:  # would collapse the wall onto its neighbour
+            continue
+        taken.add(key)
+        if end_name == "start":
+            shift = float(wall.along(point[None])[0])
+            wall.start = point.copy()
+            wall.observed_span = (
+                max(0.0, wall.observed_span[0] - shift),
+                max(0.0, wall.observed_span[1] - shift),
+            )
+        else:
+            wall.end = point.copy()
+            wall.observed_span = (
+                min(wall.observed_span[0], wall.length),
+                min(wall.observed_span[1], wall.length),
+            )
+        wall.tags = sorted(set(wall.tags) | {f"corner-{end_name}"})
+        snapped += 1
+    return snapped
+
+
 def snap_to_frame(
     walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 6.0
 ) -> list[WallSegment]:

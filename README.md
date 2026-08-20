@@ -95,7 +95,13 @@ pools every point across the wall's full height into one fit.
 
 **Wall length comes from corners, not from observed extent.** Furniture,
 doorways and grazing dropout all truncate what the sensor sees; the intersection
-of two wall planes is where a tape measure would go.
+of two wall planes is where a tape measure would go. `snap_corners` moves
+endpoints onto those intersections (median endpoint-to-corner gap on
+recordings-1: 22.5 cm → 0.0 cm), `resolve_crossings` enforces the one physical
+constraint the fitter cannot see — walls do not pass through each other — and
+each wall's offset is re-placed at the median of its per-visit offsets so the
+visit that lingered longest does not decide where the wall is. Result: drift
+median 9.9 mm (rec-1) / 10.3 mm (rec-2), inside the 2 cm gate's budget.
 
 **Drift is measured by revisit spread, not by point scatter.** RMS scatter about
 a fitted wall is mostly depth noise, and a plane fit averages it away — it is
