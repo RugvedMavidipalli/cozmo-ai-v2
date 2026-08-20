@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cozmo capture result",
+  "description": "Per-capture output: metric reconstruction, damage intelligence, and scope of work. Every measurement carries a confidence interval; every scope quantity carries the rule and source it came from.",
+  "type": "object",
+  "required": ["capture", "reconstruction", "rooms", "damage", "scope", "diagnostics"],
+  "properties": {
+    "capture": {
+      "type": "object",
+      "required": ["name", "modality", "frame_count"],
+      "properties": {
+        "name": { "type": "string" },
+        "modality": {
+          "type": "string",
+          "enum": ["lidar", "video_only"],
+          "description": "video_only captures run the estimated-depth fallback and carry wider intervals."
+        },
+        "frame_count": { "type": "integer" },
+        "duration_s": { "type": "number" },
+        "path_length_m": { "type": "number" }
+      }
+    },
+    "reconstruction": {
+      "type": "object",
+      "required": ["up_axis", "floor_height", "walls"],
+      "properties": {
+        "up_axis": { "$ref": "#/$defs/vector3" },
+        "gravity_consistency": { "type": "number" },
+        "floor_height": { "type": "number" },
+        "ceiling_height": { "type": ["number", "null"] },
+        "manhattan_yaw_deg": { "type": "number" },
+        "manhattan_fraction": { "type": "number" },
+        "walls": { "type": "array", "items": { "$ref": "#/$defs/wall" } },
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening" } }
+      }
+    },
+    "rooms": { "type": "array", "items": { "$ref": "#/$defs/room" } },
+    "adjacency": {
+      "type": "array",
+      "description": "Room connectivity graph; pairs of room ids sharing a wall or doorway.",
+      "items": {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {
+          "a": { "type": "integer" },
+          "b": { "type": "integer" },
+          "via": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "damage": { "type": "array", "items": { "$ref": "#/$defs/damage_region" } },
+    "concealed": { "type": "array", "items": { "$ref": "#/$defs/concealed_flag" } },
+    "scope": {
+      "type": "object",
+      "required": ["line_items"],
+      "properties": {
+        "line_items": { "type": "array", "items": { "$ref": "#/$defs/line_item" } },
+        "rules_version": { "type": ["integer", "string"] }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "description": "Stage timings and the error budget the report is built from.",
+      "properties": {
+        "timings_s": { "type": "object", "additionalProperties": { "type": "number" } },
+        "drift": {
+          "type": "object",
+          "properties": {
+            "median_mm": { "type": "number" },
+            "p90_mm": { "type": "number" },
+            "max_mm": { "type": "number" },
+            "revisited_walls": { "type": "integer" }
+          }
+        },
+        "calibration": {
+          "type": "object",
+          "properties": {
+            "calibrated": { "type": "boolean" },
+            "scale": { "type": "number" },
+            "coverage_target": { "type": "number" }
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "point2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "measurement": {
+      "type": "object",
+      "description": "A value with a calibrated confidence interval.",
+      "required": ["value", "ci_low", "ci_high", "coverage"],
+      "properties": {
+        "value": { "type": "number" },
+        "ci_low": { "type": "number" },
+        "ci_high": { "type": "number" },
+        "half_width": { "type": "number" },
+        "coverage": { "type": "number" },
+        "basis": { "type": "string", "description": "How the interval was derived." }
+      }
+    },
+    "wall": {
+      "type": "object",
+      "required": ["id", "name", "length", "start", "end"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string", "description": "Stable surface reference, e.g. room_1.north_wall." },
+        "room_id": { "type": ["integer", "null"] },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length": { "$ref": "#/$defs/measurement" },
+        "height": { "$ref": "#/$defs/measurement" },
+        "inferred_fraction": {
+          "type": "number",
+          "description": "Share of the wall reconstructed behind furniture rather than directly observed."
+        },
+        "occluded_spans": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "residual_rms_mm": { "type": "number" },
+        "support_points": { "type": "integer" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "opening": {
+      "type": "object",
+      "required": ["wall", "kind", "width"],
+      "properties": {
+        "wall": { "type": "string" },
+        "kind": { "type": "string", "enum": ["door", "window", "pass-through"] },
+        "width": { "$ref": "#/$defs/measurement" },
+        "height": { "$ref": "#/$defs/measurement" },
+        "sill_height": { "type": "number" },
+        "header_height": { "type": "number" },
+        "u_offset": { "type": "number", "description": "Distance from the wall's start corner." },
+        "confidence": { "type": "number" }
+      }
+    },
+    "room": {
+      "type": "object",
+      "required": ["id", "name", "area"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "area": { "$ref": "#/$defs/measurement" },
+        "ceiling_height": { "$ref": "#/$defs/measurement" },
+        "perimeter": { "type": "number" },
+        "centroid": { "$ref": "#/$defs/point2" },
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "wall_ids": { "type": "array", "items": { "type": "integer" } },
+        "neighbours": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "damage_region": {
+      "type": "object",
+      "required": ["id", "surface_ref", "damage_class", "area"],
+      "properties": {
+        "id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "damage_class": { "type": "string", "enum": ["water", "fire", "mold", "combined"] },
+        "subtype": { "type": ["string", "null"] },
+        "area": { "$ref": "#/$defs/measurement" },
+        "water_category": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "water_class": { "type": ["integer", "null"], "minimum": 1, "maximum": 4 },
+        "mold_condition": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "classification_basis": { "type": "string" },
+        "extent": {
+          "type": "object",
+          "description": "Position on the surface: u along the wall, v up from the floor.",
+          "properties": {
+            "u_range": { "$ref": "#/$defs/point2" },
+            "v_range": { "$ref": "#/$defs/point2" }
+          }
+        },
+        "description": { "type": "string" },
+        "view_count": { "type": "integer" },
+        "confidence": { "type": "number" },
+        "contributing_frames": { "type": "array", "items": { "type": "integer" } },
+        "mask_method": { "type": "string" }
+      }
+    },
+    "concealed_flag": {
+      "type": "object",
+      "required": ["rule_id", "inferred", "probability"],
+      "properties": {
+        "rule_id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "inferred": { "type": "string" },
+        "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": { "type": "string" },
+        "source": { "type": "string" },
+        "triggered_by": { "type": "string" }
+      }
+    },
+    "line_item": {
+      "type": "object",
+      "required": ["code", "action", "quantity", "unit", "rule_id"],
+      "properties": {
+        "code": { "type": "string" },
+        "description": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["remove", "replace", "clean", "treat", "seal", "detach_and_reset", "install", "operate", "monitor", "supply"]
+        },
+        "material": { "type": "string" },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "trade": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "rule_id": { "type": "string" },
+        "source": { "type": "string", "description": "The standard the rule cites." },
+        "basis": { "type": "string", "description": "How this quantity was derived, in words." },
+        "derived_from": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

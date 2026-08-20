@@ -1,0 +1,228 @@
+# Restoration scoping rules.
+#
+# Every quantity the pipeline emits traces to a rule here, and every rule
+# carries its source. Nothing in the scope engine hardcodes a number: changing
+# `flood_cut.base_height` below and re-running is the whole edit, which is what
+# makes the "change the flood cut from 30cm to 60cm" modification a config
+# change rather than a code change.
+#
+# Sources are the IICRC consensus standards a restoration estimator actually
+# works from:
+#   S500 - Standard for Professional Water Damage Restoration (5th ed.)
+#   S520 - Standard for Professional Mold Remediation (4th ed.)
+#   S700 - Standard for Professional Fire and Smoke Damage Restoration
+# Where a rule is our own simplification rather than a standard's requirement,
+# it says so in `note`. Those are the ones to challenge first.
+
+version: 3
+
+units:
+  length: m
+  area: m2
+  volume: m3
+
+# ---------------------------------------------------------------------------
+# Water
+# ---------------------------------------------------------------------------
+water:
+  flood_cut:
+    # A flood cut removes drywall ABOVE the visible waterline, because
+    # capillary rise carries moisture higher than staining shows and the cavity
+    # behind must be opened to dry.
+    base_height: 0.30           # cut this far above the highest visible damage
+    minimum_height: 0.61        # never cut less than 2 ft: below that, removal
+                                # and patching costs more than a 2 ft cut
+    standard_heights: [0.61, 1.22, 2.44]  # 2 ft / 4 ft / full sheet
+    snap_to_standard: true      # drywall is sold in sheets; estimators cut to them
+    applies_to_categories: [2, 3]
+    source: "IICRC S500 5th ed. §12.2.5 (Category 2/3 porous material removal); flood cut height is trade practice, not a numeric standard"
+    note: "Cut height above the waterline is a judgement call in the field; 30 cm is a common default and is exposed here as a parameter."
+
+  category_actions:
+    1:
+      porous_materials: dry_in_place
+      drywall: dry_in_place
+      carpet: dry_in_place
+      pad: dry_in_place
+      source: "IICRC S500 §12.2.3 - Category 1 materials may often be dried in place"
+    2:
+      porous_materials: remove
+      drywall: flood_cut
+      carpet: clean_and_dry
+      pad: remove
+      source: "IICRC S500 §12.2.4 - Category 2: pad removal typical, carpet may be restorable"
+    3:
+      porous_materials: remove
+      drywall: flood_cut
+      carpet: remove
+      pad: remove
+      source: "IICRC S500 §12.2.5 - Category 3: porous materials are removed and disposed of"
+
+  baseboard:
+    # Baseboard is removed along the whole affected run, not just the stained
+    # part: it comes off in lengths, and a partial removal leaves a joint that
+    # has to be replaced anyway.
+    follow_affected_run: true
+    extend_to_wall_ends: false
+    action: detach_and_reset_or_replace
+    replace_if_category: [2, 3]
+    source: "IICRC S500 §12.2.4; removal in full lengths is trade practice"
+
+  drying_equipment:
+    air_movers:
+      # S500 gives air mover counts per affected area and per wet wall, scaled
+      # by class. These are the mid-range figures from the standard's tables.
+      per_floor_area: 0.065      # units per m2 of affected floor (~1 per 15 m2)
+      per_wet_wall_area: 0.25    # units per m2 of affected wall
+      minimum: 1
+      source: "IICRC S500 §13.4 air mover placement guidance (1 per 50-70 sq ft of affected floor, plus 1 per wet wall)"
+    dehumidifier:
+      # Sized by cubic volume and class; LGR pints/day per m3 of affected space.
+      class_factors: {1: 0.6, 2: 1.0, 3: 1.5, 4: 1.5}
+      base_per_volume: 0.35
+      minimum: 1
+      source: "IICRC S500 §13.5 dehumidification sizing by class and volume"
+    monitoring_days:
+      default: 3
+      class_days: {1: 3, 2: 3, 3: 4, 4: 5}
+      source: "IICRC S500 §13.7 - drying is monitored daily until goals are met"
+
+  antimicrobial:
+    apply_for_categories: [2, 3]
+    coverage_rate: 1.0          # applied over the full affected area
+    source: "IICRC S500 §12.4 antimicrobial application on Category 2/3"
+
+# ---------------------------------------------------------------------------
+# Mold
+# ---------------------------------------------------------------------------
+mold:
+  # S520 sizes containment and PPE by the extent of contamination, not by the
+  # visible patch alone. This is the clearest case where the naive mapping
+  # (0.3 m2 of mold -> 0.3 m2 of line item) is simply wrong: a small patch in
+  # an occupied building still triggers containment and worker protection.
+  condition_actions:
+    1: none                      # normal fungal ecology
+    2: clean                     # settled spores, no growth
+    3: remove_and_treat          # actual growth
+  size_thresholds:
+    small: 1.0                   # m2 - limited remediation
+    medium: 9.3                  # m2 (~100 sq ft) - full containment expected
+  containment:
+    trigger_area: 1.0
+    type_by_size: {small: local, medium: full, large: full}
+    negative_air_trigger: 1.0
+    source: "IICRC S520 4th ed. §12 - containment scaled to contamination extent; 10 and 100 sq ft thresholds are long-standing industry practice (EPA Mold Remediation in Schools and Commercial Buildings)"
+  removal_margin: 0.30           # remove material this far beyond visible growth
+  ppe:
+    small: N95_gloves_goggles
+    medium: half_face_respirator_suit
+    large: full_face_PAPR_suit
+    source: "IICRC S520 §11 worker protection by remediation scale"
+  hepa_vacuum_passes: 2
+  air_scrubber:
+    per_volume: 0.03             # units per m3 of contained space
+    minimum: 1
+    source: "IICRC S520 §12.4 - HEPA air filtration devices within containment"
+
+# ---------------------------------------------------------------------------
+# Fire and smoke
+# ---------------------------------------------------------------------------
+fire:
+  subtype_actions:
+    soot: clean_and_seal         # cleanable deposit on a sound substrate
+    char: remove_and_replace     # substrate itself is burned
+    consumed: remove_and_replace
+  seal_after_cleaning: true      # seal to lock down odour-bearing residue
+  seal_coverage: 1.0
+  odour_treatment:
+    trigger_area: 0.5
+    method: thermal_fog_or_hydroxyl
+    source: "IICRC S700 - deodorisation follows source removal"
+  cleaning_rate_m2_per_hour: 9.0
+  source: "IICRC S700 Standard for Professional Fire and Smoke Damage Restoration"
+
+# ---------------------------------------------------------------------------
+# Concealed damage
+# ---------------------------------------------------------------------------
+# Damage the camera cannot see but the physics implies. Each rule emits a
+# probability and its own id so a reviewer can audit exactly why a cavity was
+# flagged. Probabilities are calibrated judgement, not measurements - they are
+# stated as such in the report.
+concealed:
+  - id: W-01
+    when: {damage_class: water, min_category: 2, surface_kind: wall}
+    infer: insulation_behind_drywall
+    probability: 0.72
+    rationale: "Drywall wet enough to stain at Category 2 has wicked into the cavity; batt insulation holds moisture and cannot be dried in place."
+    source: "IICRC S500 §12.2.4 - wall cavity inspection required where porous materials are wet"
+  - id: W-02
+    when: {damage_class: water, surface_kind: floor, material_hint: carpet}
+    infer: pad_and_subfloor
+    probability: 0.85
+    rationale: "Carpet pad is the most absorbent assembly component; water reaching carpet reaches pad first and pools at the subfloor."
+    source: "IICRC S500 §12.2.4"
+  - id: W-03
+    when: {damage_class: water, min_class: 3, surface_kind: wall}
+    infer: adjacent_wall_cavity
+    probability: 0.65
+    rationale: "Class 3 intrusion comes from above; adjacent cavities in the same run are wet even where the finish is unmarked."
+    source: "IICRC S500 §10.5 class definitions"
+  - id: W-04
+    when: {damage_class: water, surface_kind: wall, adjacent_to_floor: true}
+    infer: baseboard_and_sill_plate
+    probability: 0.60
+    rationale: "Water tracks to the wall-floor junction and is held behind the baseboard against the sill plate."
+    source: "IICRC S500 §12.2"
+  - id: M-01
+    when: {damage_class: mold, min_condition: 3}
+    infer: back_of_substrate_growth
+    probability: 0.78
+    rationale: "Visible growth on a porous surface indicates a moisture source behind it; the unexposed face is typically more colonised than the visible one."
+    source: "IICRC S520 §12.1 - the extent of contamination is assessed, not assumed from visible growth"
+  - id: M-02
+    when: {damage_class: mold, surface_kind: wall}
+    infer: hidden_moisture_source
+    probability: 0.55
+    rationale: "Mold requires sustained moisture; a plumbing or envelope leak is implied and must be found before remediation."
+    source: "IICRC S520 §12"
+  - id: F-01
+    when: {damage_class: fire, subtype: char}
+    infer: structural_member_charring
+    probability: 0.58
+    rationale: "Charring that penetrates the finish usually reaches framing behind it; depth of char determines whether members are sound."
+    source: "IICRC S700"
+  - id: F-02
+    when: {damage_class: fire}
+    infer: smoke_residue_in_cavities_and_hvac
+    probability: 0.70
+    rationale: "Smoke is driven by pressure into cavities, wall voids and return ducts well beyond visible soot."
+    source: "IICRC S700 - smoke migrates beyond the area of visible deposition"
+
+# ---------------------------------------------------------------------------
+# Line item catalogue
+# ---------------------------------------------------------------------------
+# Keyed to the action the rules above select. `unit` follows estimator
+# convention so the export maps cleanly onto an Xactimate-style workflow.
+line_items:
+  drywall_remove:      {description: "Remove drywall, cut to height",        unit: m2,   trade: drywall}
+  drywall_replace:     {description: "Install 1/2\" drywall, tape and float", unit: m2,   trade: drywall}
+  baseboard_detach:    {description: "Detach and reset baseboard",           unit: m,    trade: finish_carpentry}
+  baseboard_replace:   {description: "Remove and replace baseboard",         unit: m,    trade: finish_carpentry}
+  carpet_remove:       {description: "Remove carpet",                        unit: m2,   trade: flooring}
+  pad_remove:          {description: "Remove carpet pad",                    unit: m2,   trade: flooring}
+  carpet_clean:        {description: "Clean and sanitise carpet",            unit: m2,   trade: flooring}
+  insulation_remove:   {description: "Remove wet batt insulation",           unit: m2,   trade: insulation}
+  antimicrobial_apply: {description: "Apply antimicrobial treatment",        unit: m2,   trade: mitigation}
+  air_mover:           {description: "Air mover, per day",                   unit: ea_day, trade: mitigation}
+  dehumidifier:        {description: "LGR dehumidifier, per day",            unit: ea_day, trade: mitigation}
+  monitoring_visit:    {description: "Daily drying monitoring visit",        unit: ea,   trade: mitigation}
+  containment_barrier: {description: "Erect containment barrier, 6 mil poly", unit: m2,  trade: mitigation}
+  negative_air:        {description: "Negative air machine / air scrubber, per day", unit: ea_day, trade: mitigation}
+  hepa_vacuum:         {description: "HEPA vacuum surfaces",                 unit: m2,   trade: mitigation}
+  mold_remove:         {description: "Remove mold-contaminated material",    unit: m2,   trade: mitigation}
+  mold_treat:          {description: "Apply antimicrobial to remediated area", unit: m2, trade: mitigation}
+  ppe_set:             {description: "PPE set, per technician per day",      unit: ea,   trade: mitigation}
+  soot_clean:          {description: "Clean soot from surface",              unit: m2,   trade: fire_restoration}
+  seal_surface:        {description: "Seal surface, odour-blocking primer",  unit: m2,   trade: fire_restoration}
+  char_remove:         {description: "Remove fire-damaged material",         unit: m2,   trade: fire_restoration}
+  odour_treatment:     {description: "Thermal fog / hydroxyl deodorisation", unit: ea,   trade: fire_restoration}
