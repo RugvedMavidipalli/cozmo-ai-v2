@@ -70,6 +70,49 @@ recovers a 3.04 m storey with the camera 1.61 m above the floor. ✅
 
 ## 3. Reconstruction and the error budget
 
+### 3.0 Resolving competing surfaces
+
+Sequential RANSAC produces two kinds of duplicate, and they need opposite
+treatment. **Fragments of one surface** — a wall split by a doorway, or seen on
+two visits a couple of centimetres apart — are merged, because both are evidence
+of the same plane *and* of its extent. **Parallel clutter** — door reveals, trim,
+cabinet and bookcase fronts a few centimetres in front, of which one wall on
+recordings-1 spawned five within 23 cm — is *suppressed*, not merged: averaging
+would drag the wall off its true position, and extending it to their span would
+credit masonry with a run that furniture occupies. Since RANSAC takes the
+largest consensus set first, the dominant plane in such a family is the wall.
+
+Separation is measured as the candidate's greatest distance from the target's
+line, not as a difference of plane offsets. Offsets are only comparable between
+exactly parallel lines: within a 15° tolerance two segments can share an offset
+at their midpoints and diverge by half a metre at their ends.
+
+Runs are also gated on **observed coverage** — the share of a run's own surface
+area actually seen, given the point spacing. `min_inliers` constrains only the
+whole consensus set, which is then split into contiguous runs, so without this a
+line supported by one real wall also emits the 30-point slivers that fall on the
+same infinite line metres away. Coverage is scale-free: real walls score 8–89%,
+slivers 1–3%, a gap no absolute point count spans across capture densities.
+
+| recordings-1 | before | after |
+|---|---:|---:|
+| walls | 64 | **43** |
+| same-facing duplicate pairs | 24 | **0** |
+| minimum support density | 60 pts/m | **352 pts/m** |
+| drift median | 23.3 mm | **12.7 mm** |
+
+*Caveat on that last row:* part of the improvement is a selection effect. The
+suppressed surfaces were the worst-fitting ones, so removing them improves the
+median of the population that remains (34 → 23 revisited walls) as well as the
+geometry itself. The honest claim is that the *wall set* is now clean, not that
+sensor accuracy improved by 45%.
+
+One field turned out to be a trap worth recording: `WallSegment.height_range`
+looks like it should separate walls from low furniture, but `wall_band_mask`
+clips every candidate to the same height band before RANSAC runs, so it
+saturates at the band limits for walls and countertops alike. It is documented
+as unusable rather than quietly relied on.
+
 ### 3.1 Why walls are fitted in 2D
 
 Once gravity is known, a vertical surface has **one** free orientation and

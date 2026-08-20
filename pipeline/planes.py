@@ -62,6 +62,10 @@ class WallSegment:
     inlier_count: int
     residual_rms: float  # metres, spread of inliers about the fitted line
     observed_span: tuple[float, float]  # along-wall extent actually seen
+    # Height extent of the supporting points. NOT a measure of how tall the
+    # surface is: `wall_band_mask` clips every candidate to the same band
+    # before RANSAC runs, so this saturates at the band limits for real walls
+    # and low furniture alike. Do not filter on it.
     height_range: tuple[float, float]
     room_id: int | None = None
     name: str | None = None
@@ -180,6 +184,8 @@ def extract_walls(
     min_length: float = 0.4,
     max_walls: int = 80,
     angle_tolerance_degrees: float = 8.0,
+    point_spacing: float = 0.02,
+    min_coverage: float = 0.06,
 ) -> list[WallSegment]:
     """Sequential RANSAC for wall lines in plan space.
 
@@ -187,7 +193,17 @@ def extract_walls(
     is what converts a coarse RANSAC hypothesis into a metric surface: the
     consensus set selects *which* points belong to the wall, and the refit uses
     all of them to place it.
+
+    Runs are then gated on `min_coverage`: the share of the run's own surface
+    area that was actually observed, given the reconstruction's point spacing.
+    `min_inliers` only constrains the whole RANSAC consensus set, which is then
+    split into contiguous runs -- so without this a line supported by one real
+    wall also emits the 30-point slivers that happened to fall on the same
+    infinite line metres away.  Coverage is the right test because it is
+    scale-free: on recordings-1 real walls score 8-89% while the slivers score
+    1-3%, a gap no absolute point count spans across capture densities.
     """
+    band_height = float(np.ptp(heights)) if len(heights) else 1.0
     remaining = np.arange(len(plan_points))
     walls: list[WallSegment] = []
     rng = np.random.default_rng(0)
@@ -210,7 +226,11 @@ def extract_walls(
         # opposite sides of a corridor share an offset.  Split into runs that
         # are actually contiguous before accepting anything.
         for lo, hi, count in _contiguous_runs(np.sort(projection), gap=0.35):
-            if hi - lo < min_length:
+            run_length = hi - lo
+            if run_length < min_length:
+                continue
+            expected = (run_length / point_spacing) * (band_height / point_spacing)
+            if count < min_coverage * expected:
                 continue
             base = normal * offset
             walls.append(
@@ -288,48 +308,87 @@ def _contiguous_runs(sorted_values: np.ndarray, gap: float):
 
 def merge_collinear(
     walls: list[WallSegment],
-    offset_tolerance: float = 0.05,
-    angle_tolerance_degrees: float = 5.0,
+    offset_tolerance: float = 0.06,
+    parallel_tolerance: float = 0.30,
+    min_overlap: float = 0.30,
+    angle_tolerance_degrees: float = 15.0,
     gap_tolerance: float = 0.4,
 ) -> list[WallSegment]:
-    """Merge wall fragments that describe the same surface.
+    """Resolve competing near-coplanar surfaces into one wall each.
 
-    Sequential RANSAC finds one surface several times: a wall interrupted by a
-    doorway, or seen on two visits that drift apart by a few centimetres,
-    yields parallel fragments a short distance from each other.  Left alone
-    they inflate the wall count, split damage across duplicates, and give the
-    room a jagged boundary.
+    Sequential RANSAC produces two distinct kinds of duplicate, and they need
+    opposite treatment:
 
-    Normal *direction* is compared, not just orientation, so the two faces of
-    a partition never merge -- they are genuinely different surfaces bounding
-    different rooms, and their separation is the shared-wall thickness the
-    assignment scores.
+    * **Fragments of one surface** (within `offset_tolerance`): a wall split by
+      a doorway, or the same wall seen on two visits that drift apart by a
+      couple of centimetres.  These are *merged* -- both are evidence of the
+      same plane and of its extent.
+    * **Parallel clutter** (within `parallel_tolerance`, overlapping along the
+      run): once the wall's points are consumed, RANSAC keeps finding planes a
+      few centimetres in front of it -- door reveals, trim, cabinet and
+      bookcase fronts.  On recordings-1 a single wall spawned five such planes
+      within 23 cm.  These are *suppressed*, not merged: averaging them would
+      drag the wall off its true position, and extending the wall to their
+      span would credit it with a run that furniture, not masonry, occupies.
+
+    Because sequential RANSAC takes the largest consensus set first, the
+    dominant plane in such a family is the wall; the rest are what stands in
+    front of it, and they belong to the occlusion machinery instead.
+
+    Normal *direction* is compared throughout, not just orientation, so the two
+    faces of a partition are never combined -- they are different surfaces
+    bounding different rooms, and their separation is the shared-wall thickness
+    the assignment scores.
     """
     cosine_limit = np.cos(np.radians(angle_tolerance_degrees))
-    ordered = sorted(walls, key=lambda w: -w.length)
-    merged: list[WallSegment] = []
+    # Strongest first: support, then length. The winner of each family keeps
+    # its own geometry, so it must be the best-evidenced plane, not merely the
+    # longest fragment.
+    ordered = sorted(walls, key=lambda w: (-w.inlier_count, -w.length))
+    kept: list[WallSegment] = []
 
     for wall in ordered:
-        for target in merged:
+        for target in kept:
             if target.normal @ wall.normal < cosine_limit:
+                continue  # different direction, or the opposite face
+
+            # Separation is measured as the candidate's greatest distance from
+            # the target's line, not as a difference of offsets.  Offsets are
+            # only comparable between exactly parallel lines: within the 15
+            # degrees this tolerance allows, two segments can share an offset
+            # at their midpoints and still diverge by half a metre at their
+            # ends.  Endpoint distance is what "the same surface" actually
+            # means, and it subsumes the parallel case.
+            separation = max(
+                abs(float(target.project(wall.start))),
+                abs(float(target.project(wall.end))),
+            )
+            if separation > parallel_tolerance:
                 continue
-            if abs(target.offset - wall.offset) > offset_tolerance:
-                continue
-            # Project both onto the target's axis and require them to be
-            # collinear neighbours rather than distant fragments.
+
             span = [target.along(wall.start), target.along(wall.end)]
             lo, hi = min(span), max(span)
-            if lo > target.length + gap_tolerance or hi < -gap_tolerance:
-                continue
-            _absorb(target, wall, lo, hi)
-            break
-        else:
-            merged.append(wall)
+            overlap = max(0.0, min(hi, target.length) - max(lo, 0.0))
 
-    merged.sort(key=lambda w: -w.length)
-    for position, wall in enumerate(merged):
+            if separation <= offset_tolerance:
+                if lo > target.length + gap_tolerance or hi < -gap_tolerance:
+                    continue
+                _absorb(target, wall, lo, hi)
+                break
+            if overlap >= min_overlap:
+                # The tag lands on the wall that survives, so it must say
+                # something true about *that* wall: something parallel stood
+                # in front of it, which is also why part of it is occluded.
+                target.tags.append("clutter-in-front")
+                break  # clutter in front of `target`: drop it
+        else:
+            kept.append(wall)
+
+    kept.sort(key=lambda w: -w.length)
+    for position, wall in enumerate(kept):
         wall.index = position
-    return merged
+        wall.tags = sorted(set(wall.tags))
+    return kept
 
 
 def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> None:

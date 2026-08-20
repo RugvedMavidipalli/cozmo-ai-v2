@@ -174,6 +174,8 @@ bench/           ground-truth entry, gate scoring, calibration fitting
 - Room polygons are rectified from the floor raster, not from the fitted wall
   lines. Synthetic rooms come out ~1.2% low in area; snapping to the walls
   themselves is the principled fix and is not done yet.
+- A few near-parallel surfaces at corners survive de-duplication as separate
+  walls when their fitted angles differ by more than 15 degrees.
 - Loop closure has little leverage on open trajectories — recordings-2 ends
   7.3 m from its start with few revisits, so drift there rests on odometry
   quality alone.

@@ -435,19 +435,28 @@ def _assign_walls(
 
 
 def _name_walls(room: Room, walls: list[WallSegment]) -> None:
-    """Give each of a room's walls a compass name an estimator would use."""
+    """Give each of a room's walls a compass name an estimator would use.
+
+    Names are surface references: damage regions, scope line items and ground
+    truth all key off them, so a collision would silently merge two surfaces
+    in the benchmark.  A room legitimately can have two walls on the same side
+    (an alcove, an L-shaped room), so repeats are suffixed rather than
+    renamed, longest first so the principal wall keeps the plain name.
+    """
     lookup = {wall.index: wall for wall in walls}
-    for index in room.wall_indices:
-        wall = lookup.get(index)
-        if wall is None:
-            continue
+    members = [lookup[i] for i in room.wall_indices if i in lookup]
+    used: dict[str, int] = {}
+
+    for wall in sorted(members, key=lambda w: -w.length):
         # Point the normal into the room, then name the wall for the side it
         # sits on: a wall on the room's north side faces south.
         inward = wall.normal
         if (room.centroid - wall.midpoint) @ inward < 0:
             inward = -inward
-        compass = _compass(-inward)
-        wall.name = f"{room.name}.{compass}_wall"
+        base = f"{room.name}.{_compass(-inward)}_wall"
+        count = used.get(base, 0)
+        used[base] = count + 1
+        wall.name = base if count == 0 else f"{base}_{count + 1}"
 
 
 def _compass(direction: np.ndarray) -> str:

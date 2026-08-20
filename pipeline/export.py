@@ -15,6 +15,14 @@ from pathlib import Path
 import numpy as np
 import svgwrite
 
+FONT = "Helvetica, Arial, sans-serif"
+
+# Distinct, low-saturation room fills so adjacent rooms read apart without
+# competing with the wall linework or the damage overlay.
+ROOM_FILLS = [
+    "#cfe3f5", "#f6ddc9", "#d6ecd8", "#f3d3d6", "#e2dcf0", "#fdeec2",
+]
+
 PALETTE = {
     "wall": "#1f2933",
     "inferred": "#9aa5b1",
@@ -60,12 +68,45 @@ def validate(payload: dict, schema_path: str | Path) -> list[str]:
     ]
 
 
+class _LabelPlacer:
+    """Greedy collision avoidance for dimension labels.
+
+    A floor plan is only useful if its numbers can be read.  Where walls
+    cluster -- a doorway jamb, a run of cabinetry -- labels land on top of each
+    other and every one of them becomes unreadable.  Dropping the later,
+    shorter wall's label keeps the rest legible, which is the right trade: the
+    numbers are all in `result.json`, but the drawing has to be scannable.
+    """
+
+    def __init__(self, padding: float = 2.0):
+        self.boxes: list[tuple[float, float, float, float]] = []
+        self.padding = padding
+        self.skipped = 0
+
+    def place(self, cx: float, cy: float, text: str, size: float) -> bool:
+        half_width = 0.29 * size * len(text) / 2 + self.padding
+        half_height = size / 2 + self.padding
+        box = (cx - half_width, cy - half_height, cx + half_width, cy + half_height)
+        for other in self.boxes:
+            if (
+                box[0] < other[2]
+                and box[2] > other[0]
+                and box[1] < other[3]
+                and box[3] > other[1]
+            ):
+                self.skipped += 1
+                return False
+        self.boxes.append(box)
+        return True
+
+
 def render_floorplan(
     result: dict,
     path: str | Path,
-    scale: float = 90.0,
-    margin: float = 60.0,
+    scale: float = 110.0,
+    margin: float = 70.0,
     show_damage: bool = True,
+    min_label_length: float = 0.9,
 ) -> Path:
     """Dimensioned 2D floor plan as SVG."""
     walls = result["reconstruction"]["walls"]
@@ -87,17 +128,26 @@ def render_floorplan(
         y = height - ((point[1] - lower[1]) * scale + margin)
         return x, y
 
-    for room in result.get("rooms", []):
+    rooms = result.get("rooms", [])
+    for index, room in enumerate(rooms):
         polygon = room.get("polygon")
         if polygon and len(polygon) >= 3:
             drawing.add(
                 drawing.polygon(
                     [project(p) for p in polygon],
-                    fill=PALETTE["room"],
+                    fill=ROOM_FILLS[index % len(ROOM_FILLS)],
                     stroke="none",
-                    opacity=0.75,
+                    opacity=0.55,
                 )
             )
+
+    placer = _LabelPlacer()
+    # Room labels are claimed first: a room's name and area outrank any single
+    # wall dimension for an estimator scanning the drawing.
+    for room in rooms:
+        _room_label(drawing, room, project, placer)
+
+    room_centres = np.array([r["centroid"] for r in rooms]) if rooms else None
 
     openings_by_wall: dict[str, list[dict]] = {}
     for opening in result["reconstruction"].get("openings", []):
@@ -143,12 +193,16 @@ def render_floorplan(
             _line(drawing, project(start + direction * cursor), project(end),
                   PALETTE["wall"], 5)
 
-        _dimension(drawing, project(start), project(end), wall)
-
     if show_damage:
         _damage_overlay(drawing, result, walls, project)
 
-    _legend(drawing, height, result)
+    # Dimensions last, so no wall or overlay drawn later paints over a number.
+    # Longest walls are labelled first, so when two labels collide the one that
+    # survives is the more significant measurement.
+    for wall in sorted(walls, key=lambda w: -w["length"]["value"]):
+        _dimension(drawing, wall, project, placer, min_label_length, room_centres)
+
+    _legend(drawing, height, result, placer)
     drawing.save()
     return Path(path)
 
@@ -160,12 +214,57 @@ def _line(drawing, a, b, colour, stroke_width, dash=None):
     drawing.add(drawing.line(a, b, **kwargs))
 
 
-def _dimension(drawing, a, b, wall) -> None:
-    """Label a wall with its length and interval, offset clear of the line."""
-    measurement = wall["length"]
-    if measurement["value"] < 0.6:
+def _room_label(drawing, room: dict, project, placer: _LabelPlacer) -> None:
+    """Room name and area at its centroid."""
+    centre = project(room["centroid"])
+    name = room["name"]
+    area = room["area"]
+    if not placer.place(centre[0], centre[1], name, 13):
         return
-    mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+
+    drawing.add(
+        drawing.text(
+            name, insert=centre, fill=PALETTE["text"], font_size="13px",
+            font_weight="bold", font_family=FONT, text_anchor="middle",
+        )
+    )
+    detail = f"{area['value']:.2f} m² ±{area.get('half_width', 0):.2f}"
+    height = room.get("ceiling_height", {}).get("value")
+    if height:
+        detail += f" · h {height:.2f} m"
+    drawing.add(
+        drawing.text(
+            detail, insert=(centre[0], centre[1] + 15), fill=PALETTE["text"],
+            font_size="10.5px", font_family=FONT, text_anchor="middle",
+        )
+    )
+    placer.place(centre[0], centre[1] + 15, detail, 10.5)
+
+
+def _dimension(
+    drawing, wall: dict, project, placer: _LabelPlacer,
+    min_length: float, room_centres,
+) -> None:
+    """Label a wall with its length and interval, offset clear of the line.
+
+    The label is pushed perpendicular to the wall, on the side facing away from
+    the nearest room centre, so it sits in open drawing space instead of on top
+    of the wall it describes or inside the room's own label.
+    """
+    measurement = wall["length"]
+    if measurement["value"] < min_length:
+        return
+
+    start, end = np.asarray(wall["start"]), np.asarray(wall["end"])
+    middle = 0.5 * (start + end)
+    normal = np.asarray(wall["normal"], dtype=float)
+    if room_centres is not None and len(room_centres):
+        nearest = room_centres[np.argmin(np.linalg.norm(room_centres - middle, axis=1))]
+        if (middle - nearest) @ normal < 0:
+            normal = -normal
+
+    anchor = project(middle + normal * 0.16)
+    a, b = project(start), project(end)
     angle = np.degrees(np.arctan2(b[1] - a[1], b[0] - a[0]))
     if angle > 90 or angle < -90:
         angle += 180
@@ -173,19 +272,17 @@ def _dimension(drawing, a, b, wall) -> None:
     label = f"{measurement['value']:.2f}"
     half = measurement.get("half_width")
     if half:
-        label += f" ±{half * 100:.1f}cm"
+        label += f" ±{half * 100:.0f}cm"
     if wall.get("inferred_fraction", 0) > 0.15:
-        label += " (part inferred)"
+        label += " *"
 
+    if not placer.place(anchor[0], anchor[1], label, 11):
+        return
     drawing.add(
         drawing.text(
-            label,
-            insert=mid,
-            fill=PALETTE["text"],
-            font_size="11px",
-            font_family="Helvetica, Arial, sans-serif",
-            text_anchor="middle",
-            transform=f"rotate({angle:.1f} {mid[0]:.1f} {mid[1]:.1f}) translate(0 -8)",
+            label, insert=anchor, fill=PALETTE["text"], font_size="11px",
+            font_family=FONT, text_anchor="middle",
+            transform=f"rotate({angle:.1f} {anchor[0]:.1f} {anchor[1]:.1f})",
         )
     )
 
@@ -214,33 +311,58 @@ def _damage_overlay(drawing, result, walls, project) -> None:
         )
 
 
-def _legend(drawing, height, result) -> None:
+def _legend(drawing, height, result, placer: _LabelPlacer) -> None:
     entries = [
         ("wall", "wall"),
         ("door", "door"),
         ("window", "window"),
-        ("inferred", "inferred / occluded"),
+        ("inferred", "inferred / occluded span"),
     ]
     damage_classes = {r["damage_class"] for r in result.get("damage", [])}
     entries += [(c, f"{c} damage") for c in sorted(damage_classes)]
 
-    y = 18
+    y = 20
+    drawing.add(
+        drawing.rect(
+            (8, 8), (218, 24 + 17 * len(entries)),
+            fill="white", fill_opacity=0.88, stroke="#d0d6dd",
+        )
+    )
     for key, label in entries:
-        _line(drawing, (14, y), (40, y), PALETTE[key], 5,
+        _line(drawing, (18, y), (44, y), PALETTE[key], 5,
               "6,4" if key == "inferred" else None)
         drawing.add(
-            drawing.text(label, insert=(48, y + 4), fill=PALETTE["text"],
-                         font_size="11px", font_family="Helvetica, Arial, sans-serif")
+            drawing.text(label, insert=(52, y + 4), fill=PALETTE["text"],
+                         font_size="11px", font_family=FONT)
         )
+        placer.place(120, y, label, 11)
         y += 17
 
-    note = result.get("diagnostics", {}).get("calibration", {})
-    if not note.get("calibrated", False):
+    drawing.add(
+        drawing.text(
+            "dimensions in metres; ± is a 90% interval.  * = partly inferred",
+            insert=(18, y + 4), fill=PALETTE["text"], font_size="10px",
+            font_family=FONT,
+        )
+    )
+    placer.place(120, y + 4, "x" * 60, 10)
+
+    footer = []
+    if placer.skipped:
+        # Say so rather than let a reader assume every wall is dimensioned.
+        footer.append(
+            f"{placer.skipped} dimension labels omitted where they would "
+            f"overlap — full values in result.json"
+        )
+    calibration = result.get("diagnostics", {}).get("calibration", {})
+    if not calibration.get("calibrated", False):
+        footer.append("intervals uncalibrated (no ground truth fitted)")
+
+    for offset, note in enumerate(reversed(footer)):
         drawing.add(
             drawing.text(
-                "intervals uncalibrated (no ground truth fitted)",
-                insert=(14, height - 14), fill="#a04020", font_size="10px",
-                font_family="Helvetica, Arial, sans-serif",
+                note, insert=(14, height - 14 - offset * 14), fill="#a04020",
+                font_size="10px", font_family=FONT,
             )
         )
 
