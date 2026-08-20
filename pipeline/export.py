@@ -269,12 +269,15 @@ def _dimension(
     if angle > 90 or angle < -90:
         angle += 180
 
-    # "m" is stamped on every label, not just stated once in the legend: a
-    # cropped or covered legend must not leave a bare number's unit ambiguous.
-    label = f"{measurement['value']:.2f} m"
+    # Wall lengths are labelled in centimetres (an estimator's working unit
+    # for stud-to-stud runs), with the unit stamped on every label rather than
+    # stated once in the legend -- a cropped or covered legend must not leave
+    # a bare number's unit ambiguous. Room areas/heights stay in m/m² (see
+    # `_room_label`), so their own labels carry that unit instead.
     half = measurement.get("half_width")
+    label = f"{measurement['value'] * 100:.0f} cm"
     if half:
-        label += f" ±{half * 100:.0f}cm"
+        label += f" ±{half * 100:.0f} cm"
     if wall.get("inferred_fraction", 0) > 0.15:
         label += " *"
 
@@ -350,12 +353,12 @@ def _legend(drawing, height, result, placer: _LabelPlacer) -> None:
 
     drawing.add(
         drawing.text(
-            "dimensions in metres; ± is a 90% interval.  * = partly inferred",
+            "wall lengths in cm; room areas in m².  ± is a 90% interval.  * = partly inferred",
             insert=(18, y + 4), fill=PALETTE["text"], font_size="10px",
             font_family=FONT,
         )
     )
-    placer.place(120, y + 4, "x" * 60, 10)
+    placer.place(120, y + 4, "x" * 76, 10)
 
     y += 20
     for line in summary_lines:

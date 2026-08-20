@@ -83,7 +83,7 @@ def render(result: dict, out_path: Path, min_label_length: float = 1.2) -> Path:
                 angle += 180
             axes.text(
                 *middle,
-                f"{measurement['value']:.2f} m ±{measurement['half_width'] * 100:.0f}cm",
+                f"{measurement['value'] * 100:.0f} cm ±{measurement['half_width'] * 100:.0f} cm",
                 fontsize=6.5, ha="center", color="#3e4c59", rotation=angle, zorder=7,
             )
 
