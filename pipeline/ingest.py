@@ -5,14 +5,15 @@ Coordinate conventions
 Stray Scanner writes odometry as camera-to-world poses whose rotation already
 uses the OpenCV camera convention (camera looks down +Z, +Y down in image
 space), in a gravity-aligned world frame.  This was established empirically,
-not assumed: `conv_test.py` scores every plausible convention by how well it
+not assumed: `tools/conv_test.py` scores every plausible convention by how well it
 aligns nearby frames' point clouds, and the identity mapping wins by 6x
 (4.2 cm median nearest-neighbour vs 25.9 cm for the flipped alternatives).
 Poses are therefore passed through unmodified.
 
 The world frame's up axis is likewise measured rather than assumed --
-`gravity_axis()` recovers it from the reconstruction, because a wrong up axis
-silently produces a floor plan of a wall.
+`_imu_gravity()` here recovers its direction from the accelerometer and
+`geometry.estimate_gravity()` refines it against the floor and ceiling,
+because a wrong up axis silently produces a floor plan of a wall.
 
 `Frame.pose` is camera-to-world.  Code wanting world-to-camera (Open3D
 integration, projection) takes `np.linalg.inv(frame.pose)`.
@@ -27,7 +28,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Kept so `conv_test.py` can still score the alternative it rules out.
+# Kept so `tools/conv_test.py` can still score the alternative it rules out.
 ARKIT_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
 # ARKit's confidence raster: 0 = low, 1 = medium, 2 = high.  Low-confidence
@@ -44,7 +45,7 @@ DEPTH_SCALE = 1000.0  # Stray Scanner stores depth as uint16 millimetres.
 # raster frame.  Of the candidate mappings, only this one turns the
 # accelerometer into a constant world vector: it scores 0.99 directional
 # consistency and unit magnitude, versus 0.59-0.87 for the alternatives (see
-# `grav_test.py`).  Anything but the true mapping leaves the walking motion
+# `tools/grav_test.py`).  Anything but the true mapping leaves the walking motion
 # uncancelled and the mean drops well below 1 g.
 DEVICE_TO_CAMERA = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 

@@ -58,8 +58,8 @@ out/<capture>/
 **Stray Scanner** (primary): `rgb.mp4`, `depth/*.png` (uint16 mm), `confidence/*.png`,
 `odometry.csv`, `imu.csv`, `camera_matrix.csv`.
 
-Sensor conventions were **measured, not assumed** — `conv_test.py` and
-`grav_test.py` score every plausible convention against the data. Two findings
+Sensor conventions were **measured, not assumed** — `tools/conv_test.py` and
+`tools/grav_test.py` score every plausible convention against the data. Two findings
 that silently produce confident, geometrically meaningless output if guessed:
 
 - Poses in `odometry.csv` are *already* camera-to-world in the OpenCV
