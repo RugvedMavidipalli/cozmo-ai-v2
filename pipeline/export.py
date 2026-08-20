@@ -148,7 +148,7 @@ def render_floorplan(
     if show_damage:
         _damage_overlay(drawing, result, walls, project)
 
-    _legend(drawing, drawing, width, height, result)
+    _legend(drawing, height, result)
     drawing.save()
     return Path(path)
 
@@ -214,7 +214,7 @@ def _damage_overlay(drawing, result, walls, project) -> None:
         )
 
 
-def _legend(drawing, root, width, height, result) -> None:
+def _legend(drawing, height, result) -> None:
     entries = [
         ("wall", "wall"),
         ("door", "door"),
@@ -246,13 +246,18 @@ def _legend(drawing, root, width, height, result) -> None:
 
 
 def export_scene(
-    mesh, walls: list[dict], path: str | Path, floor_height: float
+    mesh,
+    walls: list[dict],
+    path: str | Path,
+    floor_height: float,
+    ceiling_height: float | None = None,
 ) -> Path:
     """Write the reconstruction as GLB with each surface a named node.
 
     The assignment asks for every wall, floor and ceiling to be an identifiable
-    named plane, so surfaces are exported as separate named nodes rather than
-    one merged soup.
+    named plane, so the fitted surfaces are exported as separate named quads
+    alongside the fused mesh -- a viewer can select `room_1.north_wall` rather
+    than hunting through one merged soup of triangles.
     """
     import trimesh
 
@@ -270,10 +275,40 @@ def export_scene(
             node_name="reconstruction",
         )
 
+    top = ceiling_height if ceiling_height is not None else floor_height + 2.4
+    for wall in walls:
+        quad = _wall_quad(wall, floor_height, top)
+        if quad is not None:
+            scene.add_geometry(quad, node_name=wall["name"])
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     scene.export(str(path))
     return path
+
+
+def _wall_quad(wall: dict, floor_height: float, ceiling_height: float):
+    """A named, selectable plane for one wall, spanning floor to ceiling.
+
+    Plan coordinates are 2D in the gravity-aligned frame; the third axis is
+    height, so the quad is the wall's line swept vertically.
+    """
+    import trimesh
+
+    start, end = np.asarray(wall["start"]), np.asarray(wall["end"])
+    if np.linalg.norm(end - start) < 1e-6:
+        return None
+    vertices = np.array(
+        [
+            [start[0], floor_height, start[1]],
+            [end[0], floor_height, end[1]],
+            [end[0], ceiling_height, end[1]],
+            [start[0], ceiling_height, start[1]],
+        ]
+    )
+    return trimesh.Trimesh(
+        vertices=vertices, faces=np.array([[0, 1, 2], [0, 2, 3]]), process=False
+    )
 
 
 def render_damage_overlays(

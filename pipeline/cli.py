@@ -20,7 +20,13 @@ from .geometry import estimate_gravity
 from .ingest import load_capture, iter_frames
 from .keyframes import select_damage_keyframes
 from .occupancy import build_surface_grid, find_openings, occluded_spans
-from .planes import estimate_horizontal_frame, extract_walls, snap_to_frame, wall_band_mask
+from .planes import (
+    estimate_horizontal_frame,
+    extract_walls,
+    merge_collinear,
+    snap_to_frame,
+    wall_band_mask,
+)
 from .poses import refine_trajectory, select_keyframes
 from .rooms import build_plan_grid, segment_rooms
 from .scope import ScopeEngine
@@ -96,7 +102,7 @@ def run(args: argparse.Namespace) -> int:
         frame = estimate_horizontal_frame(normals, gravity.up)
         band = wall_band_mask(points, normals, gravity, gravity.up)
         walls = extract_walls(frame.to_plan(points[band]), frame.height(points[band]))
-        walls = snap_to_frame(walls, frame)
+        walls = merge_collinear(snap_to_frame(walls, frame))
     ceiling = gravity.ceiling_height
     print(
         f"  {len(walls)} walls, room height "
@@ -106,7 +112,10 @@ def run(args: argparse.Namespace) -> int:
         warnings.append("no ceiling plane found; heights are unavailable")
 
     with timings.stage("rooms"):
-        grid = build_plan_grid(points, frame, gravity.floor_height, ceiling)
+        grid = build_plan_grid(
+            points, frame, gravity.floor_height, ceiling,
+            trajectory=poses[:, :3, 3],
+        )
         rooms = segment_rooms(grid, walls, frame, gravity.floor_height, ceiling)
     print(f"  {len(rooms)} rooms")
 
@@ -174,7 +183,7 @@ def run(args: argparse.Namespace) -> int:
             warnings.append(f"floor plan render failed: {exc}")
         export.export_scene(
             reconstruction.mesh, result["reconstruction"]["walls"],
-            out_dir / "scene.glb", gravity.floor_height,
+            out_dir / "scene.glb", gravity.floor_height, ceiling,
         )
         o3d.io.write_point_cloud(str(out_dir / "cloud.ply"), cloud)
 

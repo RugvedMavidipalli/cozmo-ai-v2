@@ -109,7 +109,6 @@ def build_surface_grid(
     columns = max(int(np.ceil(wall.length / resolution)), 1)
     rows = max(int(np.ceil(height / resolution)), 1)
 
-    signed = points @ np.append(wall.normal, 0.0)[:2] if False else None
     plan = frame.to_plan(points)
     distance = plan @ wall.normal - wall.offset
     along = (plan - wall.start) @ wall.direction

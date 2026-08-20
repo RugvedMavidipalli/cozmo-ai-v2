@@ -6,14 +6,27 @@ between them and every measurement taken from it inherits the error.  Replaying
 ARKit poses therefore cannot reach a 2 cm wall tolerance; the trajectory has to
 be corrected against the sensor log itself.
 
-The correction is a standard pose graph, but the parts that matter here are the
-edges: sequential edges refined by ICP, plus loop-closure edges between frames
-that are *spatially* near and *temporally* far.  Those are the only edges
-carrying information ARKit does not already have, and they are what pull the
-end of the walk back onto the start.
+The correction is a standard pose graph, and the design decision that matters
+is which edges carry which claim:
+
+* **Sequential edges come from ARKit**, weighted heavily.  Its visual-inertial
+  odometry fuses the whole sequence and is accurate to millimetres over the
+  ~0.2 m between keyframes.
+* **Loop-closure edges come from ICP**, weighted ~100x lower, between frames
+  that are spatially near and temporally far.  These carry the only
+  information ARKit does not already have.
+
+Using ICP for the sequential edges too is the tempting mistake, and it is
+measurably worse: a small systematic bias in pairwise depth registration
+compounds once chained over hundreds of keyframes.  On recordings-1 it drove
+metre-scale pose corrections and stretched the 2.99 m storey to 4.48 m, while
+*improving* local wall agreement -- a self-consistent, badly wrong solution.
+`refine_trajectory` therefore also refuses corrections beyond
+`max_total_correction` and falls back to the raw trajectory.
 
 Open3D pose-graph conventions used throughout: a node's pose is camera-to-world,
 and an edge (i -> j) stores `inv(pose_j) @ pose_i`.
+
 """
 
 from __future__ import annotations
@@ -25,6 +38,14 @@ import open3d as o3d
 
 from .ingest import CaptureBundle, iter_frames
 
+# Relative weights of the two edge families.  ARKit's relative pose between
+# adjacent keyframes is good to a few millimetres; a loop-closure ICP on this
+# depth resolution is good to a centimetre or two.  Information is inverse
+# variance, so the ratio is roughly the square of that -- odometry holds the
+# trajectory's shape while loop edges supply the global correction.
+ODOMETRY_INFORMATION = 1000.0
+LOOP_INFORMATION = 10.0
+
 
 @dataclass
 class DriftReport:
@@ -33,6 +54,7 @@ class DriftReport:
     keyframe_count: int
     loop_edges: int
     loop_candidates: int
+    rejected: bool  # True when the optimisation was discarded as implausible
     sequential_rmse: float
     loop_closure_gap_before: float
     loop_closure_gap_after: float
@@ -114,17 +136,17 @@ def _pairwise_icp(
     init: np.ndarray,
     threshold: float,
 ) -> tuple[np.ndarray, float, float, np.ndarray]:
-    """Point-to-plane ICP, coarse then fine, with an edge information matrix.
+    """Point-to-plane ICP, coarse then fine.
 
     Point-to-plane is the right metric indoors: it lets flat surfaces slide
     over each other instead of forcing spurious point correspondences, which
     is what keeps a featureless wall from dragging the solution sideways.
 
-    The returned information matrix is what makes the pose graph solvable.  It
-    encodes how strongly each edge constrains each degree of freedom -- derived
-    from the actual correspondences -- so a sparse loop edge cannot outvote a
-    dense sequential one.  Weighting every edge equally instead makes the
-    optimiser diverge (metre-scale corrections on this capture).
+    The returned information matrix describes how well the correspondences
+    constrain each degree of freedom.  It is reported for diagnostics; edge
+    weighting in the graph uses the fixed odometry/loop ratio above, because
+    the correspondence-derived scale varies by orders of magnitude with
+    overlap and lets a single high-overlap loop edge dominate the solution.
     """
     result = o3d.pipelines.registration.registration_icp(
         source,
@@ -200,6 +222,7 @@ def refine_trajectory(
     max_depth: float = 5.0,
     loop_fitness_threshold: float = 0.5,
     max_loop_correction: float = 0.5,
+    max_total_correction: float = 0.75,
     enable_loop_closure: bool = True,
 ) -> tuple[np.ndarray, DriftReport]:
     """Return refined camera-to-world poses for every frame, plus a drift report.
@@ -224,14 +247,26 @@ def refine_trajectory(
     for position in range(len(keyframes) - 1):
         source_id, target_id = position, position + 1
         source, target = keyframes[source_id], keyframes[target_id]
-        init = np.linalg.inv(bundle.poses[target]) @ bundle.poses[source]
-        transformation, _, rmse, information = _pairwise_icp(
-            clouds[source], clouds[target], init, threshold
+        # Sequential edges come from ARKit, NOT from ICP.  ARKit's
+        # visual-inertial odometry fuses the whole sequence and is excellent
+        # over the ~0.2 m between keyframes; a pairwise ICP between two
+        # 256x192 depth frames is not, and its small systematic bias compounds
+        # once chained.  Measured on recordings-1: substituting ICP for these
+        # edges warps the reconstruction until the 2.99 m storey reads 4.48 m,
+        # with metre-scale pose corrections, even though local wall agreement
+        # improves.  ICP's job here is loop closure, nothing else.
+        relative = np.linalg.inv(bundle.poses[target]) @ bundle.poses[source]
+        _, _, rmse, _ = _pairwise_icp(
+            clouds[source], clouds[target], relative, threshold
         )
-        sequential_errors.append(rmse)
+        sequential_errors.append(rmse)  # reported, not used to move anything
         graph.edges.append(
             o3d.pipelines.registration.PoseGraphEdge(
-                source_id, target_id, transformation, information, uncertain=False
+                source_id,
+                target_id,
+                relative,
+                np.eye(6) * ODOMETRY_INFORMATION,
+                uncertain=False,
             )
         )
 
@@ -256,9 +291,16 @@ def refine_trajectory(
         )
         if displacement > max_loop_correction:
             continue
+        # Loop edges are weighted well below the odometry edges, so the
+        # solution stays close to ARKit's trajectory and bends only as much as
+        # the revisits actually demand.
         graph.edges.append(
             o3d.pipelines.registration.PoseGraphEdge(
-                source_id, target_id, transformation, information, uncertain=True
+                source_id,
+                target_id,
+                transformation,
+                np.eye(6) * LOOP_INFORMATION,
+                uncertain=True,
             )
         )
         accepted += 1
@@ -275,15 +317,25 @@ def refine_trajectory(
     )
 
     refined_keyframe_poses = np.asarray([node.pose for node in graph.nodes])
-    poses = _propagate(bundle.poses, keyframes, refined_keyframe_poses)
-
     corrections = np.linalg.norm(
         refined_keyframe_poses[:, :3, 3] - bundle.poses[keyframes][:, :3, 3], axis=1
     )
+
+    # A correction this large is not a correction; it means the graph found a
+    # self-consistent but wrong configuration.  Falling back to the raw
+    # trajectory is always recoverable -- shipping a warped reconstruction that
+    # still looks plausible is not.
+    rejected = float(corrections.max()) > max_total_correction
+    if rejected:
+        poses = bundle.poses.copy()
+        refined_keyframe_poses = bundle.poses[keyframes]
+    else:
+        poses = _propagate(bundle.poses, keyframes, refined_keyframe_poses)
     report = DriftReport(
         keyframe_count=len(keyframes),
         loop_edges=accepted,
         loop_candidates=len(candidates),
+        rejected=rejected,
         sequential_rmse=float(np.mean(sequential_errors)) if sequential_errors else 0.0,
         loop_closure_gap_before=float(
             np.linalg.norm(bundle.poses[-1][:3, 3] - bundle.poses[0][:3, 3])

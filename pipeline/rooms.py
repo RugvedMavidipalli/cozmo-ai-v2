@@ -71,8 +71,15 @@ def build_plan_grid(
     resolution: float = 0.04,
     wall_band: tuple[float, float] = (0.35, 1.9),
     floor_band: float = 0.12,
+    trajectory: np.ndarray | None = None,
 ) -> PlanGrid:
-    """Rasterise wall evidence and observed floor into a common grid."""
+    """Rasterise wall evidence and observed floor into a common grid.
+
+    The operator's own path is counted as floor.  Depth sensors see little of
+    the floor when the camera is held level and swept across walls, so whole
+    rooms can end up with too little floor evidence to seed -- but anywhere
+    the camera physically travelled is certainly walkable floor.
+    """
     heights = frame.height(points)
     plan = frame.to_plan(points)
 
@@ -86,13 +93,21 @@ def build_plan_grid(
     )
     floor_mask = np.abs(heights - floor_height) < floor_band
 
-    grid = PlanGrid(
+    free = _accumulate(plan[floor_mask], lower, shape, resolution)
+    if trajectory is not None and len(trajectory):
+        walked = _accumulate(frame.to_plan(trajectory), lower, shape, resolution)
+        # A footprint is strong evidence, so it clears the floor threshold on
+        # its own; dilating covers the operator's body width.
+        free = free + ndimage.grey_dilation(
+            (walked > 0).astype(np.int32) * 10, size=(5, 5)
+        )
+
+    return PlanGrid(
         resolution=resolution,
         origin=lower,
         occupied=_accumulate(plan[wall_mask], lower, shape, resolution),
-        free=_accumulate(plan[floor_mask], lower, shape, resolution),
+        free=free,
     )
-    return grid
 
 
 def _accumulate(
@@ -141,6 +156,7 @@ def segment_rooms(
     if seeds.max() == 0:
         seeds, _ = ndimage.label(free)
     labels = watershed(-distance, seeds, mask=free)
+    labels = _grow_to_walls(labels, barrier)
 
     rooms: list[Room] = []
     for label in range(1, labels.max() + 1):
@@ -165,6 +181,38 @@ def segment_rooms(
     _assign_walls(rooms, walls, grid, labels)
     _link_neighbours(rooms, labels, grid)
     return rooms
+
+
+def _grow_to_walls(
+    labels: np.ndarray, barrier: np.ndarray, max_steps: int = 40
+) -> np.ndarray:
+    """Expand each room across unobserved floor until it meets a wall.
+
+    A room's floor is only partly observed: furniture casts shadows, and the
+    sensor sees little floor near the walls when the camera is held level.
+    Reporting the observed region as the room's area understates it by
+    whatever the furniture covered, which is exactly the bias the 2% floor
+    area gate does not tolerate.  Since a room is bounded by its walls, the
+    labelled region is dilated into the unlabelled gaps and stopped only by
+    barriers -- recovering the enclosed floor rather than the visible floor.
+    """
+    grown = labels.copy()
+    free = ~barrier
+    cross = ndimage.generate_binary_structure(2, 1)
+
+    for _ in range(max_steps):
+        unassigned = free & (grown == 0)
+        if not unassigned.any():
+            break
+        # Dilate every label at once, then keep expansions only where the
+        # cell was previously unclaimed: simultaneous growth means competing
+        # rooms meet in the middle instead of one flooding the other.
+        expanded = ndimage.grey_dilation(grown, footprint=cross)
+        newly = unassigned & (expanded > 0)
+        if not newly.any():
+            break
+        grown[newly] = expanded[newly]
+    return grown
 
 
 def _rasterise_walls(grid: PlanGrid, walls: list[WallSegment]) -> np.ndarray:

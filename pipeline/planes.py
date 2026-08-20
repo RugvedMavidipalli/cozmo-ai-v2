@@ -286,6 +286,87 @@ def _contiguous_runs(sorted_values: np.ndarray, gap: float):
             yield float(sorted_values[start]), float(sorted_values[end]), end - start + 1
 
 
+def merge_collinear(
+    walls: list[WallSegment],
+    offset_tolerance: float = 0.05,
+    angle_tolerance_degrees: float = 5.0,
+    gap_tolerance: float = 0.4,
+) -> list[WallSegment]:
+    """Merge wall fragments that describe the same surface.
+
+    Sequential RANSAC finds one surface several times: a wall interrupted by a
+    doorway, or seen on two visits that drift apart by a few centimetres,
+    yields parallel fragments a short distance from each other.  Left alone
+    they inflate the wall count, split damage across duplicates, and give the
+    room a jagged boundary.
+
+    Normal *direction* is compared, not just orientation, so the two faces of
+    a partition never merge -- they are genuinely different surfaces bounding
+    different rooms, and their separation is the shared-wall thickness the
+    assignment scores.
+    """
+    cosine_limit = np.cos(np.radians(angle_tolerance_degrees))
+    ordered = sorted(walls, key=lambda w: -w.length)
+    merged: list[WallSegment] = []
+
+    for wall in ordered:
+        for target in merged:
+            if target.normal @ wall.normal < cosine_limit:
+                continue
+            if abs(target.offset - wall.offset) > offset_tolerance:
+                continue
+            # Project both onto the target's axis and require them to be
+            # collinear neighbours rather than distant fragments.
+            span = [target.along(wall.start), target.along(wall.end)]
+            lo, hi = min(span), max(span)
+            if lo > target.length + gap_tolerance or hi < -gap_tolerance:
+                continue
+            _absorb(target, wall, lo, hi)
+            break
+        else:
+            merged.append(wall)
+
+    merged.sort(key=lambda w: -w.length)
+    for position, wall in enumerate(merged):
+        wall.index = position
+    return merged
+
+
+def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> None:
+    """Extend `target` to cover `other`, weighting the fit by support."""
+    total = target.inlier_count + other.inlier_count
+    target.offset = (
+        target.offset * target.inlier_count + other.offset * other.inlier_count
+    ) / max(total, 1)
+    target.residual_rms = (
+        target.residual_rms * target.inlier_count
+        + other.residual_rms * other.inlier_count
+    ) / max(total, 1)
+
+    direction = target.direction
+    base = target.normal * target.offset
+    origin = base + direction * (direction @ target.start)
+    new_lo, new_hi = min(0.0, lo), max(target.length, hi)
+    target.start = origin + direction * new_lo
+    target.end = origin + direction * new_hi
+
+    # Observed span is tracked in the merged frame so `inferred_fraction`
+    # still reports how much of the combined wall was actually seen.
+    seen = (
+        target.observed_span[1]
+        - target.observed_span[0]
+        + other.observed_span[1]
+        - other.observed_span[0]
+    )
+    target.observed_span = (0.0, min(seen, new_hi - new_lo))
+    target.inlier_count = total
+    target.height_range = (
+        min(target.height_range[0], other.height_range[0]),
+        max(target.height_range[1], other.height_range[1]),
+    )
+    target.tags = sorted(set(target.tags) | set(other.tags))
+
+
 def snap_to_frame(
     walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 6.0
 ) -> list[WallSegment]:
