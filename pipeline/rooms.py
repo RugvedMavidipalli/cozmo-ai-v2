@@ -161,11 +161,12 @@ def segment_rooms(
     rooms: list[Room] = []
     for label in range(1, labels.max() + 1):
         cells = labels == label
-        area = float(cells.sum() * grid.cell_area)
-        if area < min_area:
+        cell_area = float(cells.sum() * grid.cell_area)
+        if cell_area < min_area:
             continue
         indices = np.argwhere(cells)
         centroid = grid.to_plan(indices.mean(axis=0))
+        area, polygon = _polygon_area(_boundary_polygon(cells, grid), cell_area)
         room = Room(
             id=len(rooms),
             name=f"room_{len(rooms) + 1}",
@@ -173,7 +174,7 @@ def segment_rooms(
             centroid=centroid,
             floor_height=floor_height,
             ceiling_height=ceiling_height,
-            polygon=_boundary_polygon(cells, grid),
+            polygon=polygon,
         )
         rooms.append(room)
         labels[cells] = -(room.id + 1)  # renumber to the compacted room ids
@@ -234,17 +235,156 @@ def _rasterise_walls(grid: PlanGrid, walls: list[WallSegment]) -> np.ndarray:
     return ndimage.binary_dilation(barrier, np.ones((3, 3)))
 
 
-def _boundary_polygon(cells: np.ndarray, grid: PlanGrid) -> np.ndarray | None:
-    """Outer boundary of a room's cells, simplified to a polygon."""
+def _boundary_polygon(
+    cells: np.ndarray, grid: PlanGrid, snap_degrees: float = 32.0
+) -> np.ndarray | None:
+    """Outer boundary of a room's cells as a rectilinear polygon.
+
+    The raw marching-squares contour is a staircase of 4 cm steps, and its
+    length is meaningless: a 14 m2 room came out with a 48 m perimeter, which
+    would then inflate both the floor-area interval and the mold containment
+    barrier that is priced off perimeter.
+
+    Plan coordinates are already expressed in the building's Manhattan frame,
+    so a room's edges should lie along the axes.  Edges close to an axis are
+    snapped to it and consecutive co-directional edges merged; corners are then
+    recovered by intersecting adjacent edge lines.  Genuinely angled walls
+    (beyond `snap_degrees`) are left alone.
+    """
     from skimage import measure
 
     padded = np.pad(cells.astype(float), 1)
     contours = measure.find_contours(padded, 0.5)
     if not contours:
         return None
+
     contour = max(contours, key=len) - 1.0
-    simplified = measure.approximate_polygon(contour, tolerance=1.2)
-    return grid.origin + simplified * grid.resolution
+    # Tolerance is in cells. `_rectify` discards sub-25 cm edges, which is what
+    # actually removes the staircase, so this only needs to be large enough to
+    # keep the vertex count manageable -- and a larger value would cut real
+    # corners, biasing every room's area low.
+    simplified = measure.approximate_polygon(contour, tolerance=1.5)
+    # A cell's extent is [i, i+1) in contour coordinates, so its centre is at
+    # i + 0.5.  Omitting the half-cell shift offsets every room boundary
+    # inward by 2 cm, which the 2% floor-area gate cannot spare.
+    polygon = grid.origin + (simplified + 0.5) * grid.resolution
+    if len(polygon) < 4:
+        return polygon
+    if np.allclose(polygon[0], polygon[-1]):
+        polygon = polygon[:-1]
+    return _rectify(polygon, snap_degrees)
+
+
+def _polygon_area(
+    polygon: np.ndarray | None, cell_area: float
+) -> tuple[float, np.ndarray | None]:
+    """Area and cleaned outline for a room, from its rectified polygon.
+
+    Area and perimeter must come from the same shape or the scope's
+    perimeter-priced items (containment barrier) will not match its
+    area-priced ones.  Rectification can occasionally produce a self-touching
+    outline, so the polygon is validated; if it cannot be repaired, or if it
+    disagrees wildly with the rasterised cells, the cell count wins because it
+    cannot be wrong by construction.
+    """
+    if polygon is None or len(polygon) < 3:
+        return cell_area, polygon
+
+    from shapely.geometry import Polygon
+
+    shape = Polygon(polygon)
+    if not shape.is_valid:
+        shape = shape.buffer(0)
+    if shape.is_empty or shape.geom_type != "Polygon":
+        return cell_area, polygon
+
+    area = float(shape.area)
+    if not 0.6 * cell_area <= area <= 1.6 * cell_area:
+        return cell_area, polygon
+    return area, np.asarray(shape.exterior.coords)[:-1]
+
+
+def _rectify(
+    polygon: np.ndarray, snap_degrees: float, min_edge: float = 0.25
+) -> np.ndarray:
+    """Snap near-axis edges to the axes and rebuild corners by intersection.
+
+    Short edges are discarded before merging.  A rasterised staircase
+    *alternates* horizontal and vertical steps, so merging only consecutive
+    co-directional edges would never collapse one -- the steps are individually
+    axis-aligned and each interrupts the next.  Dropping every edge below
+    `min_edge` removes the steps while keeping real features like an alcove,
+    and what survives are the room's actual runs.
+    """
+    count = len(polygon)
+    edges: list[tuple[np.ndarray, np.ndarray, float]] = []
+
+    for index in range(count):
+        start, end = polygon[index], polygon[(index + 1) % count]
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length < min_edge:
+            continue
+        direction = delta / length
+        angle = np.degrees(np.arctan2(abs(direction[1]), abs(direction[0])))
+        if angle < snap_degrees:
+            direction = np.array([1.0, 0.0])
+        elif angle > 90 - snap_degrees:
+            direction = np.array([0.0, 1.0])
+        edges.append((direction, 0.5 * (start + end), length))
+
+    if len(edges) < 3:
+        return polygon
+
+    # Merge consecutive co-directional edges, weighting each by its length so a
+    # long run places the line and a leftover stub barely moves it.
+    merged: list[tuple[np.ndarray, np.ndarray, float]] = []
+    for direction, point, length in edges:
+        if merged and abs(float(merged[-1][0] @ direction)) > 0.999:
+            previous_direction, previous_point, weight = merged[-1]
+            merged[-1] = (
+                previous_direction,
+                (previous_point * weight + point * length) / (weight + length),
+                weight + length,
+            )
+        else:
+            merged.append((direction, point, length))
+
+    # The first and last edges are also neighbours around the loop.
+    if len(merged) > 2 and abs(float(merged[0][0] @ merged[-1][0])) > 0.999:
+        direction, point, weight = merged.pop()
+        first_direction, first_point, first_weight = merged[0]
+        merged[0] = (
+            first_direction,
+            (first_point * first_weight + point * weight) / (first_weight + weight),
+            first_weight + weight,
+        )
+
+    if len(merged) < 3:
+        return polygon
+
+    vertices = []
+    for index in range(len(merged)):
+        a_direction, a_point, _ = merged[index]
+        b_direction, b_point, _ = merged[(index + 1) % len(merged)]
+        corner = _intersect(a_direction, a_point, b_direction, b_point)
+        vertices.append(corner if corner is not None else b_point)
+    return np.asarray(vertices)
+
+
+def _intersect(
+    direction_a: np.ndarray,
+    point_a: np.ndarray,
+    direction_b: np.ndarray,
+    point_b: np.ndarray,
+) -> np.ndarray | None:
+    """Intersection of two lines given as (direction, point-on-line)."""
+    denominator = direction_a[0] * direction_b[1] - direction_a[1] * direction_b[0]
+    if abs(denominator) < 1e-9:  # parallel: no corner to recover
+        return None
+    delta = point_b - point_a
+    t = (delta[0] * direction_b[1] - delta[1] * direction_b[0]) / denominator
+    return point_a + direction_a * t
 
 
 def _assign_walls(
