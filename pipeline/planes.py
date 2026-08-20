@@ -426,6 +426,137 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
     target.tags = sorted(set(target.tags) | set(other.tags))
 
 
+def _ray_crosses_wall(
+    camera: np.ndarray, target: np.ndarray, wall: WallSegment, margin_fraction: float
+) -> np.ndarray:
+    """Boolean mask: does camera[i]->target[i] cross `wall`'s solid span strictly between them?
+
+    Vectorised over many rays against one wall -- this is the inner loop of
+    `filter_occluded_walls`, tested once per (candidate wall, blocker) pair
+    rather than once per point, which is what keeps that function fast.
+
+    Deliberately not built on `_segment_intersection`: that helper compares
+    two whole `WallSegment`s with a angle-based parallel cutoff meant for
+    finding corners, whereas this compares many short rays against one wall
+    with a magnitude-based cutoff and a margin expressed as a fraction of the
+    wall's own length -- different enough parametrisations that sharing code
+    would obscure both.
+    """
+    ray = target - camera
+    wall_vector = wall.end - wall.start
+    denominator = ray[:, 0] * wall_vector[1] - ray[:, 1] * wall_vector[0]
+    parallel = np.abs(denominator) < 1e-9
+    safe_denominator = np.where(parallel, 1.0, denominator)
+
+    diff = wall.start - camera
+    t = (diff[:, 0] * wall_vector[1] - diff[:, 1] * wall_vector[0]) / safe_denominator
+    s = (diff[:, 0] * ray[:, 1] - diff[:, 1] * ray[:, 0]) / safe_denominator
+
+    return (
+        ~parallel
+        & (t > 0.02) & (t < 0.98)  # strictly between camera and the point
+        & (s > margin_fraction) & (s < 1 - margin_fraction)  # within wall's solid span
+    )
+
+
+def filter_occluded_walls(
+    walls: list[WallSegment],
+    frame: HorizontalFrame,
+    points: np.ndarray,
+    origins: np.ndarray,
+    band: float = 0.06,
+    corner_margin: float = 0.15,
+    min_points: int = 200,
+    min_blocker_length: float = 1.0,
+    occlusion_fraction: float = 0.6,
+) -> tuple[list[WallSegment], int]:
+    """Drop candidate walls whose points require passing through a solid wall.
+
+    `merge_collinear` handles surfaces that sit too close to the camera --
+    furniture standing in front of a wall, occluding it.  This handles the
+    opposite geometry: a candidate plane sitting too far away, whose points
+    could only have been produced by light that passed through an already
+    better-supported wall to get there.  That is physically impossible for a
+    real, independently-measurable surface.
+
+    Two distinct cases were confirmed on recordings-1, traced by hand rather
+    than assumed:
+
+    * A candidate 15 cm and 9 cm behind an accepted wall, with an exactly
+      *opposite* normal -- too thin to be a second room's wall, and the wrong
+      separation to be that wall's own far face properly observed (interior
+      partitions run 9-15 cm, which is what these are: a sliver of the SAME
+      wall's far face, grazed through a doorway edge from the near room, that
+      RANSAC fitted as if it were its own freestanding wall). `merge_collinear`
+      does not catch this -- opposite-facing near-parallel planes are its
+      signature for two rooms sharing a partition, which is correct in
+      general, just not here.
+    * A candidate blocked by a wall at a completely different angle (0 degree
+      normal alignment, i.e. perpendicular) across most of its points -- no
+      thin-partition explanation available, so it is a stray fragment (noise,
+      multipath, or a glimpse of a room not yet separated by `rooms.py`, which
+      runs after this).
+
+    Both signatures are physically impossible for a freestanding wall and were
+    removed identically; the code does not need to (and does not try to)
+    distinguish them.
+
+    A candidate is tested only against *stronger* walls (`min_blocker_length`
+    keeps stub fragments from acting as blockers), so a real wall is never at
+    risk from a weaker impostor, and the check is majority-vote per wall
+    (`occlusion_fraction`) rather than any-single-ray, so one grazing ray
+    through a genuine doorway gap can't condemn an otherwise-solid wall.
+    """
+    plan = frame.to_plan(points)
+    camera = frame.to_plan(origins)
+    ordered = sorted(walls, key=lambda w: -w.inlier_count)
+    kept: list[WallSegment] = []
+    dropped = 0
+
+    for wall in ordered:
+        blockers = [
+            other
+            for other in walls
+            if other is not wall
+            and other.inlier_count > wall.inlier_count
+            and other.length >= min_blocker_length
+        ]
+        if not blockers:
+            kept.append(wall)
+            continue
+
+        distance = plan @ wall.normal - wall.offset
+        along = (plan - wall.start) @ wall.direction
+        near = (
+            (np.abs(distance) < band)
+            & (along > corner_margin)
+            & (along < wall.length - corner_margin)
+        )
+        if near.sum() < min_points:
+            kept.append(wall)  # too little evidence either way: fail open
+            continue
+
+        near_camera, near_target = camera[near], plan[near]
+        blocked = np.zeros(near.sum(), bool)
+        for blocker in blockers:
+            if blocked.all():
+                break
+            margin_fraction = min(corner_margin / max(blocker.length, 1e-6), 0.45)
+            blocked |= _ray_crosses_wall(
+                near_camera, near_target, blocker, margin_fraction
+            )
+
+        if float(blocked.mean()) >= occlusion_fraction:
+            dropped += 1
+            continue
+        kept.append(wall)
+
+    kept.sort(key=lambda w: -w.length)
+    for position, wall in enumerate(kept):
+        wall.index = position
+    return kept, dropped
+
+
 def _segment_intersection(
     a: WallSegment, b: WallSegment
 ) -> tuple[np.ndarray, float, float] | None:

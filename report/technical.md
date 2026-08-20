@@ -113,6 +113,46 @@ clips every candidate to the same height band before RANSAC runs, so it
 saturates at the band limits for walls and countertops alike. It is documented
 as unusable rather than quietly relied on.
 
+### 3.0a Occlusion filtering: a wall behind a wall
+
+`merge_collinear` removes surfaces sitting too *close* to the camera --
+furniture in front of a wall. The opposite geometry needs a different test: a
+candidate plane too *far* away, whose points could only exist if light passed
+through an already-better-supported wall to reach them. That's physically
+impossible for a freestanding surface, so `filter_occluded_walls` traces, per
+candidate, the ray from each supporting point back to the camera that observed
+it, and drops the wall if a majority of those rays cross the solid span of a
+stronger wall on the way.
+
+Two of the drops on recordings-1 were traced by hand rather than trusted on
+faith, because both had real support (2,942 and 5,595 pts/m -- denser than
+several kept walls) and a plausible reflection or noise artifact should not:
+
+- A candidate 15 cm behind an accepted wall with an *exactly opposite* normal.
+  Too thin to be a second room's wall, and the wrong geometry to be that
+  wall's own far face properly observed -- interior partitions run 9-15 cm,
+  which is what this is: a sliver of the *same* wall's far face, grazed
+  through a doorway edge from the near room, fitted by RANSAC as if it were
+  its own freestanding wall. `merge_collinear` cannot catch this: opposite-
+  facing near-parallel planes are its signature for two rooms sharing a
+  partition, correctly in general, just not here.
+- A candidate blocked by a wall at 90 degrees to it across most of its points
+  -- no thin-partition explanation available, so a stray fragment (noise,
+  multipath, or a glimpse of a room not yet separated by `rooms.py`, which
+  runs after this stage).
+
+| capture | walls before | occlusion-inconsistent removed | drift after |
+|---|---:|---:|---:|
+| recordings-1 | 45 | 13 | 9.9 mm (unchanged) |
+| recordings-2 | 52 | 15 | 13.9 mm (was 10.3 mm) |
+
+recordings-2's drift number is reported as measured, not cherry-picked: it
+*rose*. Same caveat as §3.0 -- drift is measured only over walls that survive
+to be revisited, and removing genuine (if duplicative) observations can shrink
+that population unfavourably as easily as favourably. The claim this stage
+supports is a cleaner, non-duplicated wall *set*, not a guaranteed drift win on
+every capture.
+
 ### 3.0b Precision refinement: visits, crossings, corners
 
 Three refinements close the gap between "a plane was fitted" and "a wall was

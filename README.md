@@ -124,6 +124,19 @@ stretching the 2.99 m storey to 4.48 m — a self-consistent, badly wrong
 solution. Sequential edges now come from ARKit weighted ~100× above ICP loop
 edges, and `refine_trajectory` refuses its own output past a 75 cm correction.
 
+**A wall behind a wall gets filtered by ray occlusion, not proximity.**
+`merge_collinear` removes clutter too *close* to the camera (furniture in
+front of a wall). `filter_occluded_walls` handles the opposite case — a
+candidate too *far* away, whose points could only exist if the observing ray
+passed through an already-stronger wall. Traced by hand on recordings-1: one
+drop was a 15 cm-behind, opposite-normal sliver — too thin to be a second
+room, the wrong geometry to be that wall's own far face properly observed, so
+it's the same wall's far face grazed through a doorway edge and fitted as its
+own wall; another was blocked by a wall at 90°, with no thin-partition
+explanation, i.e. stray noise. 13–15 walls dropped per capture; drift held
+steady on one capture and rose on the other — reported as measured, since the
+claim is a de-duplicated wall set, not a guaranteed drift win.
+
 **One occupancy grid does three jobs.** Openings, occlusion, and damage fusion
 are all questions about *where on this surface*, so they share one UV grid per
 wall (`pipeline/occupancy.py`). Damage votes accumulate into that fixed grid, so

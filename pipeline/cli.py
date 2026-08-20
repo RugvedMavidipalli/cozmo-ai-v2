@@ -14,7 +14,7 @@ from . import export
 from .damage import fusion as damage_fusion
 from .damage.masks import refine
 from .damage.vlm import DamageAnalyzer
-from .drift import measure_drift, refit_wall_offsets, sample_world_points
+from .drift import measure_drift, refit_wall_offsets, sample_world_points_with_origin
 from .fuse import fuse
 from .geometry import estimate_gravity
 from .ingest import load_capture, iter_frames
@@ -23,6 +23,7 @@ from .occupancy import build_surface_grid, find_openings, occluded_spans
 from .planes import (
     estimate_horizontal_frame,
     extract_walls,
+    filter_occluded_walls,
     merge_collinear,
     resolve_crossings,
     snap_corners,
@@ -99,30 +100,38 @@ def run(args: argparse.Namespace) -> int:
     normals = np.asarray(cloud.normals)
     print(f"  {len(points)} points")
 
+    with timings.stage("sampling"):
+        # Provenance-tagged points (with the camera origin each was observed
+        # from) are needed by both wall extraction below (occlusion
+        # filtering) and wall refinement further down (per-visit offset
+        # refit, drift). Sampling once and threading the result through both
+        # avoids paying for the back-projection twice.
+        sampled, origins, times = sample_world_points_with_origin(
+            bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses,
+            max_depth=args.max_depth,
+        )
+
     with timings.stage("geometry"):
         gravity = estimate_gravity(points, hint=bundle.gravity_up, normals=normals)
         frame = estimate_horizontal_frame(normals, gravity.up)
         band = wall_band_mask(points, normals, gravity, gravity.up)
         walls = extract_walls(frame.to_plan(points[band]), frame.height(points[band]))
         walls = merge_collinear(snap_to_frame(walls, frame))
+        walls, occluded_out = filter_occluded_walls(walls, frame, sampled, origins)
     ceiling = gravity.ceiling_height
     print(
-        f"  {len(walls)} walls, room height "
-        f"{gravity.room_height:.3f} m" if gravity.room_height else "  no ceiling found"
+        f"  {len(walls)} walls ({occluded_out} occlusion-inconsistent removed), "
+        f"room height {gravity.room_height:.3f} m" if gravity.room_height
+        else "  no ceiling found"
     )
     if gravity.room_height is None:
         warnings.append("no ceiling plane found; heights are unavailable")
 
     with timings.stage("wall refinement"):
-        # One time-tagged sampling serves the per-visit offset refit and the
-        # drift measurement. Drift is measured BEFORE extents change: crossing
-        # resolution and corner snapping move endpoints, never offsets, so
-        # they cannot alter a wall's true visit spread -- they only shrink
-        # the association windows and starve the estimator.
-        sampled, times = sample_world_points(
-            bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses,
-            max_depth=args.max_depth,
-        )
+        # Drift is measured BEFORE extents change: crossing resolution and
+        # corner snapping move endpoints, never offsets, so they cannot alter
+        # a wall's true visit spread -- they only shrink the association
+        # windows and starve the estimator.
         refitted = refit_wall_offsets(walls, frame, sampled, times)
         drift = measure_drift(walls, frame, sampled, times)
         walls = resolve_crossings(walls)

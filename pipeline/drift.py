@@ -59,6 +59,59 @@ class DriftMeasurement:
         )
 
 
+def _sample_provenance(
+    bundle: CaptureBundle,
+    indices: np.ndarray,
+    poses: np.ndarray | None,
+    stride: int,
+    min_confidence: int,
+    max_depth: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shared back-projection loop: world points, their camera origins, and times.
+
+    Origin is the camera position each point was observed from -- one extra
+    array costs nothing extra to compute (the pose is already read to place
+    the point) and is what lets `planes.filter_occluded_walls` ask "did the
+    ray from here to this point have to pass through solid wall".
+    """
+    pose_table = bundle.poses if poses is None else poses
+    intrinsics = bundle.intrinsics
+    point_chunks: list[np.ndarray] = []
+    origin_chunks: list[np.ndarray] = []
+    time_chunks: list[np.ndarray] = []
+
+    for frame in iter_frames(
+        bundle, indices, min_confidence=min_confidence, max_depth=max_depth
+    ):
+        depth = frame.depth[::stride, ::stride]
+        valid = depth > 0
+        if not valid.any():
+            continue
+        vs, us = np.nonzero(valid)
+        z = depth[valid]
+        camera_points = np.stack(
+            [
+                (us * stride - intrinsics[0, 2]) * z / intrinsics[0, 0],
+                (vs * stride - intrinsics[1, 2]) * z / intrinsics[1, 1],
+                z,
+            ],
+            axis=1,
+        )
+        pose = pose_table[frame.index]
+        world = camera_points @ pose[:3, :3].T + pose[:3, 3]
+        point_chunks.append(world)
+        origin_chunks.append(np.broadcast_to(pose[:3, 3], world.shape))
+        time_chunks.append(np.full(len(world), frame.timestamp))
+
+    if not point_chunks:
+        return np.empty((0, 3)), np.empty((0, 3)), np.empty(0)
+    return (
+        np.vstack(point_chunks),
+        np.vstack(origin_chunks),
+        np.concatenate(time_chunks),
+    )
+
+
 def sample_world_points(
     bundle: CaptureBundle,
     indices: np.ndarray,
@@ -72,35 +125,24 @@ def sample_world_points(
     Unlike TSDF output these points keep their provenance, which is what makes
     a per-visit analysis possible at all.
     """
-    pose_table = bundle.poses if poses is None else poses
-    intrinsics = bundle.intrinsics
-    chunks: list[np.ndarray] = []
-    times: list[np.ndarray] = []
+    points, _origins, times = _sample_provenance(
+        bundle, indices, poses, stride, min_confidence, max_depth
+    )
+    return points, times
 
-    for frame in iter_frames(
-        bundle, indices, min_confidence=min_confidence, max_depth=max_depth
-    ):
-        depth = frame.depth[::stride, ::stride]
-        valid = depth > 0
-        if not valid.any():
-            continue
-        vs, us = np.nonzero(valid)
-        z = depth[valid]
-        points = np.stack(
-            [
-                (us * stride - intrinsics[0, 2]) * z / intrinsics[0, 0],
-                (vs * stride - intrinsics[1, 2]) * z / intrinsics[1, 1],
-                z,
-            ],
-            axis=1,
-        )
-        pose = pose_table[frame.index]
-        chunks.append(points @ pose[:3, :3].T + pose[:3, 3])
-        times.append(np.full(len(points), frame.timestamp))
 
-    if not chunks:
-        return np.empty((0, 3)), np.empty(0)
-    return np.vstack(chunks), np.concatenate(times)
+def sample_world_points_with_origin(
+    bundle: CaptureBundle,
+    indices: np.ndarray,
+    poses: np.ndarray | None = None,
+    stride: int = 3,
+    min_confidence: int = 1,
+    max_depth: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`sample_world_points`, plus each point's camera origin. See `_sample_provenance`."""
+    return _sample_provenance(
+        bundle, indices, poses, stride, min_confidence, max_depth
+    )
 
 
 def refit_wall_offsets(

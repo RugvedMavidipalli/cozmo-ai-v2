@@ -6,8 +6,8 @@ Generated 2026-08-20 from pipeline output. Every figure is read from `result.jso
 
 | capture | frames | duration | path | rooms | walls | openings | runtime |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| recordings-1 | 3997 | 67 s | 41.6 m | 5 | 36 | 5 | 74 s |
-| recordings-2 | 5443 | 91 s | 54.1 m | 5 | 46 | 2 | 148 s |
+| recordings-1 | 3997 | 67 s | 41.6 m | 5 | 26 | 3 | 99 s |
+| recordings-2 | 5443 | 91 s | 54.1 m | 5 | 32 | 2 | 820 s |
 
 ## Accuracy gates
 
@@ -27,8 +27,8 @@ Drift is measured as **wall revisit spread**: each wall's supporting points are 
 
 | capture | median | p90 | max | revisited walls |
 |---|---:|---:|---:|---:|
-| recordings-1 | 9.9 mm | 33.5 mm | 51.8 mm | 14 |
-| recordings-2 | 10.3 mm | 26.2 mm | 31.4 mm | 14 |
+| recordings-1 | 9.9 mm | 33.8 mm | 51.8 mm | 12 |
+| recordings-2 | 13.9 mm | 26.7 mm | 31.4 mm | 12 |
 
 ### Ablation: trajectory refinement
 
@@ -43,16 +43,17 @@ Drift is measured as **wall revisit spread**: each wall's supporting points are 
 
 | stage | mean seconds |
 |---|---:|
-| total | 110.9 |
-| geometry | 37.2 |
-| wall refinement | 33.5 |
-| fusion | 33.3 |
-| surfaces | 2.8 |
+| total | 459.6 |
+| geometry | 373.4 |
+| fusion | 40.8 |
+| sampling | 31.4 |
+| wall refinement | 3.7 |
+| surfaces | 3.3 |
 | rooms | 0.9 |
 | ingest | 0.2 |
-| scope | 0.0 |
+| scope | 0.1 |
 
-Capture-to-scope runtime: **22 s per room** (gate <= 300 s, stretch <= 90 s) — PASS. Hardware: Intel Core i9-9980HK, 16 threads, no GPU.
+Capture-to-scope runtime: **92 s per room** (gate <= 300 s, stretch <= 90 s) — PASS. Hardware: Intel Core i9-9980HK, 16 threads, no GPU.
 
 ## Damage and scope
 
