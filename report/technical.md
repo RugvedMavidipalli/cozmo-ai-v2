@@ -176,14 +176,35 @@ Ungated depth changed drift by only 3.3% on recordings-1 ✅ — but that is an
 undamaged, well-lit property. The adversarial held-out room (mirrored closet,
 glass shower) is where confidence gating should separate sharply.
 
-### 3.5 Gating sweep
+### 3.5 Gating sweep — acting on the findings
 
-<!-- GATING_TABLE -->
+Discarding data to gain accuracy is a trade, not a free win: fewer returns means
+less support for the plane fits and less wall reconstructed. Measured, not
+assumed (`tools/gating_sweep.py`, recordings-1): ✅
 
-The trade is accuracy against coverage: discarding low-confidence and long-range
-returns removes support from the plane fits and shrinks the reconstructed wall
-area. This is measured rather than assumed, and the chosen default is the knee
-of that curve.
+| min confidence | max depth | drift median | wall coverage | walls | Δ drift | Δ coverage |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 5.0 m *(old default)* | 22.8 mm | 116.6 m | 31 | — | — |
+| 2 | 5.0 m | 20.2 mm | 92.9 m | 27 | +11.4% | −20.3% |
+| **1** | **3.5 m** *(new default)* | **20.9 mm** | **115.8 m** | **35** | **+8.2%** | **−0.7%** |
+| 2 | 3.5 m | 22.4 mm | 90.1 m | 29 | +1.7% | −22.7% |
+| 2 | 2.5 m | 13.5 mm | 57.8 m | 19 | +40.6% | −50.4% |
+
+**`--max-depth 3.5` is nearly free** — 8.2% less drift for 0.7% less coverage —
+and it lands exactly where §3.4 predicted the bias knee. It is now the default.
+
+Tightening confidence to level 2 costs a fifth of the wall coverage for less
+gain, so medium confidence remains the default on well-lit properties; the flag
+exists because the adversarial room is where that should reverse.
+
+The last row is tempting and rejected: 40% less drift, but half the wall
+coverage and only 19 walls survive. A wall that is not reconstructed cannot be
+measured accurately — it simply is not there.
+
+*Caveat:* each row fits its own wall set, so the drift figures are not measured
+over identical populations and the small differences are noisier than they look.
+The 3.5 m row is chosen because it is corroborated by the independent range
+analysis in §3.4, not on its drift delta alone.
 
 ---
 

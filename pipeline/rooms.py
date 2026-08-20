@@ -185,7 +185,7 @@ def segment_rooms(
 
 
 def _grow_to_walls(
-    labels: np.ndarray, barrier: np.ndarray, max_steps: int = 40
+    labels: np.ndarray, barrier: np.ndarray, max_steps: int = 14
 ) -> np.ndarray:
     """Expand each room across unobserved floor until it meets a wall.
 
@@ -194,8 +194,15 @@ def _grow_to_walls(
     Reporting the observed region as the room's area understates it by
     whatever the furniture covered, which is exactly the bias the 2% floor
     area gate does not tolerate.  Since a room is bounded by its walls, the
-    labelled region is dilated into the unlabelled gaps and stopped only by
+    labelled region is dilated into the unlabelled gaps and stopped by
     barriers -- recovering the enclosed floor rather than the visible floor.
+
+    The step limit matters as much as the barrier.  Wall evidence is never a
+    closed curve -- doorways, unscanned spans and grazing dropout all leave
+    gaps -- so unbounded growth escapes through them and floods a neighbouring
+    space.  Capping the reach at ~0.6 m fills furniture shadows and the
+    sensor's blind strip along the skirting, which is what the bias actually
+    comes from, while keeping an escape confined to a doorway's depth.
     """
     grown = labels.copy()
     free = ~barrier

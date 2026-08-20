@@ -24,7 +24,7 @@ def fuse(
     voxel_size: float = 0.02,
     sdf_trunc: float | None = None,
     min_confidence: int = 1,
-    max_depth: float = 6.0,
+    max_depth: float = 3.5,
 ) -> Reconstruction:
     """TSDF-fuse `indices` of `bundle` into a mesh.
 

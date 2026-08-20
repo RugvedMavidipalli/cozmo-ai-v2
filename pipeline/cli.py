@@ -463,7 +463,11 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--model", default="claude-opus-5")
     runner.add_argument("--stride", type=int, default=4)
     runner.add_argument("--voxel", type=float, default=0.02)
-    runner.add_argument("--max-depth", type=float, default=5.0)
+    # 3.5 m is the knee measured by tools/depth_bias.py: ARKit depth is well
+    # behaved below it and reads systematically far above it (+11.6 mm at
+    # 5.4 m).  tools/gating_sweep.py confirms the trade is nearly free --
+    # 8.2% less drift for 0.7% less wall coverage.
+    runner.add_argument("--max-depth", type=float, default=3.5)
     runner.add_argument("--min-confidence", type=int, default=1)
     runner.add_argument("--damage-frames", type=int, default=40)
     runner.add_argument("--min-views", type=int, default=2)

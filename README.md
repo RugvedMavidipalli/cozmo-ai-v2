@@ -100,8 +100,23 @@ of two wall planes is where a tape measure would go.
 **Drift is measured by revisit spread, not by point scatter.** RMS scatter about
 a fitted wall is mostly depth noise, and a plane fit averages it away — it is
 nearly blind to drift. `pipeline/drift.py` instead groups each wall's points by
-*when* they were observed and reports the spread between visits. On the sample
-capture that is a median of 26 mm, which is the real error budget.
+*when* they were observed and reports the spread between visits.
+
+**The dominant error is the depth sensor, not the trajectory.** Having built the
+drift metric, the honest finding is that loop closure buys only 1.8% of it
+(21.8 → 21.4 mm on recordings-1) — so further pose engineering would have been
+wasted. `tools/depth_bias.py` attributes the rest by physical signature over
+1.46 M observations: ARKit depth is well behaved to ~3.4 m then reads
+systematically **far** (+4.3 mm at 4.0 m, +11.6 mm at 5.4 m), incidence angle
+shows no monotonic trend, and ARKit's own confidence is strongly informative by
+spread (32 mm IQR at level 2 vs 58 mm at level 0). Both actionable findings are
+exposed as `--max-depth` and `--min-confidence`.
+
+**ARKit odometry is trusted; ICP is only for loop closure.** Building sequential
+pose-graph edges from pairwise ICP *lowered* measured drift by 66% while
+stretching the 2.99 m storey to 4.48 m — a self-consistent, badly wrong
+solution. Sequential edges now come from ARKit weighted ~100× above ICP loop
+edges, and `refine_trajectory` refuses its own output past a 75 cm correction.
 
 **One occupancy grid does three jobs.** Openings, occlusion, and damage fusion
 are all questions about *where on this surface*, so they share one UV grid per
@@ -156,10 +171,17 @@ bench/           ground-truth entry, gate scoring, calibration fitting
 
 ## Known limitations
 
-- Room polygons follow observed floor rather than snapping to the fitted wall
-  lines, so reported areas are biased low where furniture blocked the floor.
-- Loop-closure edge acceptance is not yet tuned; `--no-loop-closure` is
-  currently the safer default on long captures.
+- Room polygons are rectified from the floor raster, not from the fitted wall
+  lines. Synthetic rooms come out ~1.2% low in area; snapping to the walls
+  themselves is the principled fix and is not done yet.
+- Loop closure has little leverage on open trajectories — recordings-2 ends
+  7.3 m from its start with few revisits, so drift there rests on odometry
+  quality alone.
+- Occlusion detection over-triggers on recordings-2, marking spans inferred
+  that were merely viewed at a grazing angle. Errs toward understating
+  confidence, but is noisy.
 - Water Class (1–4) is rarely inferable from imagery alone and is usually
   returned null rather than guessed.
 - The no-LiDAR fallback path is not yet wired into the CLI.
+- Damage output requires `ANTHROPIC_API_KEY`; without it the geometry tracks
+  run and the scope comes out empty.
