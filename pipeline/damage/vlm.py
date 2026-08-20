@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 DEFAULT_MODEL = "claude-opus-5"
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"  # v4: bbox is {x0,y0,x1,y1}, not a 4-array (API rejects minItems>1)
 
 DAMAGE_CLASSES = ("water", "fire", "mold", "none")
 
@@ -72,8 +72,8 @@ burned; consumed means material is missing.
 - mold: subtype surface_growth or colonized. Condition 1 (normal fungal \
 ecology), 2 (settled spores / light surface), 3 (actual visible growth).
 
-Give every region a bounding box in normalized 0-1000 coordinates as \
-[x0, y0, x1, y1] with the origin at the top-left of the image.
+Give every region a bounding box as {x0, y0, x1, y1} in normalized 0-1000 \
+coordinates, origin at the top-left of the image.
 
 Be conservative. An empty list is the correct answer for an undamaged frame."""
 
@@ -106,11 +106,23 @@ RESPONSE_SCHEMA = {
                         "type": ["string", "null"],
                         "description": "soot|char|consumed for fire; surface_growth|colonized for mold; staining|saturation for water.",
                     },
+                    # A 4-element array would be the natural shape, but the
+                    # structured-output API rejects minItems/maxItems values
+                    # other than 0 or 1 -- there is no schema-level way to
+                    # require exactly 4 entries in an array. An object with
+                    # four required numeric fields gets the same guarantee
+                    # (every region really does have four coordinates) through
+                    # a mechanism the API actually supports.
                     "bbox": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["x0", "y0", "x1", "y1"],
+                        "properties": {
+                            "x0": {"type": "number"},
+                            "y0": {"type": "number"},
+                            "x1": {"type": "number"},
+                            "y1": {"type": "number"},
+                        },
                     },
                     "confidence": {"type": "number"},
                     "surface_hint": {
@@ -290,8 +302,10 @@ class DamageAnalyzer:
         for region in raw.get("regions", []):
             if region.get("damage_class") in (None, "none"):
                 continue
-            box = region.get("bbox") or [0, 0, 0, 0]
-            x0, y0, x1, y1 = (float(v) for v in box)
+            box = region.get("bbox") or {}
+            x0, y0, x1, y1 = (
+                float(box.get(key, 0.0)) for key in ("x0", "y0", "x1", "y1")
+            )
             detections.append(
                 Detection(
                     frame_index=frame_index,
