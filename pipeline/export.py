@@ -269,7 +269,9 @@ def _dimension(
     if angle > 90 or angle < -90:
         angle += 180
 
-    label = f"{measurement['value']:.2f}"
+    # "m" is stamped on every label, not just stated once in the legend: a
+    # cropped or covered legend must not leave a bare number's unit ambiguous.
+    label = f"{measurement['value']:.2f} m"
     half = measurement.get("half_width")
     if half:
         label += f" ±{half * 100:.0f}cm"
