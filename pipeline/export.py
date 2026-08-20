@@ -321,10 +321,18 @@ def _legend(drawing, height, result, placer: _LabelPlacer) -> None:
     damage_classes = {r["damage_class"] for r in result.get("damage", [])}
     entries += [(c, f"{c} damage") for c in sorted(damage_classes)]
 
+    walls = result["reconstruction"]["walls"]
+    total_length = sum(w["length"]["value"] for w in walls)
+    total_area = sum(r["area"]["value"] for r in result.get("rooms", []))
+    summary_lines = [
+        f"total wall length {total_length:.1f} m over {len(walls)} walls",
+        f"total floor area {total_area:.1f} m² in {len(result.get('rooms', []))} rooms",
+    ]
+
     y = 20
     drawing.add(
         drawing.rect(
-            (8, 8), (218, 24 + 17 * len(entries)),
+            (8, 8), (280, 40 + 17 * len(entries) + 14 * len(summary_lines)),
             fill="white", fill_opacity=0.88, stroke="#d0d6dd",
         )
     )
@@ -346,6 +354,17 @@ def _legend(drawing, height, result, placer: _LabelPlacer) -> None:
         )
     )
     placer.place(120, y + 4, "x" * 60, 10)
+
+    y += 20
+    for line in summary_lines:
+        drawing.add(
+            drawing.text(
+                line, insert=(18, y + 4), fill=PALETTE["text"],
+                font_size="11px", font_weight="bold", font_family=FONT,
+            )
+        )
+        placer.place(120, y + 4, line, 11)
+        y += 15
 
     footer = []
     if placer.skipped:
