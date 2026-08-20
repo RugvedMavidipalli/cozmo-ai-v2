@@ -96,8 +96,13 @@ def main(argv: list[str] | None = None) -> int:
     print("[1/4] raw ARKit poses")
     results.append(evaluate(bundle, bundle.poses, args.stride, 1, "raw ARKit"))
 
-    for label, loop in (("ICP only", False), ("ICP + loop closure", True)):
-        print(f"[{2 if not loop else 3}/4] {label}")
+    # Without loop edges the graph holds only ARKit odometry, so it should
+    # reproduce the raw trajectory: that row is the control proving the
+    # optimiser is not moving anything on its own.
+    for index, (label, loop) in enumerate(
+        (("odometry, no loops", False), ("odometry + loop closure", True)), start=2
+    ):
+        print(f"[{index}/4] {label}")
         start = time.time()
         poses, report = refine_trajectory(
             bundle, keyframes, enable_loop_closure=loop

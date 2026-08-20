@@ -98,45 +98,92 @@ position and is directly comparable against the 2 cm gate.
 On raw ARKit poses: **median 21.8 mm, p90 46.1 mm** over 24 revisited walls
 (recordings-1) ✅ — above the gate, which is why refinement is not optional.
 
-### 3.3 The pose graph, and the mistake that looks like success
+### 3.3 The pose graph, and a mistake that looked like success
 
-<!-- ABLATION_TABLE -->
+| variant (recordings-1) | drift median | p90 | storey height | max correction |
+|---|---:|---:|---:|---:|
+| raw ARKit | 21.8 mm | 46.1 mm | 2.990 m | — |
+| odometry only, no loops *(control)* | 21.8 mm | 46.1 mm | 2.990 m | 0.0 cm |
+| odometry + loop closure | 21.4 mm | 46.5 mm | 2.922 m | 24.5 cm |
+| **ICP sequential edges** *(rejected)* | **7.3 mm** | 29.6 mm | **4.482 m** | **324 cm** |
 
-The instructive result: building sequential edges from **pairwise ICP** cut drift
-by 66% *and destroyed the reconstruction* — pose corrections of 1–3 m and the
-2.99 m storey stretched to 4.48 m. A small systematic bias in registering two
-256×192 depth frames compounds once chained over 253 keyframes. The optimiser
-found a self-consistent, badly wrong configuration; the drift metric approved
-because every wall agreed with itself in the warped space.
+The last row is the instructive one. Building sequential edges from pairwise ICP
+cut measured drift by **66%** — and destroyed the reconstruction, stretching the
+2.99 m storey to 4.48 m with metre-scale pose corrections. A small systematic
+bias in registering two 256×192 depth frames compounds once chained over 253
+keyframes. The optimiser found a self-consistent, badly wrong configuration, and
+*the drift metric approved of it* because every wall agreed with itself in the
+warped space. A metric that improves while the artefact degrades is worth more
+than a metric that only ever agrees with you.
 
-The correction follows from what each sensor is actually good at:
+The fix follows from what each sensor is actually good at:
 
 - **Sequential edges come from ARKit**, weighted heavily. Its visual-inertial
   odometry fuses the entire sequence and is accurate to millimetres over the
-  ~0.2 m between keyframes. It is *better* than anything pairwise depth ICP can
-  produce at this resolution.
+  ~0.2 m between keyframes — *better* than anything pairwise depth ICP produces
+  at this resolution.
 - **Loop-closure edges come from ICP**, weighted ~100× lower, between frames
   spatially near and temporally far. These carry the only information ARKit does
   not already have.
 
-Loop candidates are gated on view direction as well as proximity (two poses a
-metre apart facing opposite corridor walls share no geometry), then on ICP
-fitness, then on displacement — a loop edge should be a correction, not a
-teleport, and repetitive interiors make confident wrong matches easy.
+The control row proves the optimiser now moves nothing on its own: with only
+odometry edges it reproduces raw ARKit to 0.0 cm. Loop candidates are gated on
+view direction as well as proximity, then ICP fitness, then displacement — a
+loop edge should be a correction, not a teleport, and repetitive interiors make
+confident wrong matches easy. `refine_trajectory` also **refuses its own output**
+past a 75 cm correction and falls back to raw ARKit.
 
-Finally, `refine_trajectory` **refuses** its own output when the maximum
-correction exceeds 75 cm, falling back to raw ARKit and flagging it. Shipping a
-warped reconstruction that still looks plausible is the failure mode worth
-engineering against; falling back is always recoverable.
+### 3.4 Where the error actually comes from
 
-### 3.4 Depth confidence gating
+With the optimiser honest, loop closure buys **1.8%**. That is the important
+negative result: on these captures, **trajectory drift is not the dominant error
+term**, and any amount of further pose engineering would have been wasted effort.
 
-ARKit's confidence raster collapses exactly where damaged rooms are hardest:
-glass, mirrors, wet and dark surfaces, grazing incidence. Gating at medium
-confidence is the default. Ungated depth changed drift by only 3.3% on
-recordings-1 ✅ — an undamaged, well-lit property. The adversarial held-out room
-(mirrored closet, glass shower) is where this should separate, and
-`--min-confidence 0` is the ablation switch.
+So the residual was attributed to the depth sensor instead (`tools/depth_bias.py`).
+Each candidate cause predicts a different signature, which makes them separable:
+a depth scale error trends with **range**, beam smear trends with **incidence**,
+and sensor self-assessment separates by **confidence**. Pooling 1.46 M
+observations across 30 walls, each re-centred on its own wall so the test is
+within-wall: ✅
+
+| range | 0.7 m | 1.5 m | 2.4 m | 3.4 m | 4.0 m | 5.4 m |
+|---|---:|---:|---:|---:|---:|---:|
+| median residual | −2.2 mm | +0.7 mm | −1.5 mm | −3.3 mm | **+4.3 mm** | **+11.6 mm** |
+
+**Range bias is real and strongly nonlinear.** Depth is well behaved out to
+~3.4 m and then reads systematically *far*, reaching +11.6 mm at 5.4 m. A linear
+fit (+2.5 mm/m) understates it; the effect is a knee, not a slope.
+
+**Incidence showed no clean trend** (−3.3 mm at grazing, −2.1 mm face-on, no
+monotonic structure) — so beam smear is not a leading term here, and the
+incidence weighting in damage fusion is justified on mask quality rather than on
+depth accuracy.
+
+**ARKit's own confidence is highly informative**, by spread rather than by bias:
+
+| confidence | n | median | IQR |
+|---|---:|---:|---:|
+| 0 (low) | 42 k | −1.6 mm | 57.8 mm |
+| 1 (medium) | 143 k | −3.4 mm | 50.9 mm |
+| 2 (high) | 1 277 k | −0.2 mm | **32.2 mm** |
+
+High-confidence returns are ~40% tighter than low, and are the overwhelming
+majority of the data — so tightening the gate costs less coverage than it first
+appears. Both findings are actionable through existing flags (`--min-confidence`,
+`--max-depth`); §3.5 measures whether acting on them actually pays.
+
+Ungated depth changed drift by only 3.3% on recordings-1 ✅ — but that is an
+undamaged, well-lit property. The adversarial held-out room (mirrored closet,
+glass shower) is where confidence gating should separate sharply.
+
+### 3.5 Gating sweep
+
+<!-- GATING_TABLE -->
+
+The trade is accuracy against coverage: discarding low-confidence and long-range
+returns removes support from the plane fits and shrinks the reconstructed wall
+area. This is measured rather than assumed, and the chosen default is the knee
+of that curve.
 
 ---
 

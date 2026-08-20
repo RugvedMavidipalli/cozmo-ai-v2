@@ -256,10 +256,14 @@ def refine_trajectory(
         # with metre-scale pose corrections, even though local wall agreement
         # improves.  ICP's job here is loop closure, nothing else.
         relative = np.linalg.inv(bundle.poses[target]) @ bundle.poses[source]
-        _, _, rmse, _ = _pairwise_icp(
-            clouds[source], clouds[target], relative, threshold
+        # Score ARKit's relative pose rather than re-solving it: this is how
+        # well the two frames already agree, which is the diagnostic worth
+        # reporting.  Running ICP here would cost ~250 full solves per capture
+        # and its answer would be discarded anyway.
+        evaluation = o3d.pipelines.registration.evaluate_registration(
+            clouds[source], clouds[target], threshold, relative
         )
-        sequential_errors.append(rmse)  # reported, not used to move anything
+        sequential_errors.append(float(evaluation.inlier_rmse))
         graph.edges.append(
             o3d.pipelines.registration.PoseGraphEdge(
                 source_id,
