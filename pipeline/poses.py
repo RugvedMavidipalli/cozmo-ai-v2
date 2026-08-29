@@ -1,34 +1,3 @@
-"""Trajectory refinement: keyframing, loop closure, and pose-graph optimisation.
-
-ARKit's VIO is locally excellent and globally drifting.  Over a walkthrough the
-drift is what smears a wall across its several visits, so the fitted plane sits
-between them and every measurement taken from it inherits the error.  Replaying
-ARKit poses therefore cannot reach a 2 cm wall tolerance; the trajectory has to
-be corrected against the sensor log itself.
-
-The correction is a standard pose graph, and the design decision that matters
-is which edges carry which claim:
-
-* **Sequential edges come from ARKit**, weighted heavily.  Its visual-inertial
-  odometry fuses the whole sequence and is accurate to millimetres over the
-  ~0.2 m between keyframes.
-* **Loop-closure edges come from ICP**, weighted ~100x lower, between frames
-  that are spatially near and temporally far.  These carry the only
-  information ARKit does not already have.
-
-Using ICP for the sequential edges too is the tempting mistake, and it is
-measurably worse: a small systematic bias in pairwise depth registration
-compounds once chained over hundreds of keyframes.  On recordings-1 it drove
-metre-scale pose corrections and stretched the 2.99 m storey to 4.48 m, while
-*improving* local wall agreement -- a self-consistent, badly wrong solution.
-`refine_trajectory` therefore also refuses corrections beyond
-`max_total_correction` and falls back to the raw trajectory.
-
-Open3D pose-graph conventions used throughout: a node's pose is camera-to-world,
-and an edge (i -> j) stores `inv(pose_j) @ pose_i`.
-
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -38,23 +7,45 @@ import open3d as o3d
 
 from .ingest import CaptureBundle, iter_frames
 
-# Relative weights of the two edge families.  ARKit's relative pose between
-# adjacent keyframes is good to a few millimetres; a loop-closure ICP on this
-# depth resolution is good to a centimetre or two.  Information is inverse
-# variance, so the ratio is roughly the square of that -- odometry holds the
-# trajectory's shape while loop edges supply the global correction.
 ODOMETRY_INFORMATION = 1000.0
 LOOP_INFORMATION = 10.0
 
 
 @dataclass
 class DriftReport:
-    """Per-stage trajectory error, for the report's error budget."""
+    """A summary of what happened during pose refinement.
+
+    This gets used to report how much the camera trajectory was
+    corrected, and how much that correction can be trusted.
+
+    Attributes:
+        keyframe_count: How many keyframes were actually used to refine
+            the trajectory.
+        loop_edges: How many "revisit" connections were found and
+            accepted -- pairs of keyframes that saw the same part of the
+            room on two different passes.
+        loop_candidates: How many possible revisit connections were
+            considered before filtering down to `loop_edges`.
+        rejected: True if the correction looked physically wrong and was
+            thrown out, so the original ARKit poses were kept instead.
+        sequential_rmse: How well ARKit's own frame-to-frame estimate
+            matched the depth data, on average. This is only used for
+            reporting, not for deciding anything.
+        loop_closure_gap_before: How far apart the start and end of the
+            walkthrough were, in metres, before correction.
+        loop_closure_gap_after: The same distance, after correction.
+        mean_correction: On average, how far each keyframe moved from its
+            original position, in metres.
+        max_correction: The largest single move any keyframe made, in
+            metres.
+        stages: An optional place for a caller to attach extra timing
+            info; this module doesn't fill it in.
+    """
 
     keyframe_count: int
     loop_edges: int
     loop_candidates: int
-    rejected: bool  # True when the optimisation was discarded as implausible
+    rejected: bool
     sequential_rmse: float
     loop_closure_gap_before: float
     loop_closure_gap_after: float
@@ -69,11 +60,25 @@ def select_keyframes(
     rotation_step_degrees: float = 12.0,
     max_gap: int = 60,
 ) -> np.ndarray:
-    """Frames spaced by motion rather than by time.
+    """Chooses which frames to treat as keyframes, based on how much the
+    camera actually moved rather than how much time passed.
 
-    A time-strided selection over-samples where the operator paused and
-    under-samples where they swung the camera through a doorway -- exactly
-    where registration needs support.
+    Picking keyframes by time alone would waste frames on moments where
+    the camera sat still, and skip past moments where it moved quickly --
+    like sweeping through a doorway -- which is exactly where good
+    coverage matters most.
+
+    Args:
+        bundle: The parsed capture.
+        translation_step: How far the camera has to move, in metres,
+            before the next frame counts as a new keyframe.
+        rotation_step_degrees: How far the camera has to turn, in
+            degrees, before the next frame counts as a new keyframe.
+        max_gap: The most frames allowed to pass without a new keyframe,
+            even if the camera barely moved.
+
+    Returns:
+        A list of frame numbers, in order, always starting with frame 0.
     """
     positions = bundle.poses[:, :3, 3]
     rotations = bundle.poses[:, :3, :3]
@@ -83,6 +88,8 @@ def select_keyframes(
     anchor = 0
     for index in range(1, len(bundle)):
         translated = np.linalg.norm(positions[index] - positions[anchor])
+        # How far the camera rotated since the last keyframe, worked out
+        # from the two frames' rotation matrices.
         relative = rotations[anchor].T @ rotations[index]
         angle = np.arccos(np.clip((np.trace(relative) - 1) / 2, -1, 1))
         if (
@@ -102,7 +109,22 @@ def _keyframe_clouds(
     min_confidence: int,
     max_depth: float,
 ) -> dict[int, o3d.geometry.PointCloud]:
-    """Per-keyframe clouds in their own camera frame, downsampled for ICP."""
+    """Turns each keyframe's depth image into a 3D point cloud, ready for
+    ICP alignment.
+
+    Args:
+        bundle: The parsed capture.
+        keyframes: Which frame numbers to build clouds for.
+        voxel_size: How finely to downsample each cloud, in metres.
+        min_confidence: The lowest depth-confidence level to keep.
+        max_depth: The furthest depth value to keep, in metres.
+
+    Returns:
+        A dictionary mapping each frame number to its point cloud, in
+        that frame's own camera coordinates. A keyframe with too little
+        valid depth data is skipped, so it may be missing from the
+        result.
+    """
     intrinsics = bundle.intrinsics
     clouds: dict[int, o3d.geometry.PointCloud] = {}
     for frame in iter_frames(
@@ -113,6 +135,8 @@ def _keyframe_clouds(
             continue
         vs, us = np.nonzero(valid)
         z = frame.depth[valid]
+        # Turn each valid depth pixel into an actual 3D point, using the
+        # camera's focal length and centre (fx, fy, cx, cy).
         points = np.stack(
             [
                 (us - intrinsics[0, 2]) * z / intrinsics[0, 0],
@@ -136,17 +160,30 @@ def _pairwise_icp(
     init: np.ndarray,
     threshold: float,
 ) -> tuple[np.ndarray, float, float, np.ndarray]:
-    """Point-to-plane ICP, coarse then fine.
+    """Aligns two point clouds using ICP, first with a loose tolerance and
+    then a tighter one.
 
-    Point-to-plane is the right metric indoors: it lets flat surfaces slide
-    over each other instead of forcing spurious point correspondences, which
-    is what keeps a featureless wall from dragging the solution sideways.
+    ICP (Iterative Closest Point) repeatedly matches up nearby points
+    between the two clouds and solves for the rotation and shift that
+    brings them closer together, until it stops improving. This uses the
+    "point-to-plane" version, which matches each point to the other
+    cloud's local surface instead of to one exact point -- that works
+    much better on flat, mostly featureless walls.
 
-    The returned information matrix describes how well the correspondences
-    constrain each degree of freedom.  It is reported for diagnostics; edge
-    weighting in the graph uses the fixed odometry/loop ratio above, because
-    the correspondence-derived scale varies by orders of magnitude with
-    overlap and lets a single high-overlap loop edge dominate the solution.
+    Args:
+        source: The cloud to move.
+        target: The cloud to align it against.
+        init: A starting guess for the transform, which ICP refines.
+        threshold: How close two points need to be to count as a match,
+            in metres, during the fine second pass. The first, looser
+            pass uses three times this distance.
+
+    Returns:
+        A tuple of (the final transform, how much of the cloud matched
+        up, the average matching error in metres, and a matrix
+        describing how well-constrained the result is). The last value
+        is only for reporting -- it isn't used to decide how much to
+        trust this result elsewhere.
     """
     result = o3d.pipelines.registration.registration_icp(
         source,
@@ -185,14 +222,28 @@ def find_loop_candidates(
     max_view_angle_degrees: float = 70.0,
     max_candidates: int = 220,
 ) -> list[tuple[int, int]]:
-    """Keyframe pairs that plausibly see the same surfaces on separate visits.
+    """Finds pairs of keyframes that probably show the same part of the
+    room, seen on two different passes through it.
 
-    Gating on view direction as well as position matters: two poses a metre
-    apart facing opposite walls of a corridor share no geometry, and an ICP
-    attempt between them is both wasted work and a source of false edges.
+    Args:
+        bundle: The parsed capture.
+        keyframes: Which frame numbers to consider. The pairs returned
+            are positions within this list, not raw frame numbers.
+        max_distance: How close together, in metres, two keyframes need
+            to be to count as a possible revisit.
+        min_time_gap: How much time, in seconds, has to separate the two
+            keyframes -- this rules out frames that are just next to each
+            other in the normal sequence.
+        max_view_angle_degrees: How different the two frames' camera
+            directions can be and still plausibly be looking at the same
+            thing.
+        max_candidates: The most pairs to return.
+
+    Returns:
+        Up to `max_candidates` pairs of keyframe positions, closest
+        pairs first.
     """
     positions = bundle.poses[keyframes][:, :3, 3]
-    # Camera looks down +Z in the OpenCV convention this pipeline uses.
     directions = bundle.poses[keyframes][:, :3, 2]
     times = bundle.timestamps[keyframes]
     cosine_limit = np.cos(np.radians(max_view_angle_degrees))
@@ -206,6 +257,8 @@ def find_loop_candidates(
             & (np.arange(len(keyframes)) > i)
         )
         for j in near:
+            # Skip pairs whose cameras are facing too differently to be
+            # looking at the same surfaces (e.g. opposite walls of a hall).
             if directions[i] @ directions[j] < cosine_limit:
                 continue
             scored.append((separation[j], i, j))
@@ -225,11 +278,41 @@ def refine_trajectory(
     max_total_correction: float = 0.75,
     enable_loop_closure: bool = True,
 ) -> tuple[np.ndarray, DriftReport]:
-    """Return refined camera-to-world poses for every frame, plus a drift report.
+    """Corrects the camera trajectory using a pose graph, and reports how
+    much it changed.
 
-    Keyframes are optimised; intermediate frames inherit their correction by
-    interpolation, so the returned array is indexed exactly like
-    `bundle.poses` and downstream code needs no special cases.
+    The correction combines two kinds of information. Moves from one
+    keyframe to the very next one come straight from ARKit's own
+    tracking, which is already accurate over such a short distance.
+    Longer-range corrections come from matching up keyframes that
+    revisit the same spot later in the walkthrough, using ICP -- this is
+    the only way to catch drift that built up gradually over the whole
+    capture. If the end result looks physically implausible (some
+    keyframe moved further than it reasonably should), the whole
+    correction is thrown out and the original ARKit poses are returned
+    instead.
+
+    Args:
+        bundle: The parsed capture to correct.
+        keyframes: Which frames to use; worked out automatically with
+            `select_keyframes` if not given.
+        voxel_size: How finely to downsample points for ICP, in metres.
+        min_confidence: The lowest depth-confidence level to keep.
+        max_depth: The furthest depth value to keep, in metres.
+        loop_fitness_threshold: How well two revisited keyframes need to
+            match before that connection is trusted.
+        max_loop_correction: The largest single correction, in metres, a
+            revisit connection is allowed to make.
+        max_total_correction: The largest correction, in metres, allowed
+            anywhere before the whole result is thrown out as
+            unreliable.
+        enable_loop_closure: If False, revisit connections are skipped
+            entirely, and only frame-to-frame corrections are used.
+
+    Returns:
+        A tuple of (corrected poses for every frame, a report describing
+        what happened). The poses are in the same order and shape as the
+        input.
     """
     if keyframes is None:
         keyframes = select_keyframes(bundle)
@@ -247,19 +330,9 @@ def refine_trajectory(
     for position in range(len(keyframes) - 1):
         source_id, target_id = position, position + 1
         source, target = keyframes[source_id], keyframes[target_id]
-        # Sequential edges come from ARKit, NOT from ICP.  ARKit's
-        # visual-inertial odometry fuses the whole sequence and is excellent
-        # over the ~0.2 m between keyframes; a pairwise ICP between two
-        # 256x192 depth frames is not, and its small systematic bias compounds
-        # once chained.  Measured on recordings-1: substituting ICP for these
-        # edges warps the reconstruction until the 2.99 m storey reads 4.48 m,
-        # with metre-scale pose corrections, even though local wall agreement
-        # improves.  ICP's job here is loop closure, nothing else.
+        # Frame-to-frame moves come straight from ARKit, not from ICP --
+        # ARKit is already accurate over this short a distance.
         relative = np.linalg.inv(bundle.poses[target]) @ bundle.poses[source]
-        # Score ARKit's relative pose rather than re-solving it: this is how
-        # well the two frames already agree, which is the diagnostic worth
-        # reporting.  Running ICP here would cost ~250 full solves per capture
-        # and its answer would be discarded anyway.
         evaluation = o3d.pipelines.registration.evaluate_registration(
             clouds[source], clouds[target], threshold, relative
         )
@@ -280,24 +353,20 @@ def refine_trajectory(
     accepted = 0
     for source_id, target_id in candidates:
         source, target = keyframes[source_id], keyframes[target_id]
+        # Revisit connections DO come from ICP -- they carry information
+        # ARKit alone doesn't have, since ARKit can't tell it's seeing a
+        # familiar spot again.
         init = np.linalg.inv(bundle.poses[target]) @ bundle.poses[source]
         transformation, fitness, _, information = _pairwise_icp(
             clouds[source], clouds[target], init, threshold
         )
         if fitness < loop_fitness_threshold:
             continue
-        # A loop edge should be a correction, not a teleport.  ICP between two
-        # views of a repetitive interior can converge a room's width away
-        # (corridors and matching doorways look alike); such an edge is
-        # confidently wrong and drags the whole graph with it.
         displacement = np.linalg.norm(
             (transformation @ np.linalg.inv(init))[:3, 3]
         )
         if displacement > max_loop_correction:
             continue
-        # Loop edges are weighted well below the odometry edges, so the
-        # solution stays close to ARKit's trajectory and bends only as much as
-        # the revisits actually demand.
         graph.edges.append(
             o3d.pipelines.registration.PoseGraphEdge(
                 source_id,
@@ -309,6 +378,8 @@ def refine_trajectory(
         )
         accepted += 1
 
+    # Solve for the poses that best satisfy every connection at once,
+    # rather than applying each correction one at a time.
     o3d.pipelines.registration.global_optimization(
         graph,
         o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
@@ -325,10 +396,8 @@ def refine_trajectory(
         refined_keyframe_poses[:, :3, 3] - bundle.poses[keyframes][:, :3, 3], axis=1
     )
 
-    # A correction this large is not a correction; it means the graph found a
-    # self-consistent but wrong configuration.  Falling back to the raw
-    # trajectory is always recoverable -- shipping a warped reconstruction that
-    # still looks plausible is not.
+    # If any single keyframe moved further than seems physically
+    # reasonable, don't trust any of this -- fall back to the raw poses.
     rejected = float(corrections.max()) > max_total_correction
     if rejected:
         poses = bundle.poses.copy()
@@ -356,12 +425,25 @@ def refine_trajectory(
 def _propagate(
     original: np.ndarray, keyframes: np.ndarray, refined: np.ndarray
 ) -> np.ndarray:
-    """Carry keyframe corrections to every frame.
+    """Spreads each keyframe's correction out to the ordinary frames
+    around it.
 
-    The correction is applied in the world frame and interpolated between
-    bracketing keyframes -- rotations via a shortest-arc quaternion slerp,
-    translations linearly -- so that intermediate frames keep ARKit's locally
-    accurate relative motion while inheriting the global fix.
+    Only keyframes get directly corrected by the pose graph, so every
+    other frame needs to inherit a version of that correction too. This
+    blends smoothly between two keyframes' corrections for the frames
+    in between, so nearby frames don't suddenly jump at each keyframe
+    boundary.
+
+    Args:
+        original: The original, uncorrected poses for every frame.
+        keyframes: Which frame numbers were corrected.
+        refined: The corrected poses for those keyframes, in the same
+            order.
+
+    Returns:
+        Corrected poses for every frame. Frames between two keyframes
+        get a smooth blend of the two; frames after the last keyframe
+        simply keep that keyframe's correction unchanged.
     """
     corrections = refined @ np.linalg.inv(original[keyframes])
     quaternions = np.asarray([_matrix_to_quaternion(c[:3, :3]) for c in corrections])
@@ -392,6 +474,21 @@ def _propagate(
 
 
 def _matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
+    """Converts a rotation matrix into a quaternion -- a different way of
+    representing the same rotation, using four numbers instead of nine.
+
+    There are a few equivalent formulas for this conversion, and some of
+    them involve dividing by a number that can get close to zero for
+    certain rotations, which would blow up the result. This picks
+    whichever formula stays safely away from that problem for the given
+    matrix.
+
+    Args:
+        matrix: A 3x3 rotation matrix.
+
+    Returns:
+        The equivalent quaternion, as `[w, x, y, z]`.
+    """
     trace = np.trace(matrix)
     if trace > 0:
         scale = np.sqrt(trace + 1.0) * 2
@@ -400,6 +497,8 @@ def _matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
         y = (matrix[0, 2] - matrix[2, 0]) / scale
         z = (matrix[1, 0] - matrix[0, 1]) / scale
     else:
+        # The usual formula would divide by a number close to zero here,
+        # so use whichever diagonal entry is largest instead.
         axis = int(np.argmax(np.diag(matrix)))
         if axis == 0:
             scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2
@@ -424,6 +523,14 @@ def _matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
 
 
 def _quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
+    """Converts a quaternion back into a 3x3 rotation matrix.
+
+    Args:
+        q: A quaternion, as `[w, x, y, z]`.
+
+    Returns:
+        The equivalent 3x3 rotation matrix.
+    """
     w, x, y, z = q
     return np.array(
         [
@@ -435,8 +542,29 @@ def _quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
 
 
 def _slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    """Smoothly blends between two quaternions (rotations), moving along
+    the shortest path between them.
+
+    A plain straight-line blend between two rotations would speed up and
+    slow down unevenly; this instead moves at a constant rate along the
+    curve connecting them. When the two rotations are nearly identical,
+    the usual formula becomes unstable, so this falls back to a simple
+    straight-line blend in that case, since the difference is
+    unnoticeable that close together.
+
+    Args:
+        a: The starting quaternion.
+        b: The ending quaternion.
+        t: How far to blend between them, from 0 (all `a`) to 1 (all
+            `b`).
+
+    Returns:
+        The blended quaternion.
+    """
     dot = float(a @ b)
-    if dot < 0:  # take the shortest arc
+    if dot < 0:
+        # `b` and `-b` represent the same rotation; flip the sign so the
+        # blend takes the shorter path between the two.
         b, dot = -b, -dot
     if dot > 0.9995:
         result = a + t * (b - a)

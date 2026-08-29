@@ -1,18 +1,3 @@
-"""Extract named, measurable surfaces from a reconstruction.
-
-Walls are recovered as lines in the gravity-aligned horizontal projection
-rather than as planes in 3D.  A vertical surface has one free orientation and
-one offset once gravity is known, so fitting it in 2D removes two degrees of
-freedom that 3D RANSAC would otherwise have to estimate from noise -- and it
-pools every point across the wall's full height into a single fit, which is
-what makes a 2 cm tolerance reachable from a 256x192 depth sensor.
-
-Wall extent comes from intersecting neighbouring wall lines, never from the
-spread of observed points: furniture, doorways and grazing-incidence dropout
-all truncate the observed span, while the corner where two wall planes meet is
-where a tape measure would be placed.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -24,23 +9,92 @@ from .geometry import GravityEstimate
 
 @dataclass
 class HorizontalFrame:
-    """The building's dominant horizontal axes, in world coordinates."""
+    """The building's own sense of "flat and square", worked out from the walls.
+
+    Most buildings are built out of straight walls that meet at right
+    angles, even if the whole building is rotated at some odd angle relative
+    to true north or to the raw coordinate system the capture happened to
+    use. This class captures that rotation once, as two horizontal
+    directions (`right` and `forward`) that line up with the building's own
+    walls, plus the `up` direction against gravity. Once we have this frame,
+    it's much easier to work with the building in its own natural
+    "floor-plan" coordinates instead of the arbitrary coordinates the raw
+    3D points came in.
+
+    Attributes:
+        up: A world-space unit vector pointing straight up, against gravity.
+        right: A world-space unit vector along the first wall direction of
+            the building (one of its two dominant, perpendicular wall
+            directions).
+        forward: A world-space unit vector along the other wall direction,
+            perpendicular to `right`, forming a right-handed frame together
+            with `up`.
+        yaw: How far `right` is rotated away from the world's raw X axis, in
+            radians. This is just another way of describing the same
+            rotation as `right`/`forward`.
+        manhattan_fraction: A rough score, from 0 to 1, of how strongly the
+            building's walls actually agree on a single pair of
+            perpendicular directions. A value close to 1 means the walls are
+            consistently square with each other (a typical rectilinear
+            building); a lower value means the walls point in a wider mix of
+            directions, so the recovered frame is less trustworthy.
+    """
 
     up: np.ndarray
-    right: np.ndarray  # first Manhattan axis
-    forward: np.ndarray  # second Manhattan axis, right-handed with up
-    yaw: float  # rotation from world X, radians
-    manhattan_fraction: float  # share of wall area on the two dominant axes
+    right: np.ndarray
+    forward: np.ndarray
+    yaw: float
+    manhattan_fraction: float
 
     def to_plan(self, points: np.ndarray) -> np.ndarray:
-        """World points -> 2D plan coordinates (x along `right`, y along `forward`)."""
+        """Converts world-space points into flat, 2D floor-plan coordinates.
+
+        This drops the height and keeps only the position along the
+        building's own `right` and `forward` directions, which is exactly
+        what a floor plan needs: a top-down view where the walls line up
+        with the grid.
+
+        Args:
+            points: World-space points, as an (N, 3) array (or a single
+                point, as a length-3 array).
+
+        Returns:
+            The same points, as (N, 2) plan-space coordinates, with x
+            measured along `right` and y measured along `forward`.
+        """
         return np.stack([points @ self.right, points @ self.forward], axis=-1)
 
     def height(self, points: np.ndarray) -> np.ndarray:
+        """Works out how high up each point is, measured along `up`.
+
+        Args:
+            points: World-space points, as an (N, 3) array (or a single
+                point, as a length-3 array).
+
+        Returns:
+            The height of each point above (positive) or below (negative)
+            the frame's origin, as an (N,) array.
+        """
         return points @ self.up
 
     def to_world(self, plan: np.ndarray, height: float | np.ndarray) -> np.ndarray:
-        """Plan coordinates plus a height back to world points."""
+        """Turns flat floor-plan coordinates plus a height back into a real 3D point.
+
+        This is the reverse of `to_plan` combined with `height`: given a 2D
+        position on the floor plan and how high up it should be, it
+        reconstructs the actual point in world-space coordinates.
+
+        Args:
+            plan: Plan-space coordinates, as an (N, 2) array (or a single
+                point, as a length-2 array).
+            height: How high up each point should be along `up`. Can be one
+                number shared by every point, or an (N,) array giving a
+                different height per point.
+
+        Returns:
+            The reconstructed points, as an (N, 3) array of world-space
+            coordinates.
+        """
         plan = np.atleast_2d(plan)
         heights = np.broadcast_to(np.asarray(height, float), plan.shape[0])
         return (
@@ -52,20 +106,55 @@ class HorizontalFrame:
 
 @dataclass
 class WallSegment:
-    """One planar vertical surface, expressed in plan coordinates."""
+    """One flat, vertical wall surface, described in the building's own floor-plan coordinates.
+
+    A wall is really just a straight line in the floor plan (an infinite
+    line, described by `normal` and `offset`) with a finite start and end
+    point marking where the actual wall stops. `normal` is a 2D unit vector
+    pointing away from the wall's face, and `offset` is how far that line
+    sits from the origin, so that any point `x` on the line satisfies
+    `normal . x = offset`. Alongside the geometry, a `WallSegment` also
+    carries some bookkeeping about how confidently it was detected, and
+    labels attached by later processing steps.
+
+    Attributes:
+        index: This wall's position in whatever list currently holds it.
+            This gets reassigned whenever walls are re-sorted or filtered,
+            so it shouldn't be treated as a permanent ID.
+        normal: A 2D unit vector, in plan space, pointing perpendicular to
+            the wall's face.
+        offset: How far the wall's line sits from the plan-space origin,
+            measured along `normal`.
+        start: The plan-space coordinate of one end of the wall.
+        end: The plan-space coordinate of the other end of the wall.
+        inlier_count: How many of the original 3D points were judged to
+            actually lie on this wall (its RANSAC "votes"). Higher usually
+            means more confidence in the wall.
+        residual_rms: How far, on average, the supporting points strayed
+            from a perfectly flat line, in metres. Lower means a cleaner,
+            flatter wall.
+        observed_span: The `(lo, hi)` stretch, in metres along the wall,
+            that was actually seen by the sensor, as opposed to space
+            between `start` and `end` that was only inferred.
+        height_range: The `(min, max)` height of the points that support
+            this wall.
+        room_id: Which room this wall was assigned to by a later stage, or
+            `None` if it hasn't been assigned yet.
+        name: A human-readable label (like `"wall_3"`) assigned by a later
+            pipeline stage, or `None` if it hasn't been named yet.
+        tags: Free-form text labels this module and later stages attach to
+            record notable things about the wall, such as `"clutter-in-front"`
+            or `"trimmed-at-junction"`.
+    """
 
     index: int
-    normal: np.ndarray  # 2D unit normal in plan space
-    offset: float  # normal . x = offset
-    start: np.ndarray  # 2D endpoint
-    end: np.ndarray  # 2D endpoint
+    normal: np.ndarray
+    offset: float
+    start: np.ndarray
+    end: np.ndarray
     inlier_count: int
-    residual_rms: float  # metres, spread of inliers about the fitted line
-    observed_span: tuple[float, float]  # along-wall extent actually seen
-    # Height extent of the supporting points. NOT a measure of how tall the
-    # surface is: `wall_band_mask` clips every candidate to the same band
-    # before RANSAC runs, so this saturates at the band limits for real walls
-    # and low furniture alike. Do not filter on it.
+    residual_rms: float
+    observed_span: tuple[float, float]
     height_range: tuple[float, float]
     room_id: int | None = None
     name: str | None = None
@@ -73,33 +162,69 @@ class WallSegment:
 
     @property
     def length(self) -> float:
+        """The straight-line distance between `start` and `end`, in metres."""
         return float(np.linalg.norm(self.end - self.start))
 
     @property
     def direction(self) -> np.ndarray:
+        """A unit vector pointing from `start` toward `end`.
+
+        If the two endpoints happen to be the same point (a degenerate,
+        zero-length wall), this just returns `[1, 0]` rather than dividing
+        by zero.
+        """
         delta = self.end - self.start
         norm = np.linalg.norm(delta)
         return delta / norm if norm > 1e-9 else np.array([1.0, 0.0])
 
     @property
     def midpoint(self) -> np.ndarray:
+        """The plan-space point halfway between `start` and `end`."""
         return 0.5 * (self.start + self.end)
 
     def project(self, points: np.ndarray) -> np.ndarray:
-        """Signed distance of plan-space points from this wall's line."""
+        """Measures how far a set of points sits from this wall's line, and on which side.
+
+        Args:
+            points: Plan-space points to measure, as an (N, 2) array (or a
+                single point, as a length-2 array).
+
+        Returns:
+            The signed distance of each point from the wall's line, as an
+            (N,) array. The distance is positive on the side the wall's
+            `normal` points toward, and negative on the other side.
+        """
         return points @ self.normal - self.offset
 
     def along(self, points: np.ndarray) -> np.ndarray:
-        """Coordinate of plan-space points along the wall, 0 at `start`."""
+        """Measures how far along the wall each point sits, starting from `start`.
+
+        Args:
+            points: Plan-space points to measure, as an (N, 2) array (or a
+                single point, as a length-2 array).
+
+        Returns:
+            The distance of each point along the wall's `direction`,
+            measured from `start`, as an (N,) array. This can be negative
+            (before `start`) or larger than `length` (past `end`).
+        """
         return (points - self.start) @ self.direction
 
     @property
     def inferred_fraction(self) -> float:
-        """Share of the wall's length that was never directly observed.
+        """How much of this wall's length was never actually seen by the sensor.
 
-        Spans behind furniture or beyond a grazing view are reconstructed from
-        the wall plane and its corners; the assignment requires them to be
-        reported as inferred rather than passed off as measured.
+        A wall's `start` and `end` sometimes extend past what the sensor
+        directly observed, filling in a gap the pipeline is fairly
+        confident about (for example, a short stretch hidden behind
+        furniture). This property reports how much of the wall's total
+        length falls into that "filled in" category, as opposed to being
+        directly observed.
+
+        Returns:
+            A fraction between 0 and 1, where 0 means the whole wall was
+            directly observed and 1 means none of it was. Returns 0.0 for a
+            wall with essentially zero length.
         """
         if self.length < 1e-6:
             return 0.0
@@ -110,22 +235,53 @@ class WallSegment:
 def estimate_horizontal_frame(
     normals: np.ndarray, up: np.ndarray, weights: np.ndarray | None = None
 ) -> HorizontalFrame:
-    """Recover the building's yaw from wall normals.
+    """Works out which way the building is "facing", based on the directions its walls point.
 
-    Wall normals in a rectilinear building cluster at 90-degree spacings, so
-    their doubled-then-doubled angle (4*theta) collapses all four onto one
-    direction whose circular mean is the yaw.  This is robust to walls being
-    unevenly represented, which a histogram peak is not.
+    Most rooms are built from walls that meet at right angles, even if the
+    whole room is rotated at some arbitrary angle in the raw capture data.
+    This function looks at a big pile of surface normals (arrows pointing
+    straight out of whatever surface each point belongs to), keeps only the
+    ones that point roughly sideways rather than up or down (since those are
+    the ones that could belong to a wall), and then finds the single
+    rotation that best explains all of them as pointing along one of two
+    perpendicular directions.
+
+    The tricky part is that a wall facing north and a wall facing south (or
+    east and west) both belong to the same building orientation -- a wall's
+    normal could point either way. To average these directions without them
+    cancelling each other out, this multiplies every angle by 4 before
+    averaging (which lines up all four possible right-angle directions on
+    top of each other), then divides the result back down by 4 at the end.
+
+    Args:
+        normals: World-space unit normals, one per candidate wall point or
+            patch, as an (N, 3) array.
+        up: A world-space unit vector pointing straight up, against
+            gravity.
+        weights: An optional per-normal weight, as an (N,) array, letting
+            some normals count for more than others. If omitted, every
+            normal counts equally.
+
+    Returns:
+        A `HorizontalFrame` describing the building's recovered
+        orientation, with `right`/`forward` set to the two dominant,
+        perpendicular wall directions.
     """
+    # Keep only normals that point mostly sideways -- these are the ones
+    # that could plausibly belong to a vertical wall, as opposed to a floor
+    # or ceiling.
     horizontal = normals - np.outer(normals @ up, up)
     magnitude = np.linalg.norm(horizontal, axis=1)
-    vertical_enough = magnitude > 0.85  # normal lies within ~32 deg of horizontal
+    vertical_enough = magnitude > 0.85
     horizontal = horizontal[vertical_enough] / magnitude[vertical_enough, None]
     if weights is not None:
         weights = weights[vertical_enough]
 
     right, forward = _orthonormal_basis(up)
     angles = np.arctan2(horizontal @ forward, horizontal @ right)
+    # Multiplying each angle by 4 folds the four right-angle directions
+    # (0, 90, 180, 270 degrees) on top of each other, so a plain average
+    # of the resulting angles doesn't cancel out to zero.
     resultant = np.exp(4j * angles)
     if weights is not None:
         resultant = resultant * weights
@@ -144,6 +300,21 @@ def estimate_horizontal_frame(
 
 
 def _orthonormal_basis(up: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Picks some arbitrary pair of directions perpendicular to `up`, to use as a starting point.
+
+    This doesn't need to line up with the building in any particular way --
+    it just needs to be a valid, perpendicular pair of horizontal
+    directions that `estimate_horizontal_frame` can then rotate to match
+    the building's actual walls.
+
+    Args:
+        up: The world-space unit vector to build the perpendicular
+            directions against.
+
+    Returns:
+        A `(right, forward)` pair of unit vectors, perpendicular to each
+        other and to `up`.
+    """
     seed = np.array([1.0, 0.0, 0.0])
     if abs(seed @ up) > 0.9:
         seed = np.array([0.0, 0.0, 1.0])
@@ -159,11 +330,32 @@ def wall_band_mask(
     up: np.ndarray,
     margin: float = 0.35,
 ) -> np.ndarray:
-    """Points belonging to vertical surfaces, clear of floor and ceiling.
+    """Picks out the points that most likely belong to a wall, rather than a floor or ceiling.
 
-    The margins matter: baseboards and crown moulding sit at the extremes and
-    are not the wall plane, while furniture tops present horizontal normals
-    that the normal test removes.
+    This does two simple checks on each point. First, is it at a height
+    that's clearly between the floor and the ceiling, with some margin left
+    out at each end (so floor clutter and ceiling fixtures don't sneak in)?
+    Second, does its surface normal point mostly sideways rather than
+    straight up or down, the way a wall's surface would? Only points that
+    pass both checks are kept, since those are the ones actually useful for
+    finding walls.
+
+    Args:
+        points: World-space points, as an (N, 3) array.
+        normals: World-space unit normals, one per point, as an (N, 3)
+            array.
+        gravity: A `GravityEstimate` supplying the floor height and,
+            optionally, the ceiling height.
+        up: A world-space unit vector pointing straight up, against
+            gravity.
+        margin: How much height, in metres, to leave out at both the floor
+            and ceiling ends of the band, to avoid catching floor or
+            ceiling clutter.
+
+    Returns:
+        A boolean mask, as an (N,) array, that is true wherever a point
+        both sits in the wall-height band and has a wall-like (mostly
+        sideways-pointing) normal.
     """
     heights = points @ up
     ceiling = (
@@ -172,7 +364,7 @@ def wall_band_mask(
         else heights.max()
     )
     in_band = (heights > gravity.floor_height + margin) & (heights < ceiling - margin)
-    vertical = np.abs(normals @ up) < 0.35  # normal within ~70 deg of horizontal
+    vertical = np.abs(normals @ up) < 0.35
     return in_band & vertical
 
 
@@ -187,21 +379,49 @@ def extract_walls(
     point_spacing: float = 0.02,
     min_coverage: float = 0.06,
 ) -> list[WallSegment]:
-    """Sequential RANSAC for wall lines in plan space.
+    """Finds straight wall lines in a cloud of plan-space points, one wall at a time.
 
-    Each accepted line is refined by total least squares on its inliers, which
-    is what converts a coarse RANSAC hypothesis into a metric surface: the
-    consensus set selects *which* points belong to the wall, and the refit uses
-    all of them to place it.
+    This works through the points repeatedly, each time finding the single
+    strongest straight line left in whatever points haven't been claimed by
+    an earlier wall yet, removing those points, and moving on -- this
+    general strategy is called "sequential RANSAC". Once a line is found,
+    its points get refit more precisely (RANSAC's own line is just a rough
+    first guess), and then the along-the-line spread of those points is
+    broken up into separate runs wherever there's a gap, since one straight
+    line in plan space might really correspond to two separate walls with a
+    doorway or hallway between them. Each run is only kept as a real wall if
+    it's long enough and if the points found actually cover a healthy
+    fraction of what you'd expect to see if the whole run were a solid,
+    fully-scanned wall -- a sparse handful of points is more likely noise
+    than an actual wall.
 
-    Runs are then gated on `min_coverage`: the share of the run's own surface
-    area that was actually observed, given the reconstruction's point spacing.
-    `min_inliers` only constrains the whole RANSAC consensus set, which is then
-    split into contiguous runs -- so without this a line supported by one real
-    wall also emits the 30-point slivers that happened to fall on the same
-    infinite line metres away.  Coverage is the right test because it is
-    scale-free: on recordings-1 real walls score 8-89% while the slivers score
-    1-3%, a gap no absolute point count spans across capture densities.
+    Args:
+        plan_points: Plan-space points to search, as an (N, 2) array,
+            typically already restricted to wall-like points via
+            `wall_band_mask`.
+        heights: The world-space height of each `plan_points` row, as an
+            (N,) array.
+        inlier_threshold: How close a point needs to be to a candidate
+            line, in metres, to count as supporting it.
+        min_inliers: The fewest points a candidate line needs behind it
+            before it's worth pursuing further.
+        min_length: The shortest along-line run, in metres, that's still
+            kept as a wall.
+        max_walls: A hard cap on how many walls this function will return,
+            just to keep runaway cases in check.
+        angle_tolerance_degrees: Passed straight through to `_ransac_line`
+            (currently unused there).
+        point_spacing: The typical distance, in metres, between
+            neighbouring points in the reconstruction. This is used to
+            estimate how many points a fully-observed run of a given size
+            "should" have.
+        min_coverage: The smallest fraction of a run's expected point count
+            that must actually be present for that run to be trusted as a
+            real wall, rather than dropped as too sparse.
+
+    Returns:
+        The detected wall segments, sorted from longest to shortest, with
+        `index` reassigned to match that order.
     """
     band_height = float(np.ptp(heights)) if len(heights) else 1.0
     remaining = np.arange(len(plan_points))
@@ -216,15 +436,17 @@ def extract_walls(
         if inlier_mask.sum() < min_inliers:
             break
 
+        # RANSAC's line is just a rough guess from two sample points, so
+        # refit it properly now using every point it found.
         inlier_points = subset[inlier_mask]
         normal, offset = _refit_line(inlier_points)
         residual = inlier_points @ normal - offset
         direction = np.array([-normal[1], normal[0]])
         projection = inlier_points @ direction
 
-        # A single RANSAC line spans every collinear wall in the building --
-        # opposite sides of a corridor share an offset.  Split into runs that
-        # are actually contiguous before accepting anything.
+        # One straight line can cover more than one real wall (for example,
+        # two wall segments either side of a doorway), so split it into
+        # separate runs wherever the points along it have a gap.
         for lo, hi, count in _contiguous_runs(np.sort(projection), gap=0.35):
             run_length = hi - lo
             if run_length < min_length:
@@ -264,6 +486,35 @@ def _ransac_line(
     angle_tolerance_degrees: float,
     iterations: int = 300,
 ) -> tuple[np.ndarray, float, np.ndarray]:
+    """Guesses a line by repeatedly trying two random points, and keeps whichever guess fits best.
+
+    This is the classic RANSAC ("random sample consensus") approach: pick
+    two points at random, draw the line through them, count how many of the
+    other points land close enough to that line to plausibly be on the same
+    wall, and remember whichever random guess collected the most support.
+    Trying many random pairs like this is a cheap, effective way to find a
+    good line even when a lot of the points are unrelated noise or belong
+    to other walls.
+
+    Args:
+        points: Plan-space points to fit a line to, as an (N, 2) array.
+        threshold: How close a point needs to be to a candidate line, in
+            metres, to count as supporting it.
+        rng: A seeded random number generator used to pick the random pairs
+            of points, so results are reproducible.
+        angle_tolerance_degrees: Accepted for consistency with other
+            functions in this module, but not currently used to filter
+            candidates here.
+        iterations: How many random pairs of points to try before giving
+            up and returning the best one found.
+
+    Returns:
+        A `(normal, offset, inlier_mask)` tuple for whichever candidate
+        line collected the most support. If no valid line could be formed
+        at all (for example, every random pair happened to be too close
+        together), this returns an arbitrary normal, a zero offset, and a
+        mask that is false everywhere.
+    """
     best_count = 0
     best: tuple[np.ndarray, float, np.ndarray] | None = None
     count = len(points)
@@ -272,7 +523,7 @@ def _ransac_line(
         a, b = rng.choice(count, size=2, replace=False)
         delta = points[b] - points[a]
         length = np.linalg.norm(delta)
-        if length < 0.3:  # too short a baseline to define an orientation
+        if length < 0.3:
             continue
         direction = delta / length
         normal = np.array([-direction[1], direction[0]])
@@ -288,6 +539,24 @@ def _ransac_line(
 
 
 def _refit_line(points: np.ndarray) -> tuple[np.ndarray, float]:
+    """Fits the best straight line through a set of points, minimising how far off each point is.
+
+    Unlike the rough 2-point guess RANSAC uses, this looks at every point
+    at once and finds the line that keeps all of them, on average, as close
+    as possible (measuring closeness perpendicular to the line, not just
+    vertically) -- the standard "total least squares" approach for line
+    fitting.
+
+    Args:
+        points: Plan-space points to fit a line through, as an (N, 2)
+            array, typically the set of points RANSAC already found to
+            agree on roughly the same line.
+
+    Returns:
+        A `(normal, offset)` pair: the fitted line's 2D unit normal and its
+        signed offset, such that every point `x` on the line satisfies
+        `normal . x = offset`.
+    """
     centroid = points.mean(axis=0)
     _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
     normal = vh[-1] / np.linalg.norm(vh[-1])
@@ -295,7 +564,25 @@ def _refit_line(points: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def _contiguous_runs(sorted_values: np.ndarray, gap: float):
-    """Split sorted 1D positions into runs separated by more than `gap`."""
+    """Breaks a sorted list of 1D positions into separate groups wherever there's a big enough gap.
+
+    This is used to split the points along one detected wall line into
+    separate physical wall segments -- for example, if there's a doorway or
+    a hallway partway along the line, the points on either side of that gap
+    should end up as two separate walls rather than one long one.
+
+    Args:
+        sorted_values: A 1D array of positions, already sorted from
+            smallest to largest.
+        gap: How much space between two consecutive values is enough to
+            treat them as belonging to different runs.
+
+    Yields:
+        A `(lo, hi, count)` tuple for each run: the lowest and highest
+        position in the run, and how many values fall inside it. A "run"
+        made of just a single value is skipped, since it can't support a
+        useful wall segment.
+    """
     if len(sorted_values) == 0:
         return
     breaks = np.flatnonzero(np.diff(sorted_values) > gap)
@@ -314,51 +601,69 @@ def merge_collinear(
     angle_tolerance_degrees: float = 15.0,
     gap_tolerance: float = 0.4,
 ) -> list[WallSegment]:
-    """Resolve competing near-coplanar surfaces into one wall each.
+    """Cleans up duplicate and near-duplicate walls left over from wall detection.
 
-    Sequential RANSAC produces two distinct kinds of duplicate, and they need
-    opposite treatment:
+    Because `extract_walls` looks for lines one at a time, it sometimes
+    finds the same real wall twice -- for instance, a slightly noisy scan
+    can produce two almost-identical, almost-overlapping line fits for what
+    is actually a single flat wall. Those really should become one wall.
+    But there's a second, very different situation that looks superficially
+    similar: a wall with something sitting a little in front of it, like a
+    baseboard, a cabinet, or a radiator. That clutter creates its own
+    roughly-parallel surface a few centimetres in front of the real wall,
+    and it should NOT be merged into the wall -- it's a different, separate
+    surface, and merging it in would corrupt the wall's true position.
 
-    * **Fragments of one surface** (within `offset_tolerance`): a wall split by
-      a doorway, or the same wall seen on two visits that drift apart by a
-      couple of centimetres.  These are *merged* -- both are evidence of the
-      same plane and of its extent.
-    * **Parallel clutter** (within `parallel_tolerance`, overlapping along the
-      run): once the wall's points are consumed, RANSAC keeps finding planes a
-      few centimetres in front of it -- door reveals, trim, cabinet and
-      bookcase fronts.  On recordings-1 a single wall spawned five such planes
-      within 23 cm.  These are *suppressed*, not merged: averaging them would
-      drag the wall off its true position, and extending the wall to their
-      span would credit it with a run that furniture, not masonry, occupies.
+    This function tells the two cases apart using distance: two walls that
+    are extremely close together (within `offset_tolerance`) are treated as
+    the same real surface seen twice, and get merged into one, combining
+    their evidence. Two walls that are further apart, but still fairly
+    close (within `parallel_tolerance`) and that overlap along their
+    length, are treated as the clutter-in-front case -- rather than being
+    merged in and dragging the wall's fitted position off to one side, the
+    weaker (clutter) surface is dropped entirely, and the stronger wall
+    behind it is simply tagged `"clutter-in-front"` as a note that
+    something was found sitting in front of it.
 
-    Because sequential RANSAC takes the largest consensus set first, the
-    dominant plane in such a family is the wall; the rest are what stands in
-    front of it, and they belong to the occlusion machinery instead.
+    Args:
+        walls: Candidate wall segments to clean up, typically straight from
+            `extract_walls`, in any order.
+        offset_tolerance: How close two walls need to be, in metres, to be
+            treated as two readings of the very same surface and merged
+            together.
+        parallel_tolerance: How close two walls need to be, in metres, to
+            be considered related at all (either as duplicates or as the
+            clutter-in-front case). Anything further apart than this is
+            treated as unrelated and left alone.
+        min_overlap: How much the two walls need to overlap along their
+            length, in metres, for a wall in the `parallel_tolerance` range
+            (but not close enough to merge) to be tagged as clutter rather
+            than simply ignored as unrelated.
+        angle_tolerance_degrees: How close to parallel two walls' normals
+            need to be, in degrees, before they're even compared against
+            each other at all.
+        gap_tolerance: Some extra slack, in metres, allowed along the
+            wall's length when deciding whether a fragment being merged in
+            actually overlaps the target wall's existing span, so two
+            fragments with a small real gap between them can still merge.
 
-    Normal *direction* is compared throughout, not just orientation, so the two
-    faces of a partition are never combined -- they are different surfaces
-    bounding different rooms, and their separation is the shared-wall thickness
-    the assignment scores.
+    Returns:
+        The cleaned-up wall segments, with duplicates merged away, sorted
+        longest-first, `index` reassigned to match, and each wall's `tags`
+        sorted and de-duplicated.
     """
     cosine_limit = np.cos(np.radians(angle_tolerance_degrees))
-    # Strongest first: support, then length. The winner of each family keeps
-    # its own geometry, so it must be the best-evidenced plane, not merely the
-    # longest fragment.
+    # Process the most strongly-supported, longest walls first, so that
+    # weaker duplicate fragments get folded into a solid "target" wall
+    # rather than the other way around.
     ordered = sorted(walls, key=lambda w: (-w.inlier_count, -w.length))
     kept: list[WallSegment] = []
 
     for wall in ordered:
         for target in kept:
             if target.normal @ wall.normal < cosine_limit:
-                continue  # different direction, or the opposite face
+                continue
 
-            # Separation is measured as the candidate's greatest distance from
-            # the target's line, not as a difference of offsets.  Offsets are
-            # only comparable between exactly parallel lines: within the 15
-            # degrees this tolerance allows, two segments can share an offset
-            # at their midpoints and still diverge by half a metre at their
-            # ends.  Endpoint distance is what "the same surface" actually
-            # means, and it subsumes the parallel case.
             separation = max(
                 abs(float(target.project(wall.start))),
                 abs(float(target.project(wall.end))),
@@ -371,16 +676,19 @@ def merge_collinear(
             overlap = max(0.0, min(hi, target.length) - max(lo, 0.0))
 
             if separation <= offset_tolerance:
+                # Close enough to be the same real wall seen twice --
+                # combine the two into one, unless the fragment doesn't
+                # actually sit anywhere near the target's existing span.
                 if lo > target.length + gap_tolerance or hi < -gap_tolerance:
                     continue
                 _absorb(target, wall, lo, hi)
                 break
             if overlap >= min_overlap:
-                # The tag lands on the wall that survives, so it must say
-                # something true about *that* wall: something parallel stood
-                # in front of it, which is also why part of it is occluded.
+                # Further away but still overlapping -- likely clutter
+                # sitting in front of the real wall, not the wall itself.
+                # Tag it and keep the two surfaces separate.
                 target.tags.append("clutter-in-front")
-                break  # clutter in front of `target`: drop it
+                break
         else:
             kept.append(wall)
 
@@ -392,7 +700,23 @@ def merge_collinear(
 
 
 def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> None:
-    """Extend `target` to cover `other`, weighting the fit by support."""
+    """Folds one wall's evidence into another, treating them as two readings of the same surface.
+
+    This combines the two walls' fitted positions as a weighted average
+    (giving more say to whichever one had more supporting points), stretches
+    `target`'s endpoints out to cover `other`'s extent as well, and merges
+    the bookkeeping (how much was actually observed, the height range, and
+    the tags) from both. `target` is updated in place; `other` is expected
+    to be thrown away by the caller right after this runs.
+
+    Args:
+        target: The wall being extended and updated in place -- normally
+            the one with more supporting evidence of the two.
+        other: The wall being folded into `target` and then discarded.
+        lo: The nearer endpoint of `other`, expressed in `target`'s own
+            along-the-wall coordinates (via `target.along(...)`).
+        hi: The farther endpoint of `other`, in the same coordinates.
+    """
     total = target.inlier_count + other.inlier_count
     target.offset = (
         target.offset * target.inlier_count + other.offset * other.inlier_count
@@ -409,8 +733,6 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
     target.start = origin + direction * new_lo
     target.end = origin + direction * new_hi
 
-    # Observed span is tracked in the merged frame so `inferred_fraction`
-    # still reports how much of the combined wall was actually seen.
     seen = (
         target.observed_span[1]
         - target.observed_span[0]
@@ -429,22 +751,48 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
 def _ray_crosses_wall(
     camera: np.ndarray, target: np.ndarray, wall: WallSegment, margin_fraction: float
 ) -> np.ndarray:
-    """Boolean mask: does camera[i]->target[i] cross `wall`'s solid span strictly between them?
+    """Checks, for many camera-to-point rays at once, whether each one passes straight through a wall.
 
-    Vectorised over many rays against one wall -- this is the inner loop of
-    `filter_occluded_walls`, tested once per (candidate wall, blocker) pair
-    rather than once per point, which is what keeps that function fast.
+    This is the core geometric test behind `filter_occluded_walls`: if the
+    straight line from where the camera was standing to a point it
+    supposedly measured has to pass through another, solid wall along the
+    way, that measurement doesn't make physical sense -- you can't see
+    through a wall -- so it's a sign the point (and the "wall" it's
+    supporting) might actually be a stray reflection or an error. This
+    checks many rays against one candidate wall at once, for speed.
 
-    Deliberately not built on `_segment_intersection`: that helper compares
-    two whole `WallSegment`s with a angle-based parallel cutoff meant for
-    finding corners, whereas this compares many short rays against one wall
-    with a magnitude-based cutoff and a margin expressed as a fraction of the
-    wall's own length -- different enough parametrisations that sharing code
-    would obscure both.
+    Under the hood, each ray and the wall's own segment are described as
+    parametric lines, and the function solves for where they'd cross: `t`
+    is how far along the ray (from camera to point) that crossing happens,
+    and `s` is how far along the wall's own segment it happens. A crossing
+    only counts as a real obstruction if it happens strictly between the
+    camera and the point (not before the camera or beyond the point) and
+    strictly within the solid part of the wall itself (not off past one of
+    its ends).
+
+    Args:
+        camera: The plan-space starting point of each ray (the camera
+            position each measurement was taken from), as an (N, 2) array.
+        target: The plan-space end point of each ray, aligned with
+            `camera`, as an (N, 2) array.
+        wall: The wall segment being tested as a possible obstruction.
+        margin_fraction: How much of `wall`'s length, as a fraction, to
+            exclude from both ends of its span when deciding whether a
+            crossing counts -- this avoids treating a ray that just grazes
+            past the very corner of the wall as a real obstruction.
+
+    Returns:
+        A boolean mask, as an (N,) array, that is true wherever the ray
+        from `camera[i]` to `target[i]` passes through the solid,
+        margin-trimmed part of `wall`, strictly between the two ends of the
+        ray.
     """
     ray = target - camera
     wall_vector = wall.end - wall.start
     denominator = ray[:, 0] * wall_vector[1] - ray[:, 1] * wall_vector[0]
+    # A zero (or near-zero) denominator means the ray and the wall are
+    # parallel and never cross; swap in a safe placeholder so the division
+    # below doesn't blow up, and mask those rays out explicitly afterward.
     parallel = np.abs(denominator) < 1e-9
     safe_denominator = np.where(parallel, 1.0, denominator)
 
@@ -454,8 +802,8 @@ def _ray_crosses_wall(
 
     return (
         ~parallel
-        & (t > 0.02) & (t < 0.98)  # strictly between camera and the point
-        & (s > margin_fraction) & (s < 1 - margin_fraction)  # within wall's solid span
+        & (t > 0.02) & (t < 0.98)
+        & (s > margin_fraction) & (s < 1 - margin_fraction)
     )
 
 
@@ -470,42 +818,57 @@ def filter_occluded_walls(
     min_blocker_length: float = 1.0,
     occlusion_fraction: float = 0.6,
 ) -> tuple[list[WallSegment], int]:
-    """Drop candidate walls whose points require passing through a solid wall.
+    """Throws out candidate walls that could only have been seen by looking straight through another wall.
 
-    `merge_collinear` handles surfaces that sit too close to the camera --
-    furniture standing in front of a wall, occluding it.  This handles the
-    opposite geometry: a candidate plane sitting too far away, whose points
-    could only have been produced by light that passed through an already
-    better-supported wall to get there.  That is physically impossible for a
-    real, independently-measurable surface.
+    Occasionally, a "wall" gets detected in a spot that doesn't actually
+    make physical sense once you consider where the camera was standing
+    when it captured the points that support it -- for instance, a
+    reflection in a mirror or a glass door can look, geometrically, like a
+    surface sitting in the next room, on the far side of a real wall. This
+    function catches that by checking, for each candidate wall, whether the
+    straight-line path from the camera to the points supporting it had to
+    pass through some other, sturdier wall along the way. If most of a
+    wall's points fail that check, the wall is dropped as almost certainly
+    an artifact rather than a real surface.
 
-    Two distinct cases were confirmed on recordings-1, traced by hand rather
-    than assumed:
+    To keep this efficient and conservative, a candidate wall is only ever
+    tested against other walls that are more strongly supported and long
+    enough to plausibly be a real blocking surface (its "blockers") -- it's
+    never tested against weaker or shorter walls, since a flimsy scrap
+    of a wall isn't good evidence that a stronger wall must be fake. And a
+    wall is only dropped if a clear majority of its near points turn out to
+    be blocked, not just a handful, since a few odd points crossing a wall
+    can happen by chance even for a perfectly real wall.
 
-    * A candidate 15 cm and 9 cm behind an accepted wall, with an exactly
-      *opposite* normal -- too thin to be a second room's wall, and the wrong
-      separation to be that wall's own far face properly observed (interior
-      partitions run 9-15 cm, which is what these are: a sliver of the SAME
-      wall's far face, grazed through a doorway edge from the near room, that
-      RANSAC fitted as if it were its own freestanding wall). `merge_collinear`
-      does not catch this -- opposite-facing near-parallel planes are its
-      signature for two rooms sharing a partition, which is correct in
-      general, just not here.
-    * A candidate blocked by a wall at a completely different angle (0 degree
-      normal alignment, i.e. perpendicular) across most of its points -- no
-      thin-partition explanation available, so it is a stray fragment (noise,
-      multipath, or a glimpse of a room not yet separated by `rooms.py`, which
-      runs after this).
+    Args:
+        walls: Candidate wall segments to check, typically already passed
+            through `merge_collinear`.
+        frame: The `HorizontalFrame` used to project the world-space
+            `points` and `origins` into plan space.
+        points: World-space points that supported wall fitting, as an
+            (M, 3) array.
+        origins: The world-space camera position that each row of `points`
+            was observed from, as an (M, 3) array, aligned with `points`.
+        band: How close a point needs to be to a wall's line, in metres, to
+            count as "on" that wall for this test.
+        corner_margin: How much of a candidate wall's span, in metres, to
+            exclude from both ends when picking which of its points to
+            test, so points right at a corner (which are more prone to
+            false crossings) don't skew the result.
+        min_points: The fewest nearby points a wall needs before this test
+            is even run on it; a wall with too few nearby points is kept
+            without being checked, since there isn't enough evidence either
+            way.
+        min_blocker_length: How long another wall needs to be, in metres,
+            before it's considered a plausible obstruction at all.
+        occlusion_fraction: What fraction of a candidate's nearby points
+            need to be found blocked before the candidate is dropped
+            entirely.
 
-    Both signatures are physically impossible for a freestanding wall and were
-    removed identically; the code does not need to (and does not try to)
-    distinguish them.
-
-    A candidate is tested only against *stronger* walls (`min_blocker_length`
-    keeps stub fragments from acting as blockers), so a real wall is never at
-    risk from a weaker impostor, and the check is majority-vote per wall
-    (`occlusion_fraction`) rather than any-single-ray, so one grazing ray
-    through a genuine doorway gap can't condemn an otherwise-solid wall.
+    Returns:
+        A `(kept, dropped)` pair: the surviving wall segments, sorted
+        longest-first with `index` reassigned, and a count of how many
+        walls were removed for being occluded.
     """
     plan = frame.to_plan(points)
     camera = frame.to_plan(origins)
@@ -514,6 +877,9 @@ def filter_occluded_walls(
     dropped = 0
 
     for wall in ordered:
+        # Only stronger, longer walls are trusted enough to act as
+        # "blockers" -- a candidate is never thrown out on the say-so of a
+        # weaker or shorter one.
         blockers = [
             other
             for other in walls
@@ -533,7 +899,7 @@ def filter_occluded_walls(
             & (along < wall.length - corner_margin)
         )
         if near.sum() < min_points:
-            kept.append(wall)  # too little evidence either way: fail open
+            kept.append(wall)
             continue
 
         near_camera, near_target = camera[near], plan[near]
@@ -560,14 +926,31 @@ def filter_occluded_walls(
 def _segment_intersection(
     a: WallSegment, b: WallSegment
 ) -> tuple[np.ndarray, float, float] | None:
-    """Intersection of the two walls' infinite lines, with along-coordinates.
+    """Finds where two walls' lines would cross, if extended forever in both directions.
 
-    Returns (point, u_a, u_b) where u_x is the along-wall coordinate of the
-    point on wall x (0 at start), or None for near-parallel lines.
+    This treats each wall as an infinite line (ignoring where it actually
+    starts and ends) and solves for the one point where the two lines meet.
+    It also reports how far along each wall's own direction that crossing
+    point falls, measured from that wall's `start` -- which lets the caller
+    figure out whether the crossing actually happens within the wall's real,
+    finite extent, or off somewhere past one of its ends.
+
+    Args:
+        a: The first wall segment; only the line it defines is used, not
+            its actual `start`/`end` extent.
+        b: The second wall segment, likewise treated as an infinite line.
+
+    Returns:
+        A `(point, u_a, u_b)` tuple if the two lines meet at a clear,
+        well-defined angle: `point` is the crossing point in plan space,
+        and `u_a`/`u_b` are how far along each wall's own direction that
+        point falls (0 at that wall's `start`). Returns `None` when the two
+        lines are close enough to parallel that a crossing point can't be
+        reliably pinned down.
     """
     da, db = a.direction, b.direction
     denominator = da[0] * db[1] - da[1] * db[0]
-    if abs(denominator) < 0.15:  # < ~9 deg apart: no meaningful corner
+    if abs(denominator) < 0.15:
         return None
     delta = b.start - a.start
     u_a = (delta[0] * db[1] - delta[1] * db[0]) / denominator
@@ -581,23 +964,46 @@ def resolve_crossings(
     interior_margin: float = 0.15,
     max_trim: float = 0.45,
 ) -> list[WallSegment]:
-    """Enforce the one physical constraint the fitter cannot see: walls do not
-    pass through each other.
+    """Cleans up cases where two walls appear to cut through each other partway along their length.
 
-    An interior-interior intersection has exactly two causes, distinguishable
-    by geometry:
+    Real walls don't pass through each other's middle -- if the detected
+    geometry shows that happening, something in the earlier detection
+    stages went slightly wrong, and this function decides how to fix it.
+    There are two different situations that can produce this kind of
+    crossing, and they're handled differently:
 
-    * **T-junction overshoot** -- both surfaces are real, but one wall's
-      extent ran a few decimetres past the junction (its collinear inliers
-      continue on the far side, in the next room).  The overhang past the
-      crossing is short: trim it back to the junction.
-    * **Clutter cutting a wall** -- a stair rail, counter edge or furniture
-      diagonal fitted as a wall slices through a genuine wall near its middle,
-      typically at a shallow angle.  Neither overhang is short, so trimming
-      cannot fix it; the surface with weaker support is not a wall.  Drop it.
+    The first is a small overshoot at a T-junction, where one wall (say, an
+    interior partition) is supposed to stop right where it meets another
+    wall, but the detected segment runs a little too far past that meeting
+    point. In that case, the fix is simply to trim the overshooting wall
+    back to the crossing point -- nothing is thrown away, the wall's extent
+    is just corrected.
 
-    Deletion cascades correctly on families of mutually-crossing clutter
-    because survivors are re-checked against every remaining wall.
+    The second is a case where a shorter, weaker wall genuinely cuts across
+    the middle of a longer, better-supported one -- which usually means the
+    shorter one is spurious (some kind of detection error) rather than a
+    real wall. When the overlap is too large to be explained as a small
+    T-junction overshoot, this function assumes that's what's happening and
+    simply removes the weaker of the two walls instead of trimming it.
+
+    Args:
+        walls: Wall segments to check, pairwise, for this kind of interior
+            crossing. A shallow copy of the list is worked on internally;
+            surviving `WallSegment` objects may be mutated (trimmed) in
+            place.
+        interior_margin: How close to either end of a wall, in metres, a
+            crossing can be and still be treated as a normal corner rather
+            than a true mid-span crossing that needs fixing.
+        max_trim: The largest overshoot, in metres, past the crossing point
+            that's still treated as a simple T-junction overshoot to trim.
+            Beyond this distance, the crossing is treated as the
+            weaker-wall case instead, and that wall is dropped.
+
+    Returns:
+        The surviving wall segments (the same objects, some of them
+        trimmed), with each wall's `tags` deduplicated and sorted. The
+        order and length of the returned list may differ from `walls`,
+        since walls can be removed.
     """
     walls = list(walls)
     changed = True
@@ -615,6 +1021,10 @@ def resolve_crossings(
                 if not (interior_a and interior_b):
                     continue
 
+                # How far each wall runs past the crossing point on its
+                # shorter side -- a small overhang looks like a T-junction
+                # that just needs trimming; a big one looks like a wall
+                # cutting straight across another.
                 overhang_a = min(u_a, a.length - u_a)
                 overhang_b = min(u_b, b.length - u_b)
                 if min(overhang_a, overhang_b) <= max_trim:
@@ -634,6 +1044,8 @@ def resolve_crossings(
                         )
                     victim.tags.append("trimmed-at-junction")
                 else:
+                    # Too much overlap to be a simple overshoot -- treat
+                    # the weaker-supported wall as spurious and drop it.
                     weaker = a if a.inlier_count < b.inlier_count else b
                     walls.remove(weaker)
                 changed = True
@@ -641,8 +1053,6 @@ def resolve_crossings(
             if changed:
                 break
 
-    # Indices are deliberately left alone: they are identities that per-wall
-    # drift measurements and surface grids are keyed by, not positions.
     for wall in walls:
         wall.tags = sorted(set(wall.tags))
     return walls
@@ -653,20 +1063,30 @@ def snap_corners(
     max_extension: float = 0.45,
     max_trim: float = 0.30,
 ) -> int:
-    """Move wall endpoints onto the intersections of their wall lines.
+    """Nudges wall endpoints so that walls meeting at a corner actually touch at a clean point.
 
-    An extent taken from observed points stops where the last inlier fell --
-    short of the corner when the scan never reached it, past the corner when
-    collinear surface continued beyond.  The corner, where two fitted lines
-    intersect, is where a tape measure is hooked; only after this step do the
-    emitted lengths mean what the wall-length interval model already assumes
-    (a difference of two plane intersections).
+    Detected walls almost never end exactly where they should -- one wall's
+    endpoint might stop just short of, or run just past, the neighbouring
+    wall it's supposed to meet. This function finds those nearby corners
+    (where two walls' lines would cross) and, for each wall endpoint, moves
+    it onto whichever nearby corner would require the smallest adjustment,
+    as long as that corner is also plausibly close to where the other wall
+    actually ends. Every possible endpoint-to-corner adjustment is
+    collected first and then applied smallest-adjustment-first, so that
+    endpoints compete fairly for the best-fitting corner rather than each
+    wall grabbing the first candidate it happens to consider. An endpoint
+    with no good nearby corner is simply left where it was.
 
-    Each endpoint adopts the candidate corner needing the smallest adjustment,
-    provided the intersection also lies on or near the partner wall -- a line
-    crossing three metres away is geometry, not a corner.  Endpoints with no
-    candidate keep their observed extent, and remain covered by the
-    occupancy/inferred machinery.  Returns the number of endpoints snapped.
+    Args:
+        walls: Wall segments to snap into corners; mutated in place for any
+            endpoint that ends up getting moved.
+        max_extension: The furthest an endpoint may be pushed outward, in
+            metres, to reach a candidate corner.
+        max_trim: The furthest an endpoint may be pulled inward, in metres,
+            to reach a candidate corner.
+
+    Returns:
+        How many endpoints were actually moved onto a snapped corner.
     """
     proposals: list[tuple[float, int, str, np.ndarray]] = []
     for i, wall in enumerate(walls):
@@ -677,17 +1097,18 @@ def snap_corners(
             if hit is None:
                 continue
             point, u_self, u_other = hit
-            # The corner must lie on (or just beyond) the partner too.
             if not (-max_extension <= u_other <= other.length + max_extension):
                 continue
             for end_name, adjustment in (
                 ("start", -u_self),
                 ("end", u_self - wall.length),
             ):
-                # Positive adjustment extends the wall, negative trims it.
                 if -max_trim <= adjustment <= max_extension:
                     proposals.append((abs(adjustment), i, end_name, point))
 
+    # Apply the smallest adjustments first, so each endpoint gets matched
+    # to its best-fitting corner rather than whichever candidate happened
+    # to be considered first.
     proposals.sort(key=lambda entry: entry[0])
     taken: set[tuple[int, str]] = set()
     snapped = 0
@@ -701,7 +1122,7 @@ def snap_corners(
             if end_name == "start"
             else float(np.linalg.norm(point - wall.start))
         )
-        if remaining < 0.3:  # would collapse the wall onto its neighbour
+        if remaining < 0.3:
             continue
         taken.add(key)
         if end_name == "start":
@@ -725,13 +1146,30 @@ def snap_corners(
 def snap_to_frame(
     walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 6.0
 ) -> list[WallSegment]:
-    """Rotate near-axis walls onto the building frame.
+    """Straightens out walls that are already close to square with the building, so they're exactly square.
 
-    Regularisation, not cosmetics: a wall fitted from a partly occluded, noisy
-    band can sit a degree or two off true, which displaces its far end by more
-    than the error budget allows.  Walls further than `tolerance_degrees` from
-    an axis are left alone -- genuinely angled walls exist and forcing them
-    would be worse than leaving them.
+    Real-world detection is noisy, so a wall that's actually meant to be
+    perfectly perpendicular to its neighbours might come out of the earlier
+    stages a couple of degrees off. This function looks at each wall's
+    normal direction and, if it's already close enough to one of the
+    building's own axes (the `right`/`forward` directions from
+    `estimate_horizontal_frame`), rounds it exactly onto that axis. A wall
+    that's too far from any axis to be a confident match is left exactly as
+    it was, but gets tagged `"off-axis"` so later stages know it wasn't
+    straightened.
+
+    Args:
+        walls: Wall segments to straighten; mutated in place for any wall
+            close enough to an axis to be snapped.
+        frame: The `HorizontalFrame` whose `right`/`forward` axes define
+            the plan-space directions a wall's normal gets rounded toward.
+        tolerance_degrees: The largest angle, in degrees, a wall's normal
+            may be away from the nearest axis-aligned direction and still
+            be snapped onto it.
+
+    Returns:
+        The same `walls` list, mutated in place and also returned, so
+        calls can be chained together.
     """
     for wall in walls:
         angle = np.arctan2(wall.normal[1], wall.normal[0])
@@ -740,8 +1178,6 @@ def snap_to_frame(
             wall.tags.append("off-axis")
             continue
         normal = np.array([np.cos(snapped), np.sin(snapped)])
-        # Keep the wall where its points are: re-derive the offset from the
-        # midpoint so snapping rotates the line without translating it.
         offset = float(normal @ wall.midpoint)
         direction = np.array([-normal[1], normal[0]])
         half = 0.5 * wall.length

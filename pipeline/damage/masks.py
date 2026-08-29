@@ -1,15 +1,3 @@
-"""Refine detection boxes into pixel masks.
-
-A bounding box overstates a stain's area -- a diagonal tide line fills maybe
-half its box -- and area is what the scope's quantities are built from, so the
-box has to become a mask before anything downstream can use it.
-
-SAM 2 via Replicate is the accurate path; GrabCut is the local fallback, used
-whenever the API is unavailable so the pipeline degrades instead of failing.
-Which one ran is recorded on the mask, because it changes how much the area
-should be trusted.
-"""
-
 from __future__ import annotations
 
 import base64
@@ -25,12 +13,21 @@ import numpy as np
 
 @dataclass
 class RefinedMask:
-    mask: np.ndarray  # bool, full frame resolution
-    method: str  # "sam2" | "grabcut" | "box"
-    area_fraction: float  # share of the box the mask fills
+    """A detection box refined into a pixel mask.
+
+    Attributes:
+        mask: Bool array, `(height, width)` at full frame resolution.
+        method: How the mask was produced: `"sam2"`, `"grabcut"`, or `"box"`.
+        area_fraction: Share of the box's area the mask fills.
+    """
+
+    mask: np.ndarray
+    method: str
+    area_fraction: float
 
     @property
     def trusted(self) -> bool:
+        """Whether this mask is a real segmentation rather than just the box."""
         return self.method != "box"
 
 
@@ -40,7 +37,29 @@ def refine(
     cache_dir: str | Path = "cache/masks",
     prefer_sam: bool = True,
 ) -> list[RefinedMask]:
-    """Mask each box, preferring SAM 2 and falling back to GrabCut."""
+    """Turns each rough detection box into a precise pixel mask of just the damaged area.
+
+    A bounding box always includes some background around the actual
+    damage, which would throw off any area measurement made from it. This
+    tries SAM 2 first (a general-purpose segmentation model, called through
+    the Replicate API), since it's usually much better at finding the true
+    outline of the damage. That requires a configured API token and a
+    network call, though, so if one isn't available -- or the call fails
+    for any reason -- this quietly falls back to GrabCut instead, a classic
+    image-processing algorithm that runs locally and does a rougher, but
+    still useful, job.
+
+    Args:
+        image: RGB frame the boxes were detected in.
+        boxes: Detection boxes as `(x0, y0, x1, y1)` in `image`'s pixel
+            coordinates.
+        cache_dir: Directory for the SAM 2 response cache.
+        prefer_sam: When True, try SAM 2 first if a Replicate API token is
+            configured; otherwise go straight to GrabCut.
+
+    Returns:
+        One `RefinedMask` per box, in the same order as `boxes`.
+    """
     if not boxes:
         return []
 
@@ -51,7 +70,7 @@ def refine(
         try:
             return _sam2(image, boxes, cache_dir)
         except Exception:
-            pass  # fall through to the local path rather than fail the run
+            pass
     return [_grabcut(image, box) for box in boxes]
 
 
@@ -60,6 +79,22 @@ def _sam2(
     boxes: list[tuple[float, float, float, float]],
     cache_dir: Path,
 ) -> list[RefinedMask]:
+    """Segment every box in one frame via SAM 2 on Replicate, with caching.
+
+    Args:
+        image: RGB frame the boxes were detected in.
+        boxes: Detection boxes as `(x0, y0, x1, y1)` in `image`'s pixel
+            coordinates.
+        cache_dir: Directory for the on-disk `.npz` response cache.
+
+    Returns:
+        One `RefinedMask` per box (method `"sam2"`), in the same order as
+        `boxes`.
+
+    Raises:
+        RuntimeError: If encoding fails or the decoded mask count doesn't
+            match the number of boxes sent.
+    """
     import replicate
 
     ok, buffer = cv2.imencode(
@@ -101,7 +136,20 @@ def _sam2(
 
 
 def _decode_masks(output, shape: tuple[int, int], count: int) -> list[np.ndarray]:
-    """Normalise Replicate's several possible return shapes into bool arrays."""
+    """Normalise Replicate's several possible return shapes into bool arrays.
+
+    Args:
+        output: Whatever `replicate.run` returned -- a single item or a list
+            of them, each either file-like or an HTTP URL string.
+        shape: Expected `(height, width)` for each decoded mask.
+        count: Expected number of masks.
+
+    Returns:
+        `count` bool mask arrays, each `(height, width)`.
+
+    Raises:
+        RuntimeError: If fewer than `count` items decoded successfully.
+    """
     import urllib.request
 
     items = output if isinstance(output, list) else [output]
@@ -128,10 +176,25 @@ def _decode_masks(output, shape: tuple[int, int], count: int) -> list[np.ndarray
 def _grabcut(
     image: np.ndarray, box: tuple[float, float, float, float]
 ) -> RefinedMask:
-    """Local fallback: GrabCut seeded by the detection box.
+    """Segments one box locally using OpenCV's GrabCut, seeded by the box itself.
 
-    Boxes too small for GrabCut to have any background to learn from are kept
-    as boxes, and marked as such so their area is treated as an upper bound.
+    GrabCut starts by assuming everything inside the box is probably the
+    damage and everything outside is background, then iterates to refine
+    that guess into a tighter outline. It doesn't work well on very small
+    or low-contrast boxes, though, so this falls back to just using the box
+    itself as the mask whenever the box is too small to bother segmenting,
+    GrabCut raises an error, or the result it produces looks implausibly
+    small compared to the box it came from -- all signs that the
+    segmentation isn't trustworthy.
+
+    Args:
+        image: RGB frame the box was detected in.
+        box: Detection box as `(x0, y0, x1, y1)` in `image`'s pixel
+            coordinates.
+
+    Returns:
+        A `RefinedMask`: `method="grabcut"` on success, or `method="box"`
+        if GrabCut couldn't be trusted.
     """
     height, width = image.shape[:2]
     x0 = int(np.clip(box[0], 0, width - 2))
@@ -170,5 +233,14 @@ def _grabcut(
 
 
 def _fill_fraction(mask: np.ndarray, box: tuple[float, float, float, float]) -> float:
+    """Share of the box's pixel area that `mask` actually covers.
+
+    Args:
+        mask: Bool mask, same resolution as the frame the box came from.
+        box: The box the mask was derived from, as `(x0, y0, x1, y1)`.
+
+    Returns:
+        `mask.sum() / box_area`.
+    """
     area = max((box[2] - box[0]) * (box[3] - box[1]), 1.0)
     return float(mask.sum() / area)

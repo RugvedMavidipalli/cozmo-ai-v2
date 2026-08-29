@@ -1,24 +1,3 @@
-"""Attribute wall-position error to its physical causes.
-
-The trajectory ablation showed that loop closure barely moves the residual and
-that odometry-only reproduces ARKit exactly, which rules out trajectory drift as
-the dominant term.  The remaining candidates are properties of the *depth
-sensor*, and they are separable because each predicts a different signature:
-
-  range      - a depth scale or offset error puts a wall further away the
-               further you stand from it, so the residual trends with range.
-  incidence  - at grazing angles the beam footprint smears across the surface
-               and multipath grows, so the residual trends with |cos|.
-  confidence - if ARKit's own low-confidence returns carry the error, the
-               residual separates by confidence level.
-
-This fits each trend on real walls and reports how much of the error each
-explains, then tests whether correcting the dominant one actually shrinks the
-per-visit spread that the wall gate cares about.
-
-    python tools/depth_bias.py ../recordings-1
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -82,8 +61,6 @@ def gather(bundle, indices, stride=4, min_confidence=0, max_depth=5.0):
 def analyse(walls, frame, data, band=0.06, min_points=3000):
     """Pool per-wall residuals against range, incidence, and confidence."""
     plan = frame.to_plan(data["world"])
-    # `to_plan` is a pair of dot products against unit axes through the origin,
-    # so it maps direction vectors as well as points.
     ray_plan = frame.to_plan(data["ray"])
     rows = []
 
@@ -96,11 +73,7 @@ def analyse(walls, frame, data, band=0.06, min_points=3000):
         if near.sum() < min_points:
             continue
 
-        # Re-centre on this wall's own points so the comparison is within-wall:
-        # an absolute offset would just measure where the wall is.
         residual = signed[near] - np.median(signed[near])
-        # Sign the residual along the view direction, so "further away" is
-        # positive for every wall regardless of which way its normal points.
         view_sign = np.sign(ray_plan[near] @ wall.normal)
         rows.append(
             {
@@ -129,7 +102,9 @@ def trend(x, y, bins):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Attribute wall-position error to its physical causes."
+    )
     parser.add_argument("capture")
     parser.add_argument("--stride", type=int, default=6)
     parser.add_argument("--out", default="out/depth_bias.json")

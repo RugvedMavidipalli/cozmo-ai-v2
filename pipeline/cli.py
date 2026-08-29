@@ -1,8 +1,7 @@
-"""One command per capture: `python -m pipeline run <capture_dir>`."""
-
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from contextlib import contextmanager
@@ -13,11 +12,11 @@ import numpy as np
 from . import export
 from .damage import fusion as damage_fusion
 from .damage.masks import refine
-from .damage.vlm import DamageAnalyzer
+from .damage.vlm import FURNITURE_CLASS, DamageAnalyzer
 from .drift import measure_drift, refit_wall_offsets, sample_world_points_with_origin
 from .fuse import fuse
 from .geometry import estimate_gravity
-from .ingest import load_capture, iter_frames
+from .ingest import display_rotation, load_capture, iter_frames
 from .keyframes import select_damage_keyframes
 from .occupancy import build_surface_grid, find_openings, occluded_spans
 from .planes import (
@@ -31,7 +30,7 @@ from .planes import (
     wall_band_mask,
 )
 from .poses import refine_trajectory, select_keyframes
-from .rooms import build_plan_grid, segment_rooms
+from .rooms import build_plan_grid, check_no_overlaps, segment_rooms
 from .scope import ScopeEngine
 from .uncertainty import UncertaintyModel
 
@@ -39,8 +38,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Timings(dict):
+    """Keeps track of how long each stage of a pipeline run took.
+
+    This is just a regular dictionary (stage name -> seconds elapsed)
+    with one extra method, `stage()`, that measures a block of code and
+    stores the result automatically.
+    """
+
     @contextmanager
     def stage(self, name: str, verbose: bool = True):
+        """Times a block of code and stores how long it took under `name`.
+
+        Used like `with timings.stage("ingest"): ...` -- everything
+        inside the `with` block gets timed, and the elapsed seconds get
+        saved under that name. While it runs, it also prints a short
+        progress line to the console (if `verbose` is on), so a slow
+        step doesn't look like the program has frozen.
+
+        Args:
+            name: What to call this stage when saving its elapsed time.
+            verbose: If True, print a progress line while the block runs.
+        """
         if verbose:
             print(f"  {name} ...", end="", flush=True)
         start = time.time()
@@ -52,12 +70,43 @@ class Timings(dict):
 
 
 def run(args: argparse.Namespace) -> int:
+    """Runs the whole pipeline once, turning a raw capture into a finished
+    result: a floor plan, a 3D model, a damage report, and a scope of work.
+
+    This is the main function that everything else in this file supports.
+    It moves through eleven stages, one after another, and each stage's
+    output becomes the input to the next one:
+
+    1. Ingest -- read the raw capture files.
+    2. Pose refinement -- clean up the camera's tracked path.
+    3. Fusion -- merge all the depth frames into one 3D point cloud.
+    4. Sampling -- take a lighter-weight second pass over the frames,
+       keeping track of where each point was seen from.
+    5. Geometry -- figure out which way is up, and find the walls.
+    6. Wall refinement -- clean up and finalize the wall positions.
+    7. Rooms -- split the space into separate rooms.
+    8. Surfaces -- work out where the doors and windows are.
+    9. Damage -- look for water, fire, and mold damage.
+    10. Scope -- turn any damage found into a list of repair line items.
+    11. Export -- write out all the result files.
+
+    See `docs/architecture.md` for more detail on each of these.
+
+    Args:
+        args: The parsed command-line arguments (flags like `--stride`,
+            `--no-damage`, etc. all live on this object).
+
+    Returns:
+        0 if everything went well. 1 if the final result fails a schema
+        check (a sign something is actually wrong with the output).
+    """
     timings = Timings()
     warnings: list[str] = []
     out_dir = Path(args.out or f"out/{Path(args.capture).name}")
     out_dir.mkdir(parents=True, exist_ok=True)
     total_start = time.time()
 
+    # Stage 1: ingest
     print(f"Capture: {args.capture}")
     with timings.stage("ingest"):
         bundle = load_capture(args.capture)
@@ -71,6 +120,7 @@ def run(args: argparse.Namespace) -> int:
             "poses or the device mapping may be wrong for this capture source"
         )
 
+    # Stage 2: pose refinement
     poses = bundle.poses
     drift_report = None
     if not args.no_refine:
@@ -84,6 +134,7 @@ def run(args: argparse.Namespace) -> int:
             f"{drift_report.loop_edges}/{drift_report.loop_candidates} loop edges"
         )
 
+    # Stage 3: fusion
     with timings.stage("fusion"):
         indices = np.arange(0, len(bundle), args.stride)
         reconstruction = fuse(
@@ -100,17 +151,14 @@ def run(args: argparse.Namespace) -> int:
     normals = np.asarray(cloud.normals)
     print(f"  {len(points)} points")
 
+    # Stage 4: sampling
     with timings.stage("sampling"):
-        # Provenance-tagged points (with the camera origin each was observed
-        # from) are needed by both wall extraction below (occlusion
-        # filtering) and wall refinement further down (per-visit offset
-        # refit, drift). Sampling once and threading the result through both
-        # avoids paying for the back-projection twice.
         sampled, origins, times = sample_world_points_with_origin(
             bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses,
             max_depth=args.max_depth,
         )
 
+    # Stage 5: geometry
     with timings.stage("geometry"):
         gravity = estimate_gravity(points, hint=bundle.gravity_up, normals=normals)
         frame = estimate_horizontal_frame(normals, gravity.up)
@@ -127,11 +175,8 @@ def run(args: argparse.Namespace) -> int:
     if gravity.room_height is None:
         warnings.append("no ceiling plane found; heights are unavailable")
 
+    # Stage 6: wall refinement
     with timings.stage("wall refinement"):
-        # Drift is measured BEFORE extents change: crossing resolution and
-        # corner snapping move endpoints, never offsets, so they cannot alter
-        # a wall's true visit spread -- they only shrink the association
-        # windows and starve the estimator.
         refitted = refit_wall_offsets(walls, frame, sampled, times)
         drift = measure_drift(walls, frame, sampled, times)
         walls = resolve_crossings(walls)
@@ -142,14 +187,24 @@ def run(args: argparse.Namespace) -> int:
     )
     print(f"  drift: {drift.summary()}")
 
+    # Stage 7: rooms
     with timings.stage("rooms"):
         grid = build_plan_grid(
             points, frame, gravity.floor_height, ceiling,
             trajectory=poses[:, :3, 3],
         )
         rooms = segment_rooms(grid, walls, frame, gravity.floor_height, ceiling)
+        overlaps = check_no_overlaps(rooms)
+        if overlaps:
+            warnings.append(
+                f"{len(overlaps)} room-pair(s) overlap beyond tolerance: "
+                + ", ".join(
+                    f"room_{a}/room_{b} {frac:.1%}" for a, b, frac in overlaps
+                )
+            )
     print(f"  {len(rooms)} rooms")
 
+    # Stage 8: surfaces
     with timings.stage("surfaces"):
         surface_grids = {}
         openings = []
@@ -164,15 +219,40 @@ def run(args: argparse.Namespace) -> int:
             openings.extend(find_openings(surface))
     print(f"  {len(openings)} openings")
 
+    # Stage 9: damage
     regions = []
+    overlay_paths = []
     if not args.no_damage:
         with timings.stage("damage"):
-            regions = _damage_pass(
-                bundle, poses, frame, walls, gravity, ceiling, surface_grids,
-                out_dir, args, warnings,
+            regions, overlay_paths, furniture_count, furniture_overlay_paths = (
+                _damage_pass(
+                    bundle, poses, frame, walls, gravity, ceiling, surface_grids,
+                    out_dir, args, warnings,
+                )
             )
         print(f"  {len(regions)} fused damage regions")
+        if overlay_paths:
+            print(
+                f"  {len(overlay_paths)} damage overlay images written to "
+                f"{out_dir / 'damage_overlays'}"
+            )
+        if args.debug_furniture:
+            print(
+                f"  [debug-furniture] {furniture_count} furniture detections -- "
+                "diagnostic only, not written to result.json"
+            )
+            if furniture_overlay_paths:
+                print(
+                    f"  [debug-furniture] {len(furniture_overlay_paths)} overlay "
+                    f"images written to {out_dir / 'furniture_debug_overlays'}"
+                )
+            elif furniture_count:
+                print(
+                    "  [debug-furniture] pass --furniture-overlays to also save "
+                    "annotated images"
+                )
 
+    # Stage 10: scope
     with timings.stage("scope"):
         engine = ScopeEngine(args.rules)
         wall_lengths = {
@@ -191,6 +271,7 @@ def run(args: argparse.Namespace) -> int:
             "confidence intervals are uncalibrated: no ground-truth fit was supplied"
         )
 
+    # Stage 11: export
     with timings.stage("export"):
         result = _assemble(
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
@@ -206,9 +287,11 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             warnings.append(f"floor plan render failed: {exc}")
         export.export_scene(
-            reconstruction.mesh, result["reconstruction"]["walls"],
+            result["reconstruction"]["walls"],
             out_dir / "scene.glb", gravity.floor_height, ceiling,
+            rooms=result["rooms"],
         )
+        export.export_scope_csv(result, out_dir)
         o3d.io.write_point_cloud(str(out_dir / "cloud.ply"), cloud)
 
     result["diagnostics"]["timings_s"]["total"] = round(time.time() - total_start, 2)
@@ -226,39 +309,134 @@ def run(args: argparse.Namespace) -> int:
 def _damage_pass(
     bundle, poses, frame, walls, gravity, ceiling, surface_grids,
     out_dir, args, warnings,
-) -> list:
-    """Detect, mask, project, and fuse damage across keyframes."""
+) -> tuple[list, list, int, list]:
+    """Looks for damage in a set of frames, and combines what it finds
+    into regions on the actual walls.
+
+    For each selected frame, this asks a vision-language model whether it
+    sees any damage, turns any detections into pixel masks, projects
+    those masks into the 3D scene, and adds them as "votes" onto the
+    wall they landed on. A patch of damage only ends up in the final
+    result once enough separate frames agree it's really there -- one
+    frame's guess on its own isn't trusted.
+
+    Args:
+        bundle: The parsed capture.
+        poses: Camera poses to use for this run.
+        frame: The building's horizontal frame.
+        walls: The final wall segments from the geometry stage.
+        gravity: Floor and ceiling heights.
+        ceiling: Ceiling height, or `None` if one wasn't found.
+        surface_grids: Each wall's surface grid, keyed by wall index --
+            reused here so damage detection lines up with where doors,
+            windows, and hidden spans were already found.
+        out_dir: Where to write the overlay images that show what was
+            detected.
+        args: The parsed command-line arguments.
+        warnings: A list this function can add warning messages to.
+
+    Returns:
+        A tuple of (the damage regions found, paths to the overlay
+        images written, how many furniture items were spotted in
+        debug mode, and paths to any furniture overlay images).
+    """
+    # This function is the only place that writes to these two folders,
+    # so clear them out first -- otherwise a rerun that finds nothing
+    # could leave old images sitting next to a result that says no
+    # damage was found.
+    for name in ("damage_overlays", "furniture_debug_overlays"):
+        shutil.rmtree(out_dir / name, ignore_errors=True)
+
     selected = select_damage_keyframes(bundle, poses, max_frames=args.damage_frames)
     if not selected:
-        return []
+        return [], [], 0, []
 
-    analyzer = DamageAnalyzer(model=args.model, cache_dir=args.cache_dir)
+    analyzer = DamageAnalyzer(
+        model=args.model, cache_dir=args.cache_dir,
+        include_furniture=args.debug_furniture,
+    )
     surfaces = damage_fusion.build_surface_refs(
         walls, frame, gravity.floor_height, ceiling
     )
     accumulators = {}
     for index, surface in enumerate(surfaces):
+        # Only walls get a place to collect damage votes here -- the
+        # floor and ceiling are included in `surfaces`, but there's no
+        # matching entry for them, so any damage detected there
+        # currently has nowhere to go and is quietly dropped.
         if surface.kind == "wall" and surface.wall.index in surface_grids:
             accumulators[index] = damage_fusion.DamageAccumulator(
                 surface, surface_grids[surface.wall.index]
             )
 
     errors = 0
-    for capture_frame in iter_frames(bundle, selected, min_confidence=1):
-        analysis = analyzer.analyze_frame(capture_frame.index, capture_frame.color)
+    low_confidence = 0
+    overlay_frames = []
+    detections_by_frame = {}
+    masks_by_frame = {}
+    furniture_frames = []
+    furniture_detections_by_frame = {}
+    furniture_masks_by_frame = {}
+    furniture_count = 0
+    rotations_by_frame = {}
+    for capture_frame in iter_frames(
+        bundle, selected, min_confidence=1, include_full_res=True
+    ):
+        rotation = display_rotation(poses[capture_frame.index], bundle.gravity_up)
+        rotations_by_frame[capture_frame.index] = rotation
+        # Send the model the full, high-resolution image (not the smaller
+        # depth-camera resolution) since that's what makes it able to see
+        # detail clearly. `target_shape` tells it to hand back detection
+        # boxes rescaled to the smaller grid that the rest of this
+        # function works with.
+        analysis = analyzer.analyze_frame(
+            capture_frame.index, capture_frame.color_full, rotation=rotation,
+            target_shape=capture_frame.color.shape[:2],
+        )
         if analysis.error:
             errors += 1
             continue
-        if not analysis.detections:
+        detections = [
+            d for d in analysis.detections
+            if d.confidence >= args.min_detection_confidence
+        ]
+        low_confidence += len(analysis.detections) - len(detections)
+        if not detections:
             continue
 
         masks = refine(
             capture_frame.color,
-            [d.bbox for d in analysis.detections],
+            [d.bbox for d in detections],
             cache_dir=Path(args.cache_dir).parent / "masks",
             prefer_sam=not args.no_sam,
         )
-        for detection, mask in zip(analysis.detections, masks):
+        # Furniture detections are only for sanity-checking that the
+        # model can actually recognize objects -- keep them completely
+        # separate from real damage so they never end up in the result.
+        damage_pairs = [
+            (d, m) for d, m in zip(detections, masks)
+            if d.damage_class != FURNITURE_CLASS
+        ]
+        furniture_pairs = [
+            (d, m) for d, m in zip(detections, masks)
+            if d.damage_class == FURNITURE_CLASS
+        ]
+
+        if damage_pairs:
+            overlay_frames.append(capture_frame)
+            detections_by_frame[capture_frame.index] = [d for d, _ in damage_pairs]
+            masks_by_frame[capture_frame.index] = [m for _, m in damage_pairs]
+        if furniture_pairs:
+            furniture_count += len(furniture_pairs)
+            furniture_frames.append(capture_frame)
+            furniture_detections_by_frame[capture_frame.index] = [
+                d for d, _ in furniture_pairs
+            ]
+            furniture_masks_by_frame[capture_frame.index] = [
+                m for _, m in furniture_pairs
+            ]
+
+        for detection, mask in damage_pairs:
             world, rays = damage_fusion.project_detection(
                 detection, mask.mask, capture_frame.depth,
                 poses[capture_frame.index], bundle.intrinsics,
@@ -266,6 +444,10 @@ def _damage_pass(
             )
             if len(world) == 0:
                 continue
+            # Points that don't clearly belong to any surface (like a
+            # reflection in a mirror, which projects to the wrong depth)
+            # just don't show up here at all -- they're not forced onto
+            # the nearest wall.
             assignment = damage_fusion.assign_to_surfaces(world, rays, surfaces, frame)
             for surface_index, point_indices in assignment.items():
                 accumulator = accumulators.get(surface_index)
@@ -283,16 +465,52 @@ def _damage_pass(
 
     if errors:
         warnings.append(f"{errors} damage frames failed analysis (see cache/API state)")
+    if low_confidence:
+        print(
+            f"  {low_confidence} detections dropped below "
+            f"--min-detection-confidence {args.min_detection_confidence}"
+        )
 
     regions = []
     for accumulator in accumulators.values():
         regions.extend(
             damage_fusion.extract_regions(accumulator, min_views=args.min_views)
         )
-    return regions
+
+    overlay_paths = []
+    if overlay_frames:
+        overlay_paths = export.render_damage_overlays(
+            overlay_frames, detections_by_frame, masks_by_frame,
+            out_dir / "damage_overlays", rotations=rotations_by_frame,
+        )
+    furniture_overlay_paths = []
+    if furniture_frames and args.furniture_overlays:
+        furniture_overlay_paths = export.render_damage_overlays(
+            furniture_frames, furniture_detections_by_frame, furniture_masks_by_frame,
+            out_dir / "furniture_debug_overlays", rotations=rotations_by_frame,
+        )
+    return regions, overlay_paths, furniture_count, furniture_overlay_paths
 
 
 def _to_cells(accumulator, surface, world, frame) -> np.ndarray:
+    """Works out which grid cell on a wall each 3D point falls into.
+
+    Every wall has its own small grid laid over its surface, used to
+    count up how many separate views agree that a spot is damaged. This
+    takes a batch of 3D points already known to belong to one wall, and
+    converts each one into a (column, row) position on that wall's grid.
+
+    Args:
+        accumulator: The `DamageAccumulator` whose grid to use.
+        surface: The wall surface these points belong to.
+        world: The 3D points, already known to belong to this wall.
+        frame: The building's horizontal frame.
+
+    Returns:
+        An `(K, 2)` array of `(column, row)` cell positions, one for each
+        point that actually lands inside the wall's grid. A point that
+        falls outside the grid is simply left out of the result.
+    """
     grid = accumulator.grid
     plan = frame.to_plan(world)
     wall = surface.wall
@@ -304,12 +522,85 @@ def _to_cells(accumulator, surface, world, frame) -> np.ndarray:
     return np.stack([columns[inside], rows[inside]], axis=1)
 
 
+def _infer_adjacency_via(
+    room_a, room_b, walls, openings, wall_names, max_distance: float = 1.2
+) -> str | None:
+    """Tries to find which door connects two neighbouring rooms.
+
+    Two rooms can be marked as neighbours just from their shapes, without
+    knowing which door actually connects them. This looks at every
+    detected door or pass-through opening and picks whichever one sits
+    closest to the midpoint between the two rooms -- as long as it's
+    close enough (within `max_distance`) to plausibly be the right one.
+    Not every case has a clear answer, so it's fine for this to come back
+    empty rather than guess.
+
+    Args:
+        room_a: One of the two rooms.
+        room_b: The other room.
+        walls: All wall segments.
+        openings: All detected openings.
+        wall_names: A lookup from wall index to its display name.
+        max_distance: How far away, in metres, an opening can still be
+            and count as a match.
+
+    Returns:
+        The connecting wall's name, or `None` if nothing was close enough.
+    """
+    walls_by_index = {wall.index: wall for wall in walls}
+    boundary_midpoint = 0.5 * (room_a.centroid + room_b.centroid)
+    best_name = None
+    best_distance = max_distance
+    for opening in openings:
+        if opening.kind not in ("door", "pass-through"):
+            continue
+        wall = walls_by_index.get(opening.wall_index)
+        if wall is None or wall.room_id not in (room_a.id, room_b.id):
+            continue
+        distance = float(np.linalg.norm(wall.midpoint - boundary_midpoint))
+        if distance < best_distance:
+            best_distance = distance
+            best_name = wall_names.get(opening.wall_index)
+    return best_name
+
+
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
     timings, warnings, engine,
 ) -> dict:
-    """Build the schema-shaped result document."""
+    """Puts everything the pipeline produced together into one dictionary,
+    ready to be saved as `result.json`.
+
+    This function doesn't calculate anything new -- it just takes all the
+    pieces that earlier stages already worked out (walls, rooms, damage,
+    scope items, and so on) and arranges them into the exact shape the
+    output file is supposed to have, adding a confidence interval to
+    every measurement along the way.
+
+    Args:
+        bundle: The parsed capture.
+        gravity: Floor/ceiling heights and the up axis.
+        frame: The building's horizontal frame.
+        walls: The final wall segments.
+        openings: The detected doors and windows.
+        rooms: The segmented rooms.
+        regions: The fused damage regions.
+        concealed: The concealed-damage flags.
+        line_items: The scope-of-work line items.
+        drift: The drift measurement.
+        drift_report: The pose-refinement report, or `None` if pose
+            refinement was skipped.
+        surface_grids: Each wall's surface grid.
+        uncertainty: The uncertainty model used to build confidence
+            intervals for this run.
+        timings: How long each stage took.
+        warnings: Any warnings collected while running.
+        engine: The scope engine that was used.
+
+    Returns:
+        The full result, shaped exactly as `result.json` expects it.
+    """
     drift_by_wall = {v.wall_index: v.std for v in drift.per_wall}
     wall_docs = []
     for wall in walls:
@@ -368,6 +659,7 @@ def _assemble(
             }
         )
 
+    rooms_by_id = {room.id: room for room in rooms}
     room_docs = []
     adjacency = []
     for room in rooms:
@@ -390,7 +682,10 @@ def _assemble(
         )
         for neighbour in room.neighbours:
             if neighbour > room.id:
-                adjacency.append({"a": room.id, "b": neighbour, "via": None})
+                via = _infer_adjacency_via(
+                    room, rooms_by_id[neighbour], walls, openings, wall_names
+                )
+                adjacency.append({"a": room.id, "b": neighbour, "via": via})
 
     damage_docs = []
     for region in regions:
@@ -475,6 +770,25 @@ def _assemble(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """The command-line entry point: reads the arguments the user typed
+    and runs the pipeline with them.
+
+    This is what actually gets called when you run
+    `python -m pipeline run <capture>`. It also loads the `.env` file
+    first, which is what makes the Anthropic API key available for the
+    damage-detection stage.
+
+    Args:
+        argv: The arguments to parse, or `None` to read them from the
+            command line as usual.
+
+    Returns:
+        The exit code from `run()`.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+
     parser = argparse.ArgumentParser(prog="pipeline", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -487,19 +801,30 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--model", default="claude-opus-5")
     runner.add_argument("--stride", type=int, default=4)
     runner.add_argument("--voxel", type=float, default=0.02)
-    # 3.5 m is the knee measured by tools/depth_bias.py: ARKit depth is well
-    # behaved below it and reads systematically far above it (+11.6 mm at
-    # 5.4 m).  tools/gating_sweep.py confirms the trade is nearly free --
-    # 8.2% less drift for 0.7% less wall coverage.
     runner.add_argument("--max-depth", type=float, default=3.5)
     runner.add_argument("--min-confidence", type=int, default=1)
     runner.add_argument("--damage-frames", type=int, default=40)
     runner.add_argument("--min-views", type=int, default=2)
+    runner.add_argument(
+        "--min-detection-confidence", type=float, default=0.0,
+        help="drop VLM detections (any class, including furniture) below "
+             "this confidence before masking/fusion; e.g. 0.6",
+    )
     runner.add_argument("--coverage", type=float, default=0.90)
     runner.add_argument("--no-refine", action="store_true", help="use raw ARKit poses")
     runner.add_argument("--no-loop-closure", action="store_true")
     runner.add_argument("--no-damage", action="store_true")
     runner.add_argument("--no-sam", action="store_true", help="use local GrabCut masks")
+    runner.add_argument(
+        "--debug-furniture", action="store_true",
+        help="diagnostic: also ask the VLM to tag furniture, to confirm it is "
+             "resolving objects in the frame; never enters result.json/scope",
+    )
+    runner.add_argument(
+        "--furniture-overlays", action="store_true",
+        help="with --debug-furniture, also write annotated furniture_debug_overlays/ "
+             "images (off by default -- --debug-furniture alone only prints counts)",
+    )
     runner.set_defaults(func=run)
 
     args = parser.parse_args(argv)

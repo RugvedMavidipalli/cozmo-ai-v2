@@ -1,24 +1,3 @@
-"""Capture ingest: parse a recording directory into a CaptureBundle.
-
-Coordinate conventions
-----------------------
-Stray Scanner writes odometry as camera-to-world poses whose rotation already
-uses the OpenCV camera convention (camera looks down +Z, +Y down in image
-space), in a gravity-aligned world frame.  This was established empirically,
-not assumed: `tools/conv_test.py` scores every plausible convention by how well it
-aligns nearby frames' point clouds, and the identity mapping wins by 6x
-(4.2 cm median nearest-neighbour vs 25.9 cm for the flipped alternatives).
-Poses are therefore passed through unmodified.
-
-The world frame's up axis is likewise measured rather than assumed --
-`_imu_gravity()` here recovers its direction from the accelerometer and
-`geometry.estimate_gravity()` refines it against the floor and ceiling,
-because a wrong up axis silently produces a floor plan of a wall.
-
-`Frame.pose` is camera-to-world.  Code wanting world-to-camera (Open3D
-integration, projection) takes `np.linalg.inv(frame.pose)`.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -28,71 +7,157 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Kept so `tools/conv_test.py` can still score the alternative it rules out.
+# Rotates ARKit's coordinate convention (X right, Y up, Z toward the
+# viewer) into OpenCV's convention (X right, Y down, Z into the scene),
+# which is what the rest of this pipeline expects poses to use.
 ARKIT_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
-# ARKit's confidence raster: 0 = low, 1 = medium, 2 = high.  Low-confidence
-# returns are where the sensor gives up: glass, mirrors, dark or wet surfaces,
-# grazing incidence.  Those are exactly the surfaces a damaged room is made of,
-# so the threshold is a first-class pipeline knob rather than a constant.
+# ARKit's three depth-confidence levels, from least to most trustworthy.
 CONFIDENCE_LOW = 0
 CONFIDENCE_MEDIUM = 1
 CONFIDENCE_HIGH = 2
 
-DEPTH_SCALE = 1000.0  # Stray Scanner stores depth as uint16 millimetres.
+# Depth PNGs store distances as whole millimetres; dividing by this
+# converts them to metres.
+DEPTH_SCALE = 1000.0
 
-# The IMU reports in the device body frame, which is rotated from the camera
-# raster frame.  Of the candidate mappings, only this one turns the
-# accelerometer into a constant world vector: it scores 0.99 directional
-# consistency and unit magnitude, versus 0.59-0.87 for the alternatives (see
-# `tools/grav_test.py`).  Anything but the true mapping leaves the walking motion
-# uncancelled and the mean drops well below 1 g.
+# Rotates a raw accelerometer reading from the phone's physical orientation
+# into the same axes the camera uses.
 DEVICE_TO_CAMERA = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 
 
 @dataclass
 class Frame:
-    """One synchronised RGB + depth + pose sample."""
+    """One moment in time from the capture, with its color image, depth
+    image, and camera position all lined up together.
+
+    A raw capture stores color video, depth data, and camera tracking
+    separately, each on its own schedule. A `Frame` is what you get after
+    picking one instant and pulling together everything that was recorded
+    at (or very close to) that same moment, so the color pixels, the depth
+    values, and the camera pose all describe the same snapshot in time.
+
+    Attributes:
+        index: This frame's position in the capture, counting from 0.
+        timestamp: When this frame was captured, in seconds since the
+            start of the recording.
+        pose: The camera's position and orientation at this moment, as a
+            4x4 camera-to-world transform matrix, using OpenCV's
+            coordinate convention.
+        color: The color image, as an HxWx3 array of RGB values (0-255),
+            resized down to match the depth image's resolution.
+        depth: The depth image, as an HxW array of distances in metres. A
+            value of 0 means no valid depth was measured for that pixel.
+        confidence: How much to trust each depth pixel, as an HxW array of
+            ARKit's own confidence levels: 0, 1, or 2, for low, medium, or
+            high.
+        color_full: The color image at its original, full video
+            resolution, instead of resized to depth resolution. This is
+            `None` unless it was specifically requested, since keeping
+            every frame at full resolution uses a lot more memory.
+    """
 
     index: int
     timestamp: float
-    pose: np.ndarray  # 4x4 camera-to-world, OpenCV convention
-    color: np.ndarray  # HxWx3 uint8 RGB, at depth resolution
-    depth: np.ndarray  # HxW float32 metres, 0 where invalid
-    confidence: np.ndarray  # HxW uint8 in {0,1,2}
+    pose: np.ndarray
+    color: np.ndarray
+    depth: np.ndarray
+    confidence: np.ndarray
+    color_full: np.ndarray | None = None
 
     @property
     def position(self) -> np.ndarray:
+        """Where the camera was, in world coordinates, when this frame was
+        captured."""
         return self.pose[:3, 3]
 
 
 @dataclass
 class CaptureBundle:
-    """A parsed capture, plus everything needed to re-read its frames."""
+    """Everything the rest of the pipeline needs to know about one capture,
+    plus enough information to go back and re-read its individual frames on
+    demand.
+
+    This doesn't hold the actual color and depth images -- those stay on
+    disk and get loaded frame by frame through `iter_frames` -- but it does
+    hold the camera's tracked path through the room and its optical
+    properties, which are needed constantly throughout the rest of the
+    pipeline.
+
+    Attributes:
+        root: The capture's directory on disk. It's expected to contain
+            `odometry.csv`, `rgb.mp4`, a `depth/` folder, a `confidence/`
+            folder, and (optionally) an `imu.csv` file.
+        name: The capture directory's own name, used as a label when
+            printing progress or naming output files.
+        intrinsics: The camera's pinhole intrinsics -- the focal length
+            and optical center (fx, fy, cx, cy) packed into a 3x3 matrix
+            -- scaled to match the resolution given by `depth_size`.
+        depth_size: The `(width, height)`, in pixels, of the depth and
+            confidence images.
+        timestamps: When each frame was captured, in seconds, as an (N,)
+            array.
+        poses: The camera's position and orientation at each frame, as an
+            (N, 4, 4) array of camera-to-world transform matrices, using
+            OpenCV's coordinate convention.
+        has_depth: Always `True` for a `CaptureBundle` built by
+            `load_capture`; this field exists so other parts of the code
+            can tell a LiDAR capture apart from a video-only one.
+        fps: The capture's effective frame rate, in frames per second.
+        gravity_up: A unit vector, in world coordinates, pointing away
+            from the floor -- the pipeline's best guess at "up" for this
+            capture.
+        gravity_consistency: How well the phone's accelerometer readings
+            agree with each other on a single up direction, from 0 (no
+            agreement at all) to 1 (perfect agreement). A low value can be
+            a sign that the capture involved a lot of shaking or unusual
+            device motion.
+    """
 
     root: Path
     name: str
-    intrinsics: np.ndarray  # 3x3 for the depth-resolution image
-    depth_size: tuple[int, int]  # (width, height)
-    timestamps: np.ndarray  # (N,)
-    poses: np.ndarray  # (N,4,4) camera-to-world, OpenCV convention
+    intrinsics: np.ndarray
+    depth_size: tuple[int, int]
+    timestamps: np.ndarray
+    poses: np.ndarray
     has_depth: bool
     fps: float
-    gravity_up: np.ndarray  # unit world vector opposing gravity, from the IMU
-    gravity_consistency: float  # 1.0 when the accelerometer resolves to a constant
+    gravity_up: np.ndarray
+    gravity_consistency: float
 
     def __len__(self) -> int:
+        """How many frames are in this capture."""
         return len(self.poses)
 
     @property
     def duration(self) -> float:
+        """How long the capture lasted, in seconds. Returns 0.0 if there
+        are fewer than two timestamps to measure a span between."""
         if len(self.timestamps) < 2:
             return 0.0
         return float(self.timestamps[-1] - self.timestamps[0])
 
 
 def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (timestamps, poses, rgb_intrinsics_per_frame) from odometry.csv."""
+    """Reads the camera's tracked path and per-frame lens settings out of a
+    Stray Scanner `odometry.csv` file.
+
+    Each row in this file represents one moment during the capture: when
+    it happened, where the camera was and how it was oriented, and what
+    the camera's lens settings were at that instant.
+
+    Args:
+        path: Path to a Stray Scanner `odometry.csv` file.
+
+    Returns:
+        A tuple of `(timestamps, poses, intrinsics)`. `timestamps` is an
+        (N,) array of capture times, in seconds. `poses` is an (N, 4, 4)
+        array of camera-to-world transform matrices, using OpenCV's
+        coordinate convention. `intrinsics` is an (N, 4) array of
+        per-frame `(fx, fy, cx, cy)` lens values, measured at `rgb.mp4`'s
+        native resolution. Rows with a blank timestamp are skipped
+        entirely.
+    """
     timestamps: list[float] = []
     poses: list[np.ndarray] = []
     intrinsics: list[tuple[float, float, float, float]] = []
@@ -100,6 +165,8 @@ def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
         header = [column.strip() for column in next(reader)]
+        # Look columns up by name rather than by fixed position, so this
+        # doesn't break if the CSV's column order ever changes.
         column = {name: i for i, name in enumerate(header)}
         for row in reader:
             if not row or not row[column["timestamp"]].strip():
@@ -109,10 +176,11 @@ def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             translation = np.array(
                 [float(row[column[axis]]) for axis in ("x", "y", "z")]
             )
-            # Stray writes the quaternion as (qx, qy, qz, qw).
             qx, qy, qz, qw = (
                 float(row[column[key]]) for key in ("qx", "qy", "qz", "qw")
             )
+            # Combine the rotation (stored as a quaternion) and the
+            # translation into one 4x4 camera-to-world transform matrix.
             pose = np.eye(4)
             pose[:3, :3] = _quaternion_to_matrix(qx, qy, qz, qw)
             pose[:3, 3] = translation
@@ -130,6 +198,20 @@ def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _quaternion_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Converts a quaternion -- a compact, four-number way of representing
+    a 3D rotation -- into an ordinary 3x3 rotation matrix.
+
+    Args:
+        qx: The quaternion's x component.
+        qy: The quaternion's y component.
+        qz: The quaternion's z component.
+        qw: The quaternion's w (scalar) component.
+
+    Returns:
+        The equivalent 3x3 rotation matrix. If the quaternion is exactly
+        zero, which shouldn't normally happen, this returns the identity
+        matrix (no rotation at all) instead of dividing by zero.
+    """
     norm = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
     if norm == 0.0:
         return np.eye(3)
@@ -156,7 +238,30 @@ def _quaternion_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndar
 
 
 def load_capture(root: str | Path) -> CaptureBundle:
-    """Parse a Stray Scanner capture directory."""
+    """Reads a Stray Scanner capture directory from disk and builds a
+    `CaptureBundle` describing it.
+
+    This is normally the very first thing that happens in the pipeline: it
+    checks that the expected files are present, works out the camera's
+    lens settings and the depth image's resolution, and recovers the up
+    direction from the phone's motion sensors, all before any of the
+    actual frame processing starts.
+
+    Args:
+        root: The capture directory. It must contain `odometry.csv`, a
+            non-empty `depth/` directory, and `rgb.mp4`. An `imu.csv` file
+            is optional -- without it, the up direction falls back to a
+            default guess.
+
+    Returns:
+        A populated `CaptureBundle`, always with `has_depth=True` since
+        this function only handles captures that include LiDAR depth
+        data.
+
+    Raises:
+        FileNotFoundError: `root` doesn't contain an `odometry.csv` file,
+            or contains no depth frames.
+    """
     root = Path(root)
     odometry_path = root / "odometry.csv"
     if not odometry_path.exists():
@@ -170,17 +275,21 @@ def load_capture(root: str | Path) -> CaptureBundle:
             f"no depth frames in {depth_dir}; use the no-LiDAR path instead"
         )
 
+    # Peek at one depth PNG just to learn its resolution -- the depth
+    # images are usually a lower resolution than the color video.
     probe = cv2.imread(str(sorted(depth_dir.glob("*.png"))[0]), cv2.IMREAD_UNCHANGED)
     depth_height, depth_width = probe.shape[:2]
 
-    # Intrinsics in odometry.csv describe the full-resolution RGB frame; the
-    # depth raster is a uniform downscale of it, so the intrinsics scale by the
-    # same factor.  Median over frames rejects the occasional ARKit outlier.
+    # The per-frame intrinsics from odometry.csv are given at the color
+    # video's native resolution, so they need to be rescaled to match the
+    # depth image's (usually smaller) resolution.
     rgb_width = _video_width(root / "rgb.mp4")
     scale = depth_width / rgb_width
     fx, fy, cx, cy = np.median(rgb_intrinsics, axis=0) * scale
     intrinsics = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
 
+    # Fall back to a reasonable default frame rate when there's only one
+    # timestamp to work with, since there's no time span to divide by.
     fps = len(timestamps) / (timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 30.0
     gravity_up, consistency = _imu_gravity(root / "imu.csv", timestamps, poses)
 
@@ -201,13 +310,31 @@ def load_capture(root: str | Path) -> CaptureBundle:
 def _imu_gravity(
     path: Path, timestamps: np.ndarray, poses: np.ndarray
 ) -> tuple[np.ndarray, float]:
-    """Recover the world up axis by averaging accelerometer samples.
+    """Figures out which direction is "up" in the world by averaging the
+    phone's accelerometer readings over the whole capture.
 
-    A handheld accelerometer reads gravity plus walking acceleration.  Rotated
-    into the world frame by each sample's pose, the gravity term is constant
-    and the walking term is zero-mean, so the average converges on gravity.
-    Returns the unit up axis and a consistency score in [0, 1]; a low score
-    means the poses or the device mapping are wrong, not that gravity moved.
+    When a phone is roughly level, gravity mostly shows up as a steady
+    pull along one axis of the accelerometer. Averaging many samples over
+    the capture washes out the noise caused by the phone's own movement,
+    leaving a decent estimate of which way is actually down -- and up is
+    just the opposite of that.
+
+    Args:
+        path: Path to the capture's `imu.csv` file. If this file doesn't
+            exist, this function falls back to assuming world +Y is up,
+            and reports zero consistency to signal that the answer is
+            only a guess.
+        timestamps: Each frame's capture time, in seconds, as an (N,)
+            array.
+        poses: Each frame's camera-to-world pose, as an (N, 4, 4) array,
+            indexed the same way as `timestamps`.
+
+    Returns:
+        A tuple of `(up, consistency)`. `up` is a unit vector, in world
+        coordinates, pointing away from the floor. `consistency` is how
+        closely the individual accelerometer samples agree with that
+        average direction, from 0 (no agreement) to 1 (perfect
+        agreement).
     """
     if not path.exists():
         return np.array([0.0, 1.0, 0.0]), 0.0
@@ -224,8 +351,13 @@ def _imu_gravity(
         return np.array([0.0, 1.0, 0.0]), 0.0
 
     data = np.asarray(samples)
+    # Match each accelerometer sample to whichever frame's pose was
+    # recorded closest to it in time, so the sample can be rotated into
+    # world coordinates below.
     nearest = np.clip(np.searchsorted(timestamps, data[:, 0]), 0, len(poses) - 1)
     rotations = poses[nearest][:, :3, :3]
+    # Accelerometer readings come in the phone's own physical orientation,
+    # not the camera's, so rotate them into camera space first.
     in_camera = data[:, 1:] @ DEVICE_TO_CAMERA.T
     in_world = np.einsum("nij,nj->ni", rotations, in_camera)
 
@@ -234,10 +366,25 @@ def _imu_gravity(
     unit = in_world / np.maximum(
         np.linalg.norm(in_world, axis=1, keepdims=True), 1e-9
     )
+    # `np.abs` here because a sample pointing the "wrong way" (e.g.
+    # opposite the average) still agrees with the overall direction, just
+    # with a flipped sign, so it shouldn't count against consistency.
     return up, float(np.abs(unit @ up).mean())
 
 
 def _video_width(path: Path) -> float:
+    """Opens a video file just long enough to read off its native frame
+    width, in pixels.
+
+    Args:
+        path: Path to a video file (normally `rgb.mp4`).
+
+    Returns:
+        The video's frame width, in pixels.
+
+    Raises:
+        FileNotFoundError: `path` couldn't be opened as a video.
+    """
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise FileNotFoundError(f"cannot open {path}")
@@ -251,12 +398,33 @@ def iter_frames(
     indices: list[int] | np.ndarray | None = None,
     min_confidence: int = CONFIDENCE_MEDIUM,
     max_depth: float = 8.0,
+    include_full_res: bool = False,
 ):
-    """Yield `Frame`s for `indices` (default: all), in ascending index order.
+    """Reads through a capture's video and depth files and yields fully
+    assembled `Frame` objects for the requested indices.
 
-    The RGB track is decoded sequentially rather than by seeking -- seeking a
-    long-GOP H.264 file per frame is orders of magnitude slower, and callers
-    always want an ordered subset.
+    Color frames live in a single video file that has to be read starting
+    from the beginning, while depth and confidence images are separate
+    files on disk. To avoid re-opening and re-scanning the video for every
+    single frame, this walks through the video once, in order, and only
+    keeps the frames that were actually asked for.
+
+    Args:
+        bundle: The parsed capture to read frames from.
+        indices: Which frame indices to yield; if `None`, every frame in
+            the capture is yielded.
+        min_confidence: The lowest depth-confidence level to keep. Any
+            pixel below this gets its depth zeroed out.
+        max_depth: The furthest depth value to include, in metres.
+            Anything beyond this gets zeroed out too.
+        include_full_res: If `True`, also populate `Frame.color_full` with
+            the image at its original video resolution, not just the
+            smaller depth resolution.
+
+    Yields:
+        `Frame` objects for the requested indices, in ascending index
+        order. An index with no matching depth PNG on disk is silently
+        skipped rather than raising an error.
     """
     if indices is None:
         indices = np.arange(len(bundle))
@@ -272,6 +440,9 @@ def iter_frames(
         raise FileNotFoundError(f"cannot open {bundle.root / 'rgb.mp4'}")
 
     try:
+        # Videos can only be read forward from the start, not jumped to a
+        # specific frame, so this reads sequentially and stops as soon as
+        # it passes the last requested index.
         for index in range(last + 1):
             ok, bgr = capture.read()
             if not ok:
@@ -283,6 +454,9 @@ def iter_frames(
                 cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA),
                 cv2.COLOR_BGR2RGB,
             )
+            color_full = (
+                cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if include_full_res else None
+            )
             depth_raw = cv2.imread(
                 str(bundle.root / "depth" / f"{index:06d}.png"), cv2.IMREAD_UNCHANGED
             )
@@ -293,9 +467,14 @@ def iter_frames(
             if depth_raw is None:
                 continue
             if confidence is None:
+                # No confidence file for this frame -- treat every pixel
+                # as fully trusted rather than dropping the frame.
                 confidence = np.full(depth_raw.shape, CONFIDENCE_HIGH, np.uint8)
 
             depth = depth_raw.astype(np.float32) / DEPTH_SCALE
+            # A depth of 0 is this pipeline's way of marking a pixel as
+            # invalid, so anything too low-confidence or too far away
+            # simply gets zeroed out here rather than removed outright.
             depth[confidence < min_confidence] = 0.0
             depth[depth > max_depth] = 0.0
 
@@ -306,16 +485,119 @@ def iter_frames(
                 color=color,
                 depth=depth,
                 confidence=confidence,
+                color_full=color_full,
             )
     finally:
         capture.release()
 
 
 def open3d_intrinsics(bundle: CaptureBundle):
-    """`bundle.intrinsics` as an Open3D camera model."""
+    """Repackages `bundle.intrinsics` into the camera model object that the
+    Open3D library expects.
+
+    Args:
+        bundle: The parsed capture whose intrinsics should be converted.
+
+    Returns:
+        An `o3d.camera.PinholeCameraIntrinsic` built from the bundle's
+        image width, height, and lens intrinsics.
+    """
     import open3d as o3d
 
     width, height = bundle.depth_size
     fx, fy = bundle.intrinsics[0, 0], bundle.intrinsics[1, 1]
     cx, cy = bundle.intrinsics[0, 2], bundle.intrinsics[1, 2]
     return o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+
+
+_INVERSE_ROTATION = {
+    cv2.ROTATE_90_CLOCKWISE: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    cv2.ROTATE_90_COUNTERCLOCKWISE: cv2.ROTATE_90_CLOCKWISE,
+    cv2.ROTATE_180: cv2.ROTATE_180,
+    None: None,
+}
+
+
+def inverse_rotation(rotation: int | None) -> int | None:
+    """Looks up the `cv2.ROTATE_*` code that would undo a given rotation --
+    in other words, the code that rotates an image back to how it looked
+    before `rotation` was applied to it.
+
+    Args:
+        rotation: A `cv2.ROTATE_*` code, or `None` for no rotation.
+
+    Returns:
+        The rotation code that reverses `rotation`.
+    """
+    return _INVERSE_ROTATION[rotation]
+
+
+def display_rotation(pose: np.ndarray, gravity_up: np.ndarray) -> int | None:
+    """Works out how a frame needs to be rotated so that "up" in the real
+    world points toward the top of the image, the way a person would
+    expect to see it.
+
+    A phone can be held in any orientation while recording -- portrait,
+    landscape, or even upside down -- and the raw video frames come out
+    rotated to match however the phone happened to be held at that
+    moment. This figures out, for one specific frame, which one of the
+    four 90-degree-multiple rotations would straighten that frame back
+    out.
+
+    Args:
+        pose: This frame's 4x4 camera-to-world pose.
+        gravity_up: The capture's up direction, as a unit vector in world
+            coordinates.
+
+    Returns:
+        A `cv2.ROTATE_*` code to apply to the raw frame so that world-up
+        points toward the top of the image, or `None` if it already does.
+    """
+    # Project world-up into this frame's own camera axes, then check
+    # whether it points more sideways or more up/down within the image to
+    # decide which of the four rotations is needed.
+    camera_up = pose[:3, :3].T @ gravity_up
+    dx, dy = float(camera_up[0]), float(camera_up[1])
+    if abs(dx) >= abs(dy):
+        return cv2.ROTATE_90_COUNTERCLOCKWISE if dx > 0 else cv2.ROTATE_90_CLOCKWISE
+    return None if dy < 0 else cv2.ROTATE_180
+
+
+def rotate_bbox(
+    bbox: tuple[float, float, float, float],
+    width: float,
+    height: float,
+    rotation: int | None,
+) -> tuple[float, float, float, float]:
+    """Moves a bounding box's coordinates to match an image that's been
+    rotated with one of the `cv2.ROTATE_*` codes.
+
+    This is needed whenever a detection (like a damage bounding box) was
+    found on a rotated version of a frame, but needs to be reported in the
+    original, unrotated image's coordinates, or vice versa.
+
+    Args:
+        bbox: The box as `(x0, y0, x1, y1)`, with `x0 <= x1` and
+            `y0 <= y1`, measured in the pre-rotation image.
+        width: The width, in pixels, of the pre-rotation image.
+        height: The height, in pixels, of the pre-rotation image.
+        rotation: A `cv2.ROTATE_*` code (as returned by
+            `display_rotation`), or `None` for no rotation.
+
+    Returns:
+        The box's `(x0, y0, x1, y1)` coordinates after the rotation has
+        been applied.
+
+    Raises:
+        ValueError: `rotation` isn't one of the four supported codes.
+    """
+    x0, y0, x1, y1 = bbox
+    if rotation is None:
+        return (x0, y0, x1, y1)
+    if rotation == cv2.ROTATE_90_CLOCKWISE:
+        return (height - y1, x0, height - y0, x1)
+    if rotation == cv2.ROTATE_90_COUNTERCLOCKWISE:
+        return (y0, width - x1, y1, width - x0)
+    if rotation == cv2.ROTATE_180:
+        return (width - x1, height - y1, width - x0, height - y0)
+    raise ValueError(f"unsupported rotation code: {rotation}")

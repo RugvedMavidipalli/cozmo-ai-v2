@@ -1,13 +1,3 @@
-"""Generate the benchmark report from pipeline outputs.
-
-Every number in the report is read from `result.json`, the ablation file, or
-the benchmark summary -- never transcribed by hand -- so re-running the
-pipeline regenerates a report that still matches the code.
-
-    python tools/make_report.py --results out/rec1/result.json out/rec2/result.json \
-        --ablations out/ablations_rec1.json --out report/benchmark.md
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -15,8 +5,6 @@ import json
 from datetime import date
 from pathlib import Path
 
-# The published gates, as (metric, gate text, stretch text). Populated from a
-# benchmark summary when one is supplied; otherwise marked as needing truth.
 GATE_TABLE = [
     ("wall_length", "Wall length error", "<= 1% or 2 cm on >= 90% of walls", "<= 0.5%"),
     ("ceiling_height", "Ceiling height error", "<= 1.5 cm", "<= 1 cm"),
@@ -224,7 +212,9 @@ def damage_section(results: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Generate the benchmark report from pipeline outputs."
+    )
     parser.add_argument("--results", nargs="+", required=True)
     parser.add_argument("--ablations")
     parser.add_argument("--benchmark", help="summary JSON from bench/run.py --out")

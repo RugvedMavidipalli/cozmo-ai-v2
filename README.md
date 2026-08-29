@@ -35,23 +35,45 @@ second run is offline and free.
 
 ```
 out/<capture>/
-  result.json      # schema/result.schema.json — validated on every run
-  floorplan.svg    # dimensioned plan: openings, inferred spans, damage overlay
-  scene.glb        # 3D reconstruction
-  cloud.ply        # fused point cloud
+  result.json                 # schema/result.schema.json — validated on every run
+  floorplan.svg                # dimensioned plan: openings, inferred spans, damage overlay
+  scene.glb                    # 3D reconstruction — every wall, plus each room's floor
+                                # and ceiling, as individually named, selectable planes
+  cloud.ply                    # fused point cloud
+  scope_sketch.csv             # room/wall geometry table (Xactimate-sketch-style export)
+  scope_line_items.csv         # scope-of-work line items (action/material/qty/rule/source)
+  damage_overlays/             # per-frame detection box + mask + label, full video
+                                # resolution, correctly oriented (present when damage is found)
+  furniture_debug_overlays/    # same rendering, for --debug-furniture's diagnostic
+                                # detections (only written with --furniture-overlays too)
 ```
 
-### Useful flags
+### All CLI flags
 
-| Flag | Effect |
-|---|---|
-| `--no-refine` | Use raw ARKit poses. The pose-refinement ablation. |
-| `--no-loop-closure` | Refine sequentially only, without loop edges. |
-| `--no-damage` | Geometry only; skips all API calls. |
-| `--no-sam` | Local GrabCut masks instead of hosted SAM 2. |
-| `--min-views N` | Independent views required to accept a damage region (default 2). |
-| `--stride N` | Frame stride for fusion. Lower is slower and denser. |
-| `--min-confidence 0\|1\|2` | ARKit depth-confidence floor. The glass/mirror ablation. |
+`python -m pipeline run <capture_dir> [flags]`
+
+| Flag | Default | Effect |
+|---|---|---|
+| `capture` (positional) | — | Capture directory |
+| `--out` | `out/<capture-name>` | Output directory |
+| `--rules` | `rules.yaml` | Scope rule set — point at an edited copy for a live "change this rule and rerun" demo |
+| `--cache-dir` | `cache/vlm` | VLM response cache directory |
+| `--calibration` | `bench/calibration.json` | Conformal interval calibration file (from `bench/run.py --fit-calibration`) |
+| `--model` | `claude-opus-5` | VLM model for damage detection |
+| `--stride N` | `4` | Frame stride for the main fusion pass. Lower is slower and denser |
+| `--voxel` | `0.02` | TSDF voxel size, metres |
+| `--max-depth` | `3.5` | Depth cutoff — the knee where ARKit depth starts reading systematically far |
+| `--min-confidence 0\|1\|2` | `1` | ARKit depth-confidence floor. The glass/mirror ablation |
+| `--damage-frames N` | `40` | Max keyframes sent to the VLM for damage detection |
+| `--min-views N` | `2` | Independent views required to accept a damage region |
+| `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |
+| `--coverage` | `0.90` | Target confidence-interval coverage |
+| `--no-refine` | off | Use raw ARKit poses. The pose-refinement ablation |
+| `--no-loop-closure` | off | Refine sequentially only, without loop edges |
+| `--no-damage` | off | Geometry only; skips all API calls |
+| `--no-sam` | off | Local GrabCut masks instead of hosted SAM 2 |
+| `--debug-furniture` | off | Diagnostic: also ask the VLM to tag named furniture, to sanity-check it's resolving objects in the frame at all — never reaches `result.json` or scope. Prints counts only |
+| `--furniture-overlays` | off | With `--debug-furniture`, also write annotated images to `furniture_debug_overlays/` (otherwise only console counts are printed) |
 
 ## Input formats
 
@@ -71,7 +93,15 @@ that silently produce confident, geometrically meaningless output if guessed:
 
 Rerun both scripts before trusting a new capture source.
 
-## Benchmarking against laser ground truth
+## Benchmarking
+
+`bench/run.py --result out/<capture>/result.json` alone runs a
+ground-truth-free gate: no room-polygon overlaps, and a structurally valid,
+symmetric room-adjacency graph. Everything else below is additive.
+
+**Against laser ground truth** (wall length, ceiling height, floor area, door/
+window widths, affected-area quantity; plus interval calibration and
+incumbent head-to-head):
 
 ```bash
 cp bench/gt_TEMPLATE.csv bench/gt_myhome.csv    # enter laser measurements
@@ -85,6 +115,29 @@ the confidence intervals are *calibrated*: if the system claims ±2 cm at 90%,
 roughly 90% of measurements must land inside ±2 cm. Until `--fit-calibration`
 has been run against real ground truth, every output is stamped
 `"calibrated": false` and the floor plan says so.
+
+**Against a laser-measured total footprint** (multi-room stitched footprint
+error):
+
+```bash
+python bench/run.py --result out/<capture>/result.json --footprint-reference 45.2
+```
+
+**Against damage/scope reference CSVs** — five independent scorers, each
+optional, matched by `surface_ref`:
+
+| Gate | Flag | Reference CSV columns |
+|---|---|---|
+| Damage classification macro F1 | `--damage-class-reference` | `surface_ref,damage_class` |
+| Water Category/Class accuracy | `--water-reference` | `surface_ref,water_category,water_class` |
+| Damage segmentation IoU | `--iou-reference` | `surface_ref,u_lo,u_hi,v_lo,v_hi` (metres, `result.json`'s `extent` convention) |
+| Concealed-flag recall/precision | `--concealed-reference` | `surface_ref` |
+| Line-item recall vs. reference scope | `--scope-reference` | `surface_ref,action,material,quantity` |
+
+```bash
+python bench/run.py --result out/<capture>/result.json \
+  --damage-class-reference ref_classes.csv --iou-reference ref_iou.csv
+```
 
 ## Design notes
 
@@ -186,6 +239,7 @@ pipeline/
 rules.yaml       all restoration logic, with IICRC citations
 schema/          result.schema.json (output is validated every run)
 bench/           ground-truth entry, gate scoring, calibration fitting
+docs/            design rationale, algorithm derivations, and a gap analysis
 ```
 
 ## Known limitations

@@ -1,18 +1,3 @@
-"""Turn fused damage regions into a defensible scope of work.
-
-The mapping from detected damage to line items is where domain knowledge
-lives, and it is deliberately not a proportional one.  A 0.3 m2 mold patch does
-not produce a 0.3 m2 line item: it produces removal of the patch plus a margin,
-containment sized to the room, PPE per technician, and HEPA passes over a much
-larger area.  Water is similar -- the flood cut is driven by the *height* of
-the waterline, not by the stained area, and baseboard comes off in whole runs.
-
-Every quantity here traces to a rule in `rules.yaml` and carries its `rule_id`
-and `source` into the output, so a reviewer can audit any number back to the
-standard it came from -- and so changing a rule changes the scope without
-touching this file.
-"""
-
 from __future__ import annotations
 
 import math
@@ -25,8 +10,46 @@ from .damage.fusion import DamageRegion
 from .rooms import Room
 
 
+def _involves(region: DamageRegion, damage_class: str) -> bool:
+    """True if `region` should be scoped as `damage_class`.
+
+    Args:
+        region: The fused damage region to test.
+        damage_class: The class being scoped for right now.
+
+    Returns:
+        True if `region.damage_class == damage_class`, or
+        `region.damage_class == "combined"` and `damage_class` is one of
+        `region.combined_classes`.
+    """
+    if region.damage_class == damage_class:
+        return True
+    return region.damage_class == "combined" and bool(
+        region.combined_classes and damage_class in region.combined_classes
+    )
+
+
 @dataclass
 class LineItem:
+    """One scope-of-work line item.
+
+    Attributes:
+        code: Catalogue key into `rules.yaml`'s `line_items`.
+        description: Human-readable line-item description.
+        action: Verb describing what's done.
+        material: The material or equipment this line item concerns.
+        quantity: Quantity in `unit`.
+        unit: Unit of measure.
+        trade: Responsible trade/skillset.
+        surface_ref: Surface or room-name key this item applies to.
+        room_id: Room this item belongs to, or `None`.
+        rule_id: Dotted path into `rules.yaml` identifying which rule
+            produced this item.
+        source: Citation for the rule.
+        basis: Prose explanation of how the quantity was derived.
+        derived_from: Damage region ids this item was produced from.
+    """
+
     code: str
     description: str
     action: str
@@ -38,10 +61,15 @@ class LineItem:
     room_id: int | None
     rule_id: str
     source: str
-    basis: str  # how the quantity was derived, in words
-    derived_from: list[str] = field(default_factory=list)  # damage region ids
+    basis: str
+    derived_from: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        """Plain-dict form of this line item, for JSON export.
+
+        Returns:
+            A dict with every field, `quantity` rounded to 3 decimal places.
+        """
         return {
             "code": self.code,
             "description": self.description,
@@ -61,6 +89,23 @@ class LineItem:
 
 @dataclass
 class ConcealedFlag:
+    """A flagged risk of damage that can't be directly seen, inferred from
+    visible evidence.
+
+    Attributes:
+        rule_id: Id of the `concealed` rule in `rules.yaml` that fired.
+        surface_ref: Surface of the triggering region.
+        room_id: Room of the triggering region, or `None`.
+        inferred: Description of the concealed condition being flagged
+            (the rule's `infer` text).
+        probability: The rule's stated likelihood this concealed condition
+            is actually present, in `[0, 1]`.
+        rationale: The rule's stated reasoning, for a human reviewer.
+        source: Citation for the rule.
+        triggered_by: Id of the `DamageRegion` that matched the rule's
+            condition.
+    """
+
     rule_id: str
     surface_ref: str
     room_id: int | None
@@ -71,6 +116,11 @@ class ConcealedFlag:
     triggered_by: str
 
     def to_dict(self) -> dict:
+        """Plain-dict form of this flag, for JSON export.
+
+        Returns:
+            A dict with every field.
+        """
         return {
             "rule_id": self.rule_id,
             "surface_ref": self.surface_ref,
@@ -84,13 +134,23 @@ class ConcealedFlag:
 
 
 class ScopeEngine:
-    """Applies `rules.yaml` to fused damage."""
+    """Turns fused damage regions into a concrete list of repair line items, following the rules in `rules.yaml`.
+
+    None of the pricing or repair logic is hard-coded in this class --
+    it just reads whichever action `rules.yaml` specifies for the damage
+    it's given and applies it. That means the rules can be updated
+    without touching this code.
+    """
 
     def __init__(self, rules_path: str | Path = "rules.yaml"):
+        """Load and parse the rules file.
+
+        Args:
+            rules_path: Path to the YAML rules file.
+        """
         self.rules = yaml.safe_load(Path(rules_path).read_text())
         self.catalogue = self.rules["line_items"]
 
-    # -- helpers ----------------------------------------------------------
     def _item(
         self,
         code: str,
@@ -104,6 +164,24 @@ class ScopeEngine:
         basis: str,
         derived_from: list[str],
     ) -> LineItem:
+        """Build a `LineItem`, filling `description`/`unit`/`trade` from the
+        catalogue entry for `code`.
+
+        Args:
+            code: Catalogue key into `self.catalogue`.
+            action: Verb describing the work performed.
+            material: Material or equipment involved.
+            quantity: Quantity in the catalogue entry's unit.
+            surface_ref: Surface or room-name key the item applies to.
+            room_id: Room the item belongs to, or `None`.
+            rule_id: Dotted path identifying the rule that produced this.
+            source: Citation for the rule.
+            basis: Prose explanation of how `quantity` was derived.
+            derived_from: Damage region ids the item was produced from.
+
+        Returns:
+            A fully-populated `LineItem`.
+        """
         entry = self.catalogue[code]
         return LineItem(
             code=code,
@@ -121,9 +199,19 @@ class ScopeEngine:
             derived_from=derived_from,
         )
 
-    # -- water ------------------------------------------------------------
     def _flood_cut_height(self, waterline: float) -> tuple[float, str]:
-        """Cut height above the floor, and the reasoning behind it."""
+        """Cut height above the floor, and the reasoning behind it.
+
+        Args:
+            waterline: Height of the visible waterline above the floor,
+                metres.
+
+        Returns:
+            `(height, basis)`: the drywall cut height in metres (waterline
+            plus a safety margin, raised to a configured minimum, and
+            optionally snapped up to the nearest standard sheet line), and
+            a prose trail of which adjustments applied.
+        """
         rules = self.rules["water"]["flood_cut"]
         raw = waterline + rules["base_height"]
         height = max(raw, rules["minimum_height"])
@@ -148,6 +236,34 @@ class ScopeEngine:
     def _water_items(
         self, region: DamageRegion, room: Room | None, wall_length: float | None
     ) -> list[LineItem]:
+        """Builds the water-damage repair items for one region, using different logic for each kind of surface.
+
+        A wet floor, a wet wall, and a wet ceiling don't get repaired the
+        same way, so this first checks what kind of surface the region
+        sits on. A floor gets its carpet and pad addressed directly, since
+        water pools there and soaks straight down. A wall instead gets a
+        "flood cut": rather than replacing the whole wall, only the
+        drywall up to some height above where the water visibly reached is
+        removed and replaced, since damage from wicking rarely climbs much
+        higher than that. A ceiling has no equivalent waterline to measure
+        from -- water falling from above just soaks whatever area it
+        touches -- so a ceiling is scoped by its damaged area instead of a
+        cut height. Whichever of those applies, an antimicrobial treatment
+        is also added on top whenever the water's contamination category
+        calls for it, regardless of which surface it's on.
+
+        Args:
+            region: A water (or water-half-of-combined) damage region.
+            room: The region's room, if resolved.
+            wall_length: Full length of the wall this region sits on,
+                metres; `None` for floor/ceiling regions or if unknown.
+
+        Returns:
+            Zero or more `LineItem`s: carpet/pad handling for a floor;
+            drywall removal, replacement, insulation removal, and baseboard
+            handling for a wall or ceiling flood cut; antimicrobial
+            treatment for a qualifying category, on any surface kind.
+        """
         water = self.rules["water"]
         category = region.water_category or 1
         actions = water["category_actions"].get(category, water["category_actions"][1])
@@ -155,6 +271,7 @@ class ScopeEngine:
         room_id = region.room_id
 
         is_floor = region.surface_key.endswith("floor") or region.surface_key == "floor"
+        is_ceiling = region.surface_key.endswith("ceiling") or region.surface_key == "ceiling"
 
         if is_floor:
             if actions["carpet"] == "remove":
@@ -190,25 +307,34 @@ class ScopeEngine:
                 )
             return items
 
-        # Wall: the flood cut is driven by the waterline height, not the area.
-        if actions["drywall"] == "flood_cut" and wall_length:
-            waterline = region.bounds_v[1]
-            height, basis = self._flood_cut_height(waterline)
-            run = min(region.width_extent, wall_length)
-            area = height * run
+        if actions["drywall"] == "flood_cut" and (wall_length or is_ceiling):
+            if is_ceiling:
+                area = region.area
+                basis = (
+                    f"ceiling water damage scoped by affected area (a ceiling has "
+                    f"no waterline to cut above): {area:.2f} m2"
+                )
+                rule_id = "water.category_actions.ceiling"
+            else:
+                waterline = region.bounds_v[1]
+                height, basis = self._flood_cut_height(waterline)
+                run = min(region.width_extent, wall_length)
+                area = height * run
+                basis += f"; cut {height:.2f} m x {run:.2f} m affected run"
+                rule_id = "water.flood_cut"
+
             items.append(
                 self._item(
                     "drywall_remove", "remove", "drywall", area,
-                    region.surface_key, room_id, "water.flood_cut",
-                    water["flood_cut"]["source"],
-                    f"{basis}; cut {height:.2f} m x {run:.2f} m affected run",
+                    region.surface_key, room_id, rule_id,
+                    water["flood_cut"]["source"], basis,
                     [region.id],
                 )
             )
             items.append(
                 self._item(
                     "drywall_replace", "replace", "1/2\" drywall", area,
-                    region.surface_key, room_id, "water.flood_cut",
+                    region.surface_key, room_id, rule_id,
                     water["flood_cut"]["source"],
                     "Replacement matches the removed area",
                     [region.id],
@@ -224,22 +350,23 @@ class ScopeEngine:
                 )
             )
 
-            baseboard = water["baseboard"]
-            code = (
-                "baseboard_replace"
-                if category in baseboard["replace_if_category"]
-                else "baseboard_detach"
-            )
-            items.append(
-                self._item(
-                    code,
-                    "replace" if code == "baseboard_replace" else "detach_and_reset",
-                    "baseboard", run, region.surface_key, room_id,
-                    "water.baseboard", baseboard["source"],
-                    f"Baseboard follows the full {run:.2f} m affected run, not the stain",
-                    [region.id],
+            if not is_ceiling:
+                baseboard = water["baseboard"]
+                code = (
+                    "baseboard_replace"
+                    if category in baseboard["replace_if_category"]
+                    else "baseboard_detach"
                 )
-            )
+                items.append(
+                    self._item(
+                        code,
+                        "replace" if code == "baseboard_replace" else "detach_and_reset",
+                        "baseboard", run, region.surface_key, room_id,
+                        "water.baseboard", baseboard["source"],
+                        f"Baseboard follows the full {run:.2f} m affected run, not the stain",
+                        [region.id],
+                    )
+                )
 
         if category in water["antimicrobial"]["apply_for_categories"]:
             items.append(
@@ -256,8 +383,18 @@ class ScopeEngine:
     def _drying_items(
         self, regions: list[DamageRegion], room: Room
     ) -> list[LineItem]:
-        """Equipment counts follow affected area and class, per room."""
-        water_regions = [r for r in regions if r.damage_class == "water"]
+        """Equipment counts follow affected area and class, for the whole room.
+
+        Args:
+            regions: All damage regions in one room (mixed classes;
+                filtered to water-involving ones internally).
+            room: The room these regions belong to.
+
+        Returns:
+            Empty list if the room has no water damage. Otherwise three
+            items: air movers, a dehumidifier, and daily monitoring visits.
+        """
+        water_regions = [r for r in regions if _involves(r, "water")]
         if not water_regions:
             return []
 
@@ -318,8 +455,19 @@ class ScopeEngine:
             ),
         ]
 
-    # -- mold -------------------------------------------------------------
     def _mold_items(self, region: DamageRegion, room: Room | None) -> list[LineItem]:
+        """Build mold-remediation line items for one region.
+
+        Args:
+            region: A mold (or mold-half-of-combined) damage region.
+            room: The region's room, if resolved; not used here.
+
+        Returns:
+            Zero to three items: material removal and antimicrobial
+            treatment (both skipped when the condition's action doesn't call
+            for removal), and always a HEPA vacuum pass over the grown
+            (margin-expanded) area.
+        """
         mold = self.rules["mold"]
         condition = region.mold_condition or 3
         action = mold["condition_actions"].get(condition, "remove_and_treat")
@@ -327,7 +475,6 @@ class ScopeEngine:
         room_id = region.room_id
 
         margin = mold["removal_margin"]
-        # Remediation extends past visible growth on every side.
         grown = (region.width_extent + 2 * margin) * (region.height_extent + 2 * margin)
 
         if action == "remove_and_treat":
@@ -364,13 +511,36 @@ class ScopeEngine:
     def _mold_containment(
         self, regions: list[DamageRegion], room: Room
     ) -> list[LineItem]:
-        """Containment and PPE scale with the room, not the patch.
+        """Builds the containment barrier, air scrubber, and PPE items for a room with mold, sized to the whole room rather than to the mold patch itself.
 
-        This is the clearest case where proportional mapping fails: a small
-        patch in an occupied space still needs a sealed enclosure and
-        protected workers.
+        Most repair quantities scale with how much damage there is -- more
+        damaged area means more material to remove or treat. Containment
+        doesn't work that way. Remediating mold safely means sealing off
+        the entire room with plastic sheeting so spores can't spread while
+        the work happens, and that seal has to cover the room's real walls
+        and ceiling whether the visible mold patch is tiny or covers most
+        of a wall. So the size of the plastic barrier below is calculated
+        from the room's own perimeter, floor area, and height -- not from
+        how much of the room the mold actually covers. The total mold area
+        still matters for one thing: it decides how serious a containment
+        setup is called for (the `size` category below), which in turn
+        picks the containment type and PPE level.
+
+        Args:
+            regions: All damage regions in one room (mixed classes; filtered
+                to mold-involving ones internally).
+            room: The room these regions belong to; supplies the
+                perimeter/area/height the barrier and air-scrubber sizing
+                are based on.
+
+        Returns:
+            Empty list if the room's total mold area is under the
+            containment trigger threshold. Otherwise a containment barrier
+            item; a negative-air (HEPA scrubber) item if the larger
+            negative-air trigger is also met; and a PPE supply item sized to
+            two technicians over three days.
         """
-        mold_regions = [r for r in regions if r.damage_class == "mold"]
+        mold_regions = [r for r in regions if _involves(r, "mold")]
         total = sum(r.area for r in mold_regions)
         containment = self.rules["mold"]["containment"]
         if total < containment["trigger_area"]:
@@ -385,8 +555,9 @@ class ScopeEngine:
             else "large"
         )
         height = room.height or 2.4
-        # A poly enclosure is walls plus a ceiling over the work area; the
-        # perimeter comes from the room's own footprint.
+        # Barrier covers the room's own perimeter walls (perimeter x height)
+        # plus its ceiling (area) -- a full room-scale enclosure, independent
+        # of how much of that room the visible mold actually covers.
         barrier_area = room.perimeter * height + room.area
 
         items = [
@@ -426,8 +597,23 @@ class ScopeEngine:
         )
         return items
 
-    # -- fire -------------------------------------------------------------
     def _fire_items(self, region: DamageRegion, room: Room | None) -> list[LineItem]:
+        """Build fire-damage line items for one region.
+
+        Dispatches by subtype action: cleanable soot is cleaned (and
+        optionally sealed against residual odour), while char or consumed
+        material -- where the substrate itself is compromised, not just
+        coated -- is removed and replaced outright rather than cleaned.
+
+        Args:
+            region: A fire (or fire-half-of-combined) damage region.
+            room: The region's room, if resolved (not directly used here,
+                accepted for a uniform per-class item-builder signature).
+
+        Returns:
+            One or two items: either soot cleaning plus an optional sealant
+            coat, or fire-damaged material removal.
+        """
         fire = self.rules["fire"]
         subtype = region.subtype or "soot"
         action = fire["subtype_actions"].get(subtype, "clean_and_seal")
@@ -469,7 +655,20 @@ class ScopeEngine:
         return items
 
     def _fire_odour(self, regions: list[DamageRegion], room: Room) -> list[LineItem]:
-        fire_regions = [r for r in regions if r.damage_class == "fire"]
+        """Per-room deodorisation, triggered once total fire damage clears a threshold.
+
+        Args:
+            regions: All damage regions in one room (mixed classes; filtered
+                to fire-involving ones internally).
+            room: The room these regions belong to.
+
+        Returns:
+            Empty list if the room's total fire-damaged area is under the
+            odour-treatment trigger. Otherwise a single whole-room
+            deodorisation item (`quantity=1.0` -- it's a per-room treatment,
+            not an area-scaled one).
+        """
+        fire_regions = [r for r in regions if _involves(r, "fire")]
         total = sum(r.area for r in fire_regions)
         odour = self.rules["fire"]["odour_treatment"]
         if total < odour["trigger_area"]:
@@ -484,9 +683,28 @@ class ScopeEngine:
             )
         ]
 
-    # -- concealed --------------------------------------------------------
     def concealed_flags(self, regions: list[DamageRegion]) -> list[ConcealedFlag]:
-        """Fire every concealed-damage rule whose conditions a region meets."""
+        """Checks every damage region against every concealed-damage rule, and flags the ones that match.
+
+        A concealed-damage rule describes a hidden risk that's likely
+        given what's visible -- for example, contaminated water damage on
+        a wall often means the insulation behind it is contaminated too,
+        even though nobody can see that directly. Every region is checked
+        against every rule, not just the rules that match that region's
+        own damage class: a rule written for water damage will simply fail
+        its first check for a fire-damage region, so nothing extra is
+        needed here to keep the classes from mixing. A single region can
+        also end up triggering more than one rule, if it happens to
+        satisfy several.
+
+        Args:
+            regions: All fused damage regions across the whole property.
+
+        Returns:
+            One `ConcealedFlag` per (rule, region) pair where the region
+            satisfies the rule's `when` condition -- possibly several per
+            region, or none.
+        """
         flags: list[ConcealedFlag] = []
         for rule in self.rules["concealed"]:
             condition = rule["when"]
@@ -508,6 +726,27 @@ class ScopeEngine:
         return flags
 
     def _matches(self, condition: dict, region: DamageRegion) -> bool:
+        """Checks whether one region satisfies every condition listed in a concealed-damage rule.
+
+        A rule's `when` block in `rules.yaml` can list several conditions
+        at once, like a minimum water category or being close to the
+        floor. Each condition checked below is optional: if a rule simply
+        doesn't mention it, this skips checking it rather than treating
+        its absence as a failure. But any condition a rule does list has
+        to be satisfied, or the whole match fails. This lets `rules.yaml`
+        describe narrow, specific combinations -- like "Category 3 water,
+        next to the floor" -- without this function needing a separate
+        case written for every possible rule.
+
+        Args:
+            condition: One rule's `when` block from `rules.yaml` --
+                `damage_class` is required, every other key optional.
+            region: The candidate region to test.
+
+        Returns:
+            True only if EVERY condition key present in `condition` is
+            satisfied by `region`.
+        """
         if condition.get("damage_class") != region.damage_class:
             return False
         if "min_category" in condition:
@@ -532,27 +771,51 @@ class ScopeEngine:
             return False
         return True
 
-    # -- entry point ------------------------------------------------------
     def build(
         self,
         regions: list[DamageRegion],
         rooms: list[Room],
         wall_lengths: dict[str, float] | None = None,
     ) -> tuple[list[LineItem], list[ConcealedFlag]]:
-        """Full scope: per-region items plus per-room equipment and containment."""
+        """Builds the full scope of work: line items for each region, plus per-room items like equipment and containment.
+
+        This runs in two passes. First, every region gets its own
+        class-specific items -- water, mold, or fire, via `_involves`, so
+        a region with combined damage gets items from both classes.
+        Second, every room that has any damage at all gets a batch of
+        per-room items computed once from all of that room's regions
+        together (drying equipment, mold containment, fire odour). Those
+        are handled as a separate pass, rather than per region, because
+        they don't scale per region -- computing them region-by-region
+        would double-count things like how many air movers a room needs.
+
+        Args:
+            regions: All fused damage regions across the property.
+            rooms: All rooms, used both to resolve each region's room by id
+                and to iterate for the per-room aggregate pass.
+            wall_lengths: Map from wall surface key to that wall's full
+                length, metres -- passed through to `_water_items` for
+                flood-cut sizing. Regions on a wall missing from this map
+                get no flood-cut items (see `_water_items`'s
+                `wall_length or is_ceiling` guard).
+
+        Returns:
+            `(items, concealed_flags)`: every generated line item, and every
+            concealed-damage flag from `concealed_flags`.
+        """
         wall_lengths = wall_lengths or {}
         items: list[LineItem] = []
         by_room = {room.id: room for room in rooms}
 
         for region in regions:
             room = by_room.get(region.room_id)
-            if region.damage_class == "water":
+            if _involves(region, "water"):
                 items += self._water_items(
                     region, room, wall_lengths.get(region.surface_key)
                 )
-            elif region.damage_class == "mold":
+            if _involves(region, "mold"):
                 items += self._mold_items(region, room)
-            elif region.damage_class == "fire":
+            if _involves(region, "fire"):
                 items += self._fire_items(region, room)
 
         for room in rooms:

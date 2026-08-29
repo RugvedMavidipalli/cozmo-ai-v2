@@ -1,12 +1,3 @@
-"""Segment a capture into rooms and build the adjacency graph.
-
-Rooms are derived from the floor's free space, not from the trajectory: a
-capture may start in a hallway outside the unit, wander back through a room it
-already visited, or cover one room from two directions.  Watershed over the
-free-space distance transform cuts at the narrow necks -- doorways -- which is
-where a floor plan should be cut.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,44 +10,118 @@ from .planes import HorizontalFrame, WallSegment
 
 @dataclass
 class PlanGrid:
-    """Rasterised plan view shared by room finding and opening detection."""
+    """A top-down grid of the space, used both to find rooms and to find
+    doors and windows.
+
+    Picture looking straight down at the building from above and dividing
+    the floor into small square cells, like graph paper. For every cell,
+    this keeps two counts: how many times a 3D point landed there at
+    "wall height" (evidence that a wall runs through that cell), and how
+    many times a point landed there at floor height (evidence that
+    someone could actually stand there). Room segmentation and opening
+    detection both build on this same grid, so they agree with each other
+    about where the walls and open floor actually are.
+
+    Attributes:
+        resolution: The size of one grid cell, in metres. Smaller values
+            give a more detailed grid but take longer to process.
+        origin: The plan-space (x, y) coordinate that cell (0, 0) sits at,
+            used to convert between real-world coordinates and grid
+            cells.
+        occupied: A grid of integers, one per cell, counting how many
+            wall-height points landed in each cell.
+        free: A grid of integers, one per cell, counting how many
+            floor-height points (or camera positions -- see
+            `build_plan_grid`) landed in each cell.
+    """
 
     resolution: float
-    origin: np.ndarray  # plan coordinate of cell (0, 0)
-    occupied: np.ndarray  # wall evidence
-    free: np.ndarray  # observed floor
+    origin: np.ndarray
+    occupied: np.ndarray
+    free: np.ndarray
 
     def to_cell(self, plan: np.ndarray) -> np.ndarray:
+        """Converts a real-world (x, y) position into the grid cell it
+        falls inside.
+
+        Args:
+            plan: An array of plan-space (x, y) coordinates, in metres.
+
+        Returns:
+            An integer array of the same shape giving each point's
+            (column, row) cell index.
+        """
         return np.floor((plan - self.origin) / self.resolution).astype(int)
 
     def to_plan(self, cell: np.ndarray) -> np.ndarray:
+        """Converts a grid cell index back into a real-world (x, y)
+        position, at the centre of that cell.
+
+        Args:
+            cell: An array of integer (column, row) cell indices.
+
+        Returns:
+            The plan-space (x, y) coordinate, in metres, at the centre of
+            each given cell.
+        """
         return self.origin + (np.asarray(cell, float) + 0.5) * self.resolution
 
     @property
     def cell_area(self) -> float:
+        """The area covered by a single grid cell, in square metres. This
+        is just the cell size squared, and it's what turns a raw cell
+        count into an actual area measurement elsewhere in this file."""
         return self.resolution**2
 
 
 @dataclass
 class Room:
+    """One room found by `segment_rooms`, along with everything known
+    about its shape and which walls bound it.
+
+    Attributes:
+        id: A number identifying this room, assigned in the order rooms
+            were found during segmentation.
+        name: An automatically generated name like "room_1", "room_2",
+            and so on.
+        area: The room's floor area, in square metres.
+        centroid: The plan-space (x, y) position at the average of all
+            the room's floor cells -- roughly its centre.
+        floor_height: The world-space height of the floor, in metres.
+        ceiling_height: The world-space height of the ceiling, in metres,
+            or `None` if no ceiling plane could be found for this
+            capture.
+        wall_indices: Which walls (as indices into the full `walls` list)
+            bound this room.
+        neighbours: The ids of other rooms that share a boundary with
+            this one.
+        polygon: The (N, 2) plan-space vertices that trace the room's
+            outline, or `None` if no usable outline could be traced.
+    """
+
     id: int
     name: str
-    area: float  # m^2, from the segmented floor cells
-    centroid: np.ndarray  # plan coordinates
+    area: float
+    centroid: np.ndarray
     floor_height: float
     ceiling_height: float | None
     wall_indices: list[int] = field(default_factory=list)
     neighbours: list[int] = field(default_factory=list)
-    polygon: np.ndarray | None = None  # (N,2) plan-space boundary
+    polygon: np.ndarray | None = None
 
     @property
     def height(self) -> float | None:
+        """The floor-to-ceiling height of this room, in metres, or `None`
+        if no ceiling plane was found for this capture."""
         if self.ceiling_height is None:
             return None
         return self.ceiling_height - self.floor_height
 
     @property
     def perimeter(self) -> float:
+        """The total length of this room's outline, in metres, found by
+        adding up the length of every edge in `polygon`. Returns 0.0 if
+        the room has no usable polygon."""
         if self.polygon is None or len(self.polygon) < 2:
             return 0.0
         closed = np.vstack([self.polygon, self.polygon[:1]])
@@ -73,12 +138,43 @@ def build_plan_grid(
     floor_band: float = 0.12,
     trajectory: np.ndarray | None = None,
 ) -> PlanGrid:
-    """Rasterise wall evidence and observed floor into a common grid.
+    """Builds the top-down `PlanGrid` that room finding and opening
+    detection both work from.
 
-    The operator's own path is counted as floor.  Depth sensors see little of
-    the floor when the camera is held level and swept across walls, so whole
-    rooms can end up with too little floor evidence to seed -- but anywhere
-    the camera physically travelled is certainly walkable floor.
+    Every point in the full 3D reconstruction gets sorted into one of two
+    buckets, based on how high above the floor it sits: points in a
+    "wall height" band (roughly waist to head height, which avoids
+    furniture near the floor and light fixtures near the ceiling) count
+    as evidence of a wall, and points close to floor height count as
+    evidence of open, walkable floor. Each bucket is then dropped into
+    its matching grid cell. Optionally, the camera's own path through the
+    space is also marked as walkable floor and puffed out slightly --
+    this helps fill in open floor in areas the depth sensor didn't get a
+    clean reading, since the camera obviously had to be standing
+    somewhere to take that shot.
+
+    Args:
+        points: The full set of (N, 3) world-space points from the 3D
+            reconstruction.
+        frame: The building's horizontal reference frame, used to convert
+            points into flat (x, y) plan coordinates and to measure how
+            high above the floor each point is.
+        floor_height: The world-space height of the floor, in metres.
+        ceiling_height: The world-space height of the ceiling, in metres,
+            or `None` to fall back to the highest point actually
+            observed.
+        resolution: The size of one grid cell, in metres.
+        wall_band: The `(low, high)` height range above the floor, in
+            metres, that counts as wall evidence.
+        floor_band: How close to `floor_height`, in metres, a point has
+            to be to count as floor.
+        trajectory: Optional (M, 3) world-space camera positions to also
+            mark as walkable floor.
+
+    Returns:
+        A `PlanGrid` sized to cover every point with half a metre of
+        margin around the edges, with wall and floor evidence already
+        counted up per cell.
     """
     heights = frame.height(points)
     plan = frame.to_plan(points)
@@ -95,9 +191,11 @@ def build_plan_grid(
 
     free = _accumulate(plan[floor_mask], lower, shape, resolution)
     if trajectory is not None and len(trajectory):
+        # Wherever the camera walked, mark that spot (and a small area
+        # around it) as walkable floor too -- the sensor may not have
+        # gotten a clean floor reading there, but the camera had to be
+        # standing on solid ground to take the shot.
         walked = _accumulate(frame.to_plan(trajectory), lower, shape, resolution)
-        # A footprint is strong evidence, so it clears the floor threshold on
-        # its own; dilating covers the operator's body width.
         free = free + ndimage.grey_dilation(
             (walked > 0).astype(np.int32) * 10, size=(5, 5)
         )
@@ -113,6 +211,22 @@ def build_plan_grid(
 def _accumulate(
     plan: np.ndarray, origin: np.ndarray, shape: np.ndarray, resolution: float
 ) -> np.ndarray:
+    """Counts how many points fall into each cell of a 2D grid.
+
+    This is the basic building block `build_plan_grid` uses for both the
+    wall and floor evidence grids: given a scatter of flat (x, y) points,
+    it works out which cell each one lands in and tallies up the count.
+
+    Args:
+        plan: The (N, 2) plan-space (x, y) points to count up.
+        origin: The plan-space coordinate that cell (0, 0) sits at.
+        shape: The `(columns, rows)` size of the output grid.
+        resolution: The size of one grid cell, in metres.
+
+    Returns:
+        A `shape`-sized grid of integer hit counts. Points that fall
+        outside the grid's bounds are simply dropped, not counted.
+    """
     cells = np.floor((plan - origin) / resolution).astype(int)
     inside = (
         (cells[:, 0] >= 0)
@@ -135,11 +249,47 @@ def segment_rooms(
     wall_threshold: int = 6,
     floor_threshold: int = 3,
 ) -> list[Room]:
-    """Watershed the free space into rooms, then attach walls to each.
+    """Splits the open floor space into separate rooms, using a technique
+    called watershed segmentation, then figures out which walls belong to
+    each room.
 
-    Wall evidence is drawn from the *fitted* wall lines rather than raw points:
-    a doorway the operator walked through leaves a gap in the point cloud on
-    both sides, and raw evidence alone leaks one room into the next.
+    The idea behind watershed segmentation is borrowed from geography:
+    imagine the open floor area as a landscape where the "elevation" at
+    each point is how far it is from the nearest wall or unexplored area
+    (so the middle of a big room is a tall peak, and doorways or narrow
+    thresholds are low valleys). If you slowly flood that landscape with
+    water starting from each peak, the water pools naturally separate at
+    the valleys, and each pool ends up corresponding to one room. This
+    works well here because doorways -- even ones standing open -- tend
+    to be narrow "pinch points" that naturally form valleys between two
+    wider rooms, without needing to detect the doors explicitly first.
+    The fitted wall lines are also drawn onto the grid as extra barriers,
+    since the raw point evidence alone sometimes leaves small gaps where
+    a wall should completely close off a doorway.
+
+    Args:
+        grid: The rasterised wall and floor evidence to segment, built by
+            `build_plan_grid`.
+        walls: The fitted wall segments; these are drawn onto the grid as
+            additional barriers, to help close up gaps in the raw point
+            evidence around doorways.
+        frame: The building's horizontal reference frame.
+        floor_height: The world-space floor height, in metres, recorded
+            on every resulting `Room`.
+        ceiling_height: The world-space ceiling height, in metres, or
+            `None`; also recorded on every resulting `Room`.
+        min_area: The smallest floor area, in square metres, a candidate
+            room needs to have in order to be kept. Smaller regions are
+            treated as noise and discarded.
+        wall_threshold: The minimum number of wall-evidence hits a grid
+            cell needs before it's treated as a solid wall barrier.
+        floor_threshold: The minimum number of floor-evidence hits a grid
+            cell needs before it's treated as observed, walkable floor.
+
+    Returns:
+        One `Room` per surviving region, each already filled in with its
+        outline polygon, area, the walls that bound it, and which other
+        rooms it neighbours.
     """
     from skimage.segmentation import watershed
 
@@ -149,11 +299,17 @@ def segment_rooms(
     free = ndimage.binary_opening(free, np.ones((3, 3)))
     free = ndimage.binary_closing(free, np.ones((3, 3)))
 
+    # The "distance transform" gives every free cell its distance to the
+    # nearest barrier -- this is the "elevation" the flood fill below
+    # works from. Seeding only from the tallest peaks (the most open
+    # parts of each room) keeps the flood from accidentally starting a
+    # new room right next to a wall or in a noisy sliver of floor.
     distance = ndimage.distance_transform_edt(free) * grid.resolution
-    # Seeds are the cores of open areas; the 0.55 m radius is about half a
-    # doorway, so a corridor neck never seeds a room of its own.
     seeds, _ = ndimage.label(distance > 0.55)
     if seeds.max() == 0:
+        # No point was far enough from a wall to seed a room on its own
+        # (this can happen in a small or narrow space) -- fall back to
+        # treating each disconnected blob of free floor as its own seed.
         seeds, _ = ndimage.label(free)
     labels = watershed(-distance, seeds, mask=free)
     labels = _grow_to_walls(labels, barrier)
@@ -177,7 +333,10 @@ def segment_rooms(
             polygon=polygon,
         )
         rooms.append(room)
-        labels[cells] = -(room.id + 1)  # renumber to the compacted room ids
+        # Re-label this room's cells with a negative number, so they can
+        # be told apart from "not yet assigned" (0) and from every other
+        # room's positive watershed label later on.
+        labels[cells] = -(room.id + 1)
 
     _assign_walls(rooms, walls, grid, labels)
     _link_neighbours(rooms, labels, grid)
@@ -187,22 +346,30 @@ def segment_rooms(
 def _grow_to_walls(
     labels: np.ndarray, barrier: np.ndarray, max_steps: int = 14
 ) -> np.ndarray:
-    """Expand each room across unobserved floor until it meets a wall.
+    """Fills in the gaps between a room's watershed region and the walls
+    around it.
 
-    A room's floor is only partly observed: furniture casts shadows, and the
-    sensor sees little floor near the walls when the camera is held level.
-    Reporting the observed region as the room's area understates it by
-    whatever the furniture covered, which is exactly the bias the 2% floor
-    area gate does not tolerate.  Since a room is bounded by its walls, the
-    labelled region is dilated into the unlabelled gaps and stopped by
-    barriers -- recovering the enclosed floor rather than the visible floor.
+    The watershed step above only labels cells where the floor was
+    actually observed, which can leave a thin ring of unlabelled cells
+    between a room and its bounding walls in spots the sensor didn't
+    fully cover. This repeatedly grows each labelled region outward, one
+    cell at a time, into any neighbouring unlabelled-but-free cell, so a
+    room's boundary reaches all the way to the walls around it instead of
+    stopping short.
 
-    The step limit matters as much as the barrier.  Wall evidence is never a
-    closed curve -- doorways, unscanned spans and grazing dropout all leave
-    gaps -- so unbounded growth escapes through them and floods a neighbouring
-    space.  Capping the reach at ~0.6 m fills furniture shadows and the
-    sensor's blind strip along the skirting, which is what the bias actually
-    comes from, while keeping an escape confined to a doorway's depth.
+    Args:
+        labels: The integer label grid from the watershed step, where 0
+            means "not yet assigned to any room".
+        barrier: A boolean grid marking wall cells that growth must never
+            cross.
+        max_steps: The most times to repeat the one-cell growth step.
+            Each step can only reach one cell further out, so this also
+            caps how big a gap can be filled.
+
+    Returns:
+        A copy of `labels` with previously-unassigned free cells filled
+        in by growth from their nearest labelled neighbour, up to
+        `max_steps` cells away.
     """
     grown = labels.copy()
     free = ~barrier
@@ -212,9 +379,6 @@ def _grow_to_walls(
         unassigned = free & (grown == 0)
         if not unassigned.any():
             break
-        # Dilate every label at once, then keep expansions only where the
-        # cell was previously unclaimed: simultaneous growth means competing
-        # rooms meet in the middle instead of one flooding the other.
         expanded = ndimage.grey_dilation(grown, footprint=cross)
         newly = unassigned & (expanded > 0)
         if not newly.any():
@@ -224,7 +388,25 @@ def _grow_to_walls(
 
 
 def _rasterise_walls(grid: PlanGrid, walls: list[WallSegment]) -> np.ndarray:
-    """Draw fitted wall lines into the grid as barriers."""
+    """Draws each fitted wall as a solid line on the grid, to use as a
+    barrier during room segmentation.
+
+    The raw point evidence used to build `grid.occupied` can leave small
+    gaps in a wall -- for instance where an open door let the sensor see
+    straight through to the next room. Since the wall-fitting stage
+    already knows exactly where each wall actually is, drawing those wall
+    lines directly onto the grid closes up those gaps and stops rooms
+    from incorrectly bleeding into each other through them.
+
+    Args:
+        grid: The target grid; supplies the resolution, origin, and
+            output shape to draw into.
+        walls: The fitted wall segments to draw.
+
+    Returns:
+        A boolean grid, `True` wherever a wall line (thickened by one
+        cell in every direction) passes through.
+    """
     barrier = np.zeros(grid.occupied.shape, bool)
     for wall in walls:
         steps = max(int(wall.length / grid.resolution) * 2, 2)
@@ -245,18 +427,25 @@ def _rasterise_walls(grid: PlanGrid, walls: list[WallSegment]) -> np.ndarray:
 def _boundary_polygon(
     cells: np.ndarray, grid: PlanGrid, snap_degrees: float = 32.0
 ) -> np.ndarray | None:
-    """Outer boundary of a room's cells as a rectilinear polygon.
+    """Traces the outer edge of a room's cells and turns it into a clean,
+    mostly-rectangular polygon.
 
-    The raw marching-squares contour is a staircase of 4 cm steps, and its
-    length is meaningless: a 14 m2 room came out with a 48 m perimeter, which
-    would then inflate both the floor-area interval and the mold containment
-    barrier that is priced off perimeter.
+    Args:
+        cells: A boolean grid, `True` wherever this room's floor cells
+            are.
+        grid: The `PlanGrid` that `cells` was rasterised into, used to
+            convert cell positions back to real-world coordinates.
+        snap_degrees: How far, in degrees, an edge can be from being
+            perfectly horizontal or vertical and still get snapped onto
+            that axis. Most real rooms have walls that are meant to be
+            straight, so this cleans up the small wobble left over from
+            working on a grid.
 
-    Plan coordinates are already expressed in the building's Manhattan frame,
-    so a room's edges should lie along the axes.  Edges close to an axis are
-    snapped to it and consecutive co-directional edges merged; corners are then
-    recovered by intersecting adjacent edge lines.  Genuinely angled walls
-    (beyond `snap_degrees`) are left alone.
+    Returns:
+        The rectified (N, 2) plan-space polygon vertices tracing the
+        room's outline (not closed -- the first and last point are not
+        repeated), or `None` if no outline could be traced from `cells`
+        at all.
     """
     from skimage import measure
 
@@ -266,14 +455,7 @@ def _boundary_polygon(
         return None
 
     contour = max(contours, key=len) - 1.0
-    # Tolerance is in cells. `_rectify` discards sub-25 cm edges, which is what
-    # actually removes the staircase, so this only needs to be large enough to
-    # keep the vertex count manageable -- and a larger value would cut real
-    # corners, biasing every room's area low.
     simplified = measure.approximate_polygon(contour, tolerance=1.5)
-    # A cell's extent is [i, i+1) in contour coordinates, so its centre is at
-    # i + 0.5.  Omitting the half-cell shift offsets every room boundary
-    # inward by 2 cm, which the 2% floor-area gate cannot spare.
     polygon = grid.origin + (simplified + 0.5) * grid.resolution
     if len(polygon) < 4:
         return polygon
@@ -285,14 +467,29 @@ def _boundary_polygon(
 def _polygon_area(
     polygon: np.ndarray | None, cell_area: float
 ) -> tuple[float, np.ndarray | None]:
-    """Area and cleaned outline for a room, from its rectified polygon.
+    """Works out the most trustworthy area figure for a room, and cleans
+    up its polygon along the way.
 
-    Area and perimeter must come from the same shape or the scope's
-    perimeter-priced items (containment barrier) will not match its
-    area-priced ones.  Rectification can occasionally produce a self-touching
-    outline, so the polygon is validated; if it cannot be repaired, or if it
-    disagrees wildly with the rasterised cells, the cell count wins because it
-    cannot be wrong by construction.
+    The rectified polygon should give a more accurate area than simply
+    counting grid cells, but the rectification process (snapping edges to
+    axes and rebuilding corners) can occasionally distort a room's shape
+    too much to trust. This checks the polygon's area against the raw
+    cell-count area, and only uses the polygon when the two roughly
+    agree; otherwise it falls back to the simpler cell count.
+
+    Args:
+        polygon: The rectified (N, 2) plan-space polygon from
+            `_boundary_polygon`, or `None` if none could be traced.
+        cell_area: The room's area from simply counting cells (cell count
+            times `grid.cell_area`), used both as a fallback and as a
+            sanity check on the polygon.
+
+    Returns:
+        A tuple of `(area, polygon)`. `area` comes from the polygon when
+        it is a valid shape and its area falls within 60% to 160% of
+        `cell_area`; otherwise `area` falls back to `cell_area`.
+        `polygon` is the repaired vertex array in the accepted case, or
+        passed through unchanged otherwise.
     """
     if polygon is None or len(polygon) < 3:
         return cell_area, polygon
@@ -301,6 +498,10 @@ def _polygon_area(
 
     shape = Polygon(polygon)
     if not shape.is_valid:
+        # A self-intersecting or otherwise invalid polygon can often be
+        # repaired by buffering it by zero -- a common trick for cleaning
+        # up small geometry errors without meaningfully changing the
+        # shape.
         shape = shape.buffer(0)
     if shape.is_empty or shape.geom_type != "Polygon":
         return cell_area, polygon
@@ -314,14 +515,30 @@ def _polygon_area(
 def _rectify(
     polygon: np.ndarray, snap_degrees: float, min_edge: float = 0.25
 ) -> np.ndarray:
-    """Snap near-axis edges to the axes and rebuild corners by intersection.
+    """Cleans up a room outline traced from a grid into straight,
+    axis-aligned edges with sharp corners.
 
-    Short edges are discarded before merging.  A rasterised staircase
-    *alternates* horizontal and vertical steps, so merging only consecutive
-    co-directional edges would never collapse one -- the steps are individually
-    axis-aligned and each interrupts the next.  Dropping every edge below
-    `min_edge` removes the steps while keeping real features like an alcove,
-    and what survives are the room's actual runs.
+    A polygon traced directly off a grid of square cells tends to look
+    stair-stepped rather than straight, even where the real wall is
+    perfectly flat. Since most rooms are built from walls that run either
+    north-south or east-west, this snaps any edge that's already close to
+    one of those directions onto it exactly, merges edges that end up
+    pointing the same way, and then rebuilds each corner as the exact
+    intersection of the two edges that meet there.
+
+    Args:
+        polygon: The raw, simplified (N, 2) plan-space polygon to clean
+            up.
+        snap_degrees: How far, in degrees, an edge can be from an axis
+            and still get snapped onto it.
+        min_edge: The shortest edge length, in metres, allowed to survive
+            the initial filtering step; shorter edges are treated as
+            noise and dropped.
+
+    Returns:
+        The rectified (N, 2) polygon, with corners recovered by
+        intersecting adjacent edges, or the original `polygon` unchanged
+        if too few usable edges survived to rebuild a shape from.
     """
     count = len(polygon)
     edges: list[tuple[np.ndarray, np.ndarray, float]] = []
@@ -343,8 +560,10 @@ def _rectify(
     if len(edges) < 3:
         return polygon
 
-    # Merge consecutive co-directional edges, weighting each by its length so a
-    # long run places the line and a leftover stub barely moves it.
+    # Neighbouring edges that both snapped to the same axis are really
+    # one edge that got split by noise -- merge them into a single edge,
+    # weighted by length, so the corner rebuild below doesn't create a
+    # spurious extra vertex.
     merged: list[tuple[np.ndarray, np.ndarray, float]] = []
     for direction, point, length in edges:
         if merged and abs(float(merged[-1][0] @ direction)) > 0.999:
@@ -357,8 +576,10 @@ def _rectify(
         else:
             merged.append((direction, point, length))
 
-    # The first and last edges are also neighbours around the loop.
     if len(merged) > 2 and abs(float(merged[0][0] @ merged[-1][0])) > 0.999:
+        # The last edge wrapped back around to point the same way as the
+        # first one -- merge those two as well, since the polygon is a
+        # closed loop.
         direction, point, weight = merged.pop()
         first_direction, first_point, first_weight = merged[0]
         merged[0] = (
@@ -385,9 +606,21 @@ def _intersect(
     direction_b: np.ndarray,
     point_b: np.ndarray,
 ) -> np.ndarray | None:
-    """Intersection of two lines given as (direction, point-on-line)."""
+    """Finds where two lines cross, with each line given as a direction
+    and a point that sits on it.
+
+    Args:
+        direction_a: The unit direction vector of the first line.
+        point_a: Any point on the first line.
+        direction_b: The unit direction vector of the second line.
+        point_b: Any point on the second line.
+
+    Returns:
+        The (x, y) point where the two lines intersect, or `None` if the
+        lines are parallel and never cross.
+    """
     denominator = direction_a[0] * direction_b[1] - direction_a[1] * direction_b[0]
-    if abs(denominator) < 1e-9:  # parallel: no corner to recover
+    if abs(denominator) < 1e-9:
         return None
     delta = point_b - point_a
     t = (delta[0] * direction_b[1] - delta[1] * direction_b[0]) / denominator
@@ -397,11 +630,24 @@ def _intersect(
 def _assign_walls(
     rooms: list[Room], walls: list[WallSegment], grid: PlanGrid, labels: np.ndarray
 ) -> None:
-    """Attach each wall to the rooms whose free space it bounds.
+    """Works out which room each wall belongs to, by checking which
+    room's floor sits on either side of it.
 
-    A wall is sampled just off each face; an interior partition therefore
-    lands in two rooms and becomes a shared wall, while an exterior wall lands
-    in one.
+    For each wall, this samples a line of points running just off both
+    faces of the wall and checks which room's cells those probe points
+    land in. Whichever room shows up often enough on a given side is
+    considered to be bounded by that wall. A wall can end up belonging to
+    more than one room if it separates two of them.
+
+    Args:
+        rooms: The rooms to attach walls to; each room's `wall_indices`
+            list is updated in place.
+        walls: The fitted wall segments to check; each wall's `room_id`
+            is set in place, to whichever room claimed it first.
+        grid: The rasterised grid, used to convert probe points into cell
+            indices.
+        labels: The watershed label grid, with rooms encoded as negative
+            numbers (see `segment_rooms`).
     """
     for wall in walls:
         steps = max(int(wall.length / grid.resolution), 2)
@@ -410,6 +656,9 @@ def _assign_walls(
         )
         touching: dict[int, int] = {}
         for side in (+1, -1):
+            # Nudge the sample points slightly off the wall's own line,
+            # to either side, so they land inside the neighbouring room's
+            # floor rather than sitting exactly on the wall itself.
             probes = samples + wall.normal * side * 0.12
             cells = grid.to_cell(probes)
             inside = (
@@ -435,21 +684,21 @@ def _assign_walls(
 
 
 def _name_walls(room: Room, walls: list[WallSegment]) -> None:
-    """Give each of a room's walls a compass name an estimator would use.
+    """Gives each of a room's walls a compass-direction name, the way a
+    property estimator would refer to them (for example,
+    "room_1.north_wall").
 
-    Names are surface references: damage regions, scope line items and ground
-    truth all key off them, so a collision would silently merge two surfaces
-    in the benchmark.  A room legitimately can have two walls on the same side
-    (an alcove, an L-shaped room), so repeats are suffixed rather than
-    renamed, longest first so the principal wall keeps the plain name.
+    Args:
+        room: The room whose walls are being named; the room itself
+            isn't changed, only the walls it points to.
+        walls: The full list of walls, used to look up the actual
+            `WallSegment` objects from `room.wall_indices`.
     """
     lookup = {wall.index: wall for wall in walls}
     members = [lookup[i] for i in room.wall_indices if i in lookup]
     used: dict[str, int] = {}
 
     for wall in sorted(members, key=lambda w: -w.length):
-        # Point the normal into the room, then name the wall for the side it
-        # sits on: a wall on the room's north side faces south.
         inward = wall.normal
         if (room.centroid - wall.midpoint) @ inward < 0:
             inward = -inward
@@ -460,14 +709,34 @@ def _name_walls(room: Room, walls: list[WallSegment]) -> None:
 
 
 def _compass(direction: np.ndarray) -> str:
-    """Name a plan-space direction, with plan +y treated as north."""
+    """Turns a flat direction vector into a compass-point name, treating
+    plan-space +y as north.
+
+    Args:
+        direction: A (2,) plan-space direction vector; only its angle
+            matters, not its length.
+
+    Returns:
+        One of the 8 compass points: "north", "northeast", "east",
+        "southeast", "south", "southwest", "west", or "northwest".
+    """
     angle = np.degrees(np.arctan2(direction[0], direction[1])) % 360
     names = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
     return names[int((angle + 22.5) // 45) % 8]
 
 
 def _link_neighbours(rooms: list[Room], labels: np.ndarray, grid: PlanGrid) -> None:
-    """Connect rooms whose free space is separated by a single barrier."""
+    """Works out which rooms are next to each other, by checking whether
+    their floor areas come close together anywhere.
+
+    Args:
+        rooms: The rooms to link; each room's `neighbours` list is reset
+            and then filled back in, in place.
+        labels: The watershed label grid, with rooms encoded as negative
+            numbers (see `segment_rooms`).
+        grid: Not used directly here, but kept as an argument so every
+            helper in this file shares a consistent signature.
+    """
     for room in rooms:
         room.neighbours = []
     for a in rooms:
@@ -480,5 +749,77 @@ def _link_neighbours(rooms: list[Room], labels: np.ndarray, grid: PlanGrid) -> N
 
 
 def _shares_boundary(labels: np.ndarray, a: int, b: int, radius: int = 6) -> bool:
+    """Checks whether two rooms' floor areas come within a few cells of
+    each other -- close enough to count as neighbours.
+
+    Rooms are rarely separated by literally zero gap once walls are
+    drawn in, so this grows room `a`'s area outward by a small margin
+    first and then checks whether that expanded area touches any of room
+    `b`'s cells.
+
+    Args:
+        labels: The watershed label grid, with rooms encoded as negative
+            numbers (see `segment_rooms`).
+        a: The first room's id.
+        b: The second room's id.
+        radius: How many cells to grow room `a`'s area outward by, in
+            every direction, before testing for overlap with room `b`.
+
+    Returns:
+        `True` if the two rooms come within `radius` cells of each
+        other.
+    """
     mask_a = ndimage.binary_dilation(labels == -(a + 1), np.ones((radius, radius)))
     return bool((mask_a & (labels == -(b + 1))).any())
+
+
+def check_no_overlaps(
+    rooms: list[Room], tolerance_fraction: float = 0.01
+) -> list[tuple[int, int, float]]:
+    """Sanity-checks the segmented rooms by looking for pairs whose
+    polygons overlap more than they reasonably should.
+
+    Rooms are supposed to divide up the floor without their outlines
+    overlapping each other, but small geometry errors during
+    segmentation can occasionally produce polygons that overlap
+    slightly. This flags any pair that overlaps by more than a small
+    tolerance, so a caller can decide whether the result is trustworthy
+    enough to use.
+
+    Args:
+        rooms: The rooms to check, each with an optional `polygon`.
+            Rooms without a usable polygon are simply skipped.
+        tolerance_fraction: The largest allowed overlap area, as a
+            fraction of the smaller of the two rooms' own areas, before a
+            pair gets reported as a violation.
+
+    Returns:
+        A list of `(room_id_a, room_id_b, overlap_fraction)` for every
+        pair whose overlap exceeds `tolerance_fraction`. An empty list
+        means every pair of rooms is within tolerance.
+    """
+    from shapely.geometry import Polygon
+
+    polygons: dict[int, Polygon] = {}
+    for room in rooms:
+        if room.polygon is None or len(room.polygon) < 3:
+            continue
+        polygon = Polygon(room.polygon)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.area > 0:
+            polygons[room.id] = polygon
+
+    violations: list[tuple[int, int, float]] = []
+    ids = sorted(polygons)
+    for i, a in enumerate(ids):
+        for b in ids[i + 1 :]:
+            poly_a, poly_b = polygons[a], polygons[b]
+            overlap = poly_a.intersection(poly_b).area
+            if overlap <= 0:
+                continue
+            smaller = min(poly_a.area, poly_b.area)
+            fraction = overlap / smaller if smaller > 0 else 0.0
+            if fraction > tolerance_fraction:
+                violations.append((a, b, float(fraction)))
+    return violations

@@ -5,3 +5,4 @@ __pycache__/
 .env
 *.ply
 cache/
+.DS_Store

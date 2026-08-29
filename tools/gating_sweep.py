@@ -1,14 +1,3 @@
-"""Does tighter depth gating actually buy accuracy?
-
-`depth_bias.py` found two exploitable signatures: ARKit depth reads
-systematically far beyond ~3.5 m, and its high-confidence returns are far
-tighter than its medium ones. Both suggest discarding data to gain accuracy --
-but discarding data also removes support from the plane fits and shrinks
-coverage, so the trade has to be measured rather than assumed.
-
-    python tools/gating_sweep.py ../recordings-1
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -82,7 +71,9 @@ def evaluate(bundle, stride, min_confidence, max_depth):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Does tighter depth gating actually buy accuracy?"
+    )
     parser.add_argument("capture")
     parser.add_argument("--stride", type=int, default=6)
     parser.add_argument("--out", default="out/gating_sweep.json")

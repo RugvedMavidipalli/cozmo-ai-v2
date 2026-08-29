@@ -14,7 +14,7 @@
 # Where a rule is our own simplification rather than a standard's requirement,
 # it says so in `note`. Those are the ones to challenge first.
 
-version: 3
+version: 3   # schema version of this file; bump when a rule's shape (not just its numbers) changes
 
 units:
   length: m
@@ -108,9 +108,9 @@ mold:
     small: 1.0                   # m2 - limited remediation
     medium: 9.3                  # m2 (~100 sq ft) - full containment expected
   containment:
-    trigger_area: 1.0
+    trigger_area: 1.0           # m2 total mold area in a room; below this, no containment item is added at all
     type_by_size: {small: local, medium: full, large: full}
-    negative_air_trigger: 1.0
+    negative_air_trigger: 1.0   # m2 total mold area; at/above this, a HEPA negative-air scrubber item is added too
     source: "IICRC S520 4th ed. §12 - containment scaled to contamination extent; 10 and 100 sq ft thresholds are long-standing industry practice (EPA Mold Remediation in Schools and Commercial Buildings)"
   removal_margin: 0.30           # remove material this far beyond visible growth
   ppe:
@@ -118,7 +118,7 @@ mold:
     medium: half_face_respirator_suit
     large: full_face_PAPR_suit
     source: "IICRC S520 §11 worker protection by remediation scale"
-  hepa_vacuum_passes: 2
+  hepa_vacuum_passes: 2          # HEPA-vacuum quantity = (margin-expanded area) x this many passes
   air_scrubber:
     per_volume: 0.03             # units per m3 of contained space
     minimum: 1
@@ -133,12 +133,12 @@ fire:
     char: remove_and_replace     # substrate itself is burned
     consumed: remove_and_replace
   seal_after_cleaning: true      # seal to lock down odour-bearing residue
-  seal_coverage: 1.0
+  seal_coverage: 1.0             # sealant quantity = region area x this factor (1.0 = full area sealed)
   odour_treatment:
-    trigger_area: 0.5
+    trigger_area: 0.5            # m2 total fire-damaged area in a room; below this, no odour-treatment item is added
     method: thermal_fog_or_hydroxyl
     source: "IICRC S700 - deodorisation follows source removal"
-  cleaning_rate_m2_per_hour: 9.0
+  cleaning_rate_m2_per_hour: 9.0 # NOTE: currently unused -- no code in pipeline/ reads this key
   source: "IICRC S700 Standard for Professional Fire and Smoke Damage Restoration"
 
 # ---------------------------------------------------------------------------

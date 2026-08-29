@@ -1,12 +1,3 @@
-"""Run the report's ablations and print the error budget.
-
-Each ablation toggles exactly one stage and re-measures drift as wall revisit
-spread -- the metric that actually tracks the wall-length gate, unlike point
-scatter which mostly measures sensor noise.
-
-    python tools/ablate.py ../recordings-1 --out out/ablations.json
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -81,7 +72,9 @@ def evaluate(bundle, poses, stride: int, min_confidence: int, label: str) -> dic
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Run the report's ablations and print the error budget."
+    )
     parser.add_argument("capture")
     parser.add_argument("--out", default="out/ablations.json")
     parser.add_argument("--stride", type=int, default=4)
@@ -96,9 +89,6 @@ def main(argv: list[str] | None = None) -> int:
     print("[1/4] raw ARKit poses")
     results.append(evaluate(bundle, bundle.poses, args.stride, 1, "raw ARKit"))
 
-    # Without loop edges the graph holds only ARKit odometry, so it should
-    # reproduce the raw trajectory: that row is the control proving the
-    # optimiser is not moving anything on its own.
     for index, (label, loop) in enumerate(
         (("odometry, no loops", False), ("odometry + loop closure", True)), start=2
     ):

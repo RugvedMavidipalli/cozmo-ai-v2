@@ -1,11 +1,3 @@
-"""Render a result.json floor plan to PNG for quick inspection.
-
-The shipped plan is SVG (pipeline/export.py); this is the raster view used
-while iterating, since it needs no cairo and can be eyeballed directly.
-
-    python tools/view_plan.py out/rec1/result.json
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -130,7 +122,9 @@ def _segment(axes, a, b, colour, width, zorder=1, style="-") -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Render a result.json floor plan to PNG for quick inspection."
+    )
     parser.add_argument("result")
     parser.add_argument("--out")
     args = parser.parse_args(argv)

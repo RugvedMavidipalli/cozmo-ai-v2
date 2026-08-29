@@ -1,14 +1,3 @@
-"""Exercise the scope engine, and show a rule change as a line-item delta.
-
-Track C is testable without a capture: it is a pure function from damage
-regions to line items. This builds representative regions, prints the scope,
-then re-runs with one rule changed and diffs the result — the "change the flood
-cut from 30 cm to 60 cm and show the delta across all rooms" modification.
-
-    python tools/scope_demo.py
-    python tools/scope_demo.py --set water.flood_cut.base_height=0.60
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -167,7 +156,6 @@ def print_delta(before: list, after: list, label: str) -> None:
             f"{total_before:.2f} -> {total_after:.2f} "
             f"({total_after - total_before:+.2f} m2)"
         )
-    # The basis string is what makes the change defensible in review.
     for item in after:
         if item.code == "drywall_remove":
             print(f"\n  basis now reads: {item.basis}")
@@ -211,7 +199,9 @@ def print_sweep(rules: dict, margins=(0.0, 0.15, 0.30, 0.45, 0.60, 0.90, 1.20)) 
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Exercise the scope engine, and show a rule change as a line-item delta."
+    )
     parser.add_argument("--rules", default=str(REPO_ROOT / "rules.yaml"))
     parser.add_argument(
         "--set", dest="override",

@@ -1,5 +1,3 @@
-"""Volumetric fusion of posed depth frames into a mesh and point cloud."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +10,24 @@ from .ingest import CaptureBundle, iter_frames, open3d_intrinsics
 
 @dataclass
 class Reconstruction:
+    """The result of merging a set of depth frames into one combined 3D
+    model.
+
+    This uses a technique called TSDF fusion (short for "truncated signed
+    distance function"), which works by laying an invisible 3D grid over
+    the space and, for every depth frame, updating each grid cell with how
+    far it is from the nearest observed surface and which side of that
+    surface it's on. Averaging this across many frames smooths out the
+    noise that any single depth frame would have on its own, and a normal
+    mesh and point cloud can then be pulled out of the grid afterward.
+
+    Attributes:
+        mesh: A triangle mesh built from the fused volume, with the normal
+            direction at each vertex already worked out.
+        cloud: A point cloud built from the same fused volume.
+        frame_count: How many frames actually got folded into the volume.
+    """
+
     mesh: o3d.geometry.TriangleMesh
     cloud: o3d.geometry.PointCloud
     frame_count: int
@@ -26,10 +42,34 @@ def fuse(
     min_confidence: int = 1,
     max_depth: float = 3.5,
 ) -> Reconstruction:
-    """TSDF-fuse `indices` of `bundle` into a mesh.
+    """Merges a set of a capture's depth frames into one mesh and point
+    cloud, using TSDF fusion.
 
-    `poses` overrides the bundle's poses (indexed the same way), which is how
-    refined trajectories are fed back in without touching the parsed capture.
+    Each frame only shows one view of the room; this combines all of them
+    into a single, cleaned-up 3D reconstruction by integrating them one at
+    a time into a shared voxel grid (see `Reconstruction`'s docstring for
+    more on how that works).
+
+    Args:
+        bundle: The parsed capture to fuse frames from.
+        indices: Which frame indices to fuse; if `None`, every frame in
+            the capture is used.
+        poses: Camera-to-world poses to use instead of `bundle.poses`,
+            indexed the same way as the capture's own poses. This is how a
+            caller plugs in corrected poses from pose refinement instead
+            of the raw, unrefined ones.
+        voxel_size: The edge length of each voxel (3D grid cell) in the
+            fusion volume, in metres. Smaller values give a more detailed
+            result but take longer to run and use more memory.
+        sdf_trunc: How far, in metres, the signed distance function is
+            allowed to range before it gets clamped. Defaults to
+            `voxel_size * 4` if not given.
+        min_confidence: The lowest depth-confidence level to keep.
+        max_depth: The furthest depth value to include, in metres.
+
+    Returns:
+        A `Reconstruction` holding the fused mesh, the fused point cloud,
+        and how many frames actually made it into the volume.
     """
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size,
@@ -43,6 +83,8 @@ def fuse(
     for frame in iter_frames(
         bundle, indices, min_confidence=min_confidence, max_depth=max_depth
     ):
+        # depth_scale=1.0 because `frame.depth` is already stored in
+        # metres, not in raw sensor units that would need converting.
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(np.ascontiguousarray(frame.color)),
             o3d.geometry.Image(frame.depth),
@@ -50,7 +92,8 @@ def fuse(
             depth_trunc=max_depth,
             convert_rgb_to_intensity=False,
         )
-        # Open3D integrates with world-to-camera extrinsics.
+        # TSDF fusion wants the world-to-camera transform for each frame,
+        # which is why the stored camera-to-world pose gets inverted here.
         volume.integrate(rgbd, intrinsics, np.linalg.inv(pose_table[frame.index]))
         count += 1
 
@@ -58,32 +101,3 @@ def fuse(
     mesh.compute_vertex_normals()
     cloud = volume.extract_point_cloud()
     return Reconstruction(mesh=mesh, cloud=cloud, frame_count=count)
-
-
-def backproject(
-    frame,
-    intrinsics: np.ndarray,
-    pose: np.ndarray | None = None,
-    stride: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Back-project a frame's depth to 3D points, plus their pixel colors.
-
-    Returns points in world coordinates when `pose` is given, camera
-    coordinates otherwise.  Invalid (zero) depth is dropped.
-    """
-    depth = frame.depth[::stride, ::stride]
-    color = frame.color[::stride, ::stride]
-    height, width = depth.shape
-
-    us, vs = np.meshgrid(
-        np.arange(width) * stride, np.arange(height) * stride
-    )
-    valid = depth > 0
-    z = depth[valid]
-    x = (us[valid] - intrinsics[0, 2]) * z / intrinsics[0, 0]
-    y = (vs[valid] - intrinsics[1, 2]) * z / intrinsics[1, 1]
-    points = np.stack([x, y, z], axis=1)
-
-    if pose is not None:
-        points = points @ pose[:3, :3].T + pose[:3, 3]
-    return points, color[valid].astype(np.float32) / 255.0

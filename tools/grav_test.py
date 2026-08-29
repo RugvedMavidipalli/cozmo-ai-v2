@@ -10,18 +10,14 @@ with open('../recordings-1/imu.csv') as f:
 ts_imu=np.array(ts_imu); acc=np.array(acc)
 print('imu samples', len(acc), '|a| mean %.3f std %.3f (g units => gravity dominates)' % (np.linalg.norm(acc,1 if False else None,axis=1).mean(), np.linalg.norm(acc,axis=1).std()))
 
-# nearest pose per imu sample
 j = np.clip(np.searchsorted(b.timestamps, ts_imu), 0, len(b)-1)
 R = b.poses[j][:,:3,:3]
-# device-frame accel -> world. Try identity mapping device->camera first.
 world = np.einsum('nij,nj->ni', R, acc)
 g = world.mean(0); g/=np.linalg.norm(g)
 print('mean accel in world (device axes == camera axes):', np.round(g,3))
 print('  consistency: mean |unit dot g| = %.3f (1.0 = perfectly consistent)' %
       np.abs((world/np.linalg.norm(world,axis=1,keepdims=True))@g).mean())
 
-# iPhone device frame vs OpenCV camera frame differ by a rotation; try the 4
-# 90-degree rotations about Z plus the standard portrait mapping.
 cands = {
  'identity': np.eye(3),
  'devY->camY_flip': np.diag([1.,-1,-1]),
