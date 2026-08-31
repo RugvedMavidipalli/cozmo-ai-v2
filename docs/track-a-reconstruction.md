@@ -149,20 +149,18 @@ warning `"confidence intervals are uncalibrated: no ground-truth fit was supplie
 because `bench/calibration.json` has never actually been produced — no ground-truth CSV
 has been filled in and run through `bench/run.py --fit-calibration` yet. `has_depth`
 also multiplies every interval by `no_lidar_multiplier` (3.0 by default) when depth was
-estimated rather than measured — see Known Gaps below for why that path is currently
-unreachable.
+estimated rather than measured. Stage 5 can now consume a precomputed, QC-approved
+dense artifact for this path; model execution remains an explicit offline Stage 4 step.
 
 ## Known gaps and limitations
 
-**No-LiDAR fallback is a hard blocker at ingest, not a soft degradation.** The downstream
-concept exists and is wired (`UncertaintyModel(has_depth=False)`, the `"video_only"`
-modality tag), but `ingest.load_capture()` raises `FileNotFoundError` the instant
-`odometry.csv` or any `depth/*.png` is missing, and `has_depth=True` is hardcoded in the
-only `CaptureBundle` constructor — there is no monocular pose, depth, or metric-scale
-recovery path at all. Camera intrinsics also come from `odometry.csv`, so "no poses" and
-"no intrinsics" are the same missing file, not two separable gaps. This is the highest-risk
-open item for Track A: it's an explicitly scored gate, and a capture with no depth or
-poses is a stated held-out test case.
+**No-LiDAR is an artifact-driven fallback, not an automatic model run.**
+`ingest.load_capture()` and `frame_contract.build_frame_contract()` accept a capture with
+no raw `depth/*.png` when a QC-approved Stage 4 dense directory, calibration, and pose
+table are supplied. A Stray Scanner frame with an unapproved/malformed dense raster falls
+back to its same-index raw LiDAR, while a video-only frame without either source is
+rejected and reported. The Metric3D adapter deliberately requires an explicit local
+checkpoint/repository so CI and production ingestion never download weights implicitly.
 
 **Confidence intervals are structurally correct but never calibrated against real data**
 — every run reports the honest "uncalibrated" warning rather than silently claiming a

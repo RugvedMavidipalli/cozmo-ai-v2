@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -26,7 +27,15 @@ class Metric3Dv2Model:
     keep-ratio-resize -> pad -> normalize -> infer -> un-pad -> upsample ->
     de-canonicalize recipe (see hubconf.py's __main__ block upstream)."""
 
-    def __init__(self, variant: str = "metric3d_vit_small", device: str | None = None):
+    def __init__(
+        self,
+        variant: str = "metric3d_vit_small",
+        device: str | None = None,
+        *,
+        weights_path: str | Path | None = None,
+        repository: str | Path | None = None,
+        model=None,
+    ):
         try:
             import torch
         except ImportError as exc:
@@ -39,7 +48,27 @@ class Metric3Dv2Model:
             "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
         self._input_size = CONVNEXT_INPUT_SIZE if "convnext" in variant else VIT_INPUT_SIZE
-        self._model = torch.hub.load("yvanyin/metric3d", variant, pretrain=True)
+        if model is not None:
+            # Dependency injection is useful for offline tests and for
+            # applications that manage model lifecycles themselves.
+            self._model = model
+        else:
+            if weights_path is None:
+                raise ModelUnavailableError(
+                    "torch is installed but Metric3D v2 weights were not supplied; "
+                    "download weights separately and pass weights_path (no automatic download is performed)"
+                )
+            if repository is None or not Path(repository).is_dir():
+                raise ModelUnavailableError(
+                    "Metric3D repository must be a local checkout when loading offline; "
+                    "automatic torch.hub downloads are disabled"
+                )
+            if not Path(weights_path).is_file():
+                raise ModelUnavailableError(f"Metric3D weights file does not exist: {weights_path}")
+            self._model = torch.hub.load(str(repository), variant, source="local", pretrain=False)
+            checkpoint = torch.load(str(weights_path), map_location="cpu")
+            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            self._model.load_state_dict(state_dict, strict=False)
         self._model = self._model.to(self._device).eval()
 
     def predict(self, rgb: np.ndarray, fx: float) -> np.ndarray:

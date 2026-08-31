@@ -97,6 +97,38 @@ def validate(payload: dict, schema_path: str | Path) -> list[str]:
     ]
 
 
+def export_reconstruction(reconstruction, output_dir: str | Path) -> dict[str, Path]:
+    """Export the extracted TSDF cloud and mesh with their provenance.
+
+    ``cloud.ply`` remains the stable Stage 3 output name.  ``mesh.ply`` is
+    the triangle mesh extracted from the same TSDF volume; older pipeline
+    runs only wrote the cloud even though the mesh was already computed.
+    """
+    import open3d as o3d
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cloud_path = output_dir / "cloud.ply"
+    mesh_path = output_dir / "mesh.ply"
+    if not o3d.io.write_point_cloud(str(cloud_path), reconstruction.cloud):
+        raise OSError(f"could not write fused point cloud {cloud_path}")
+    if not o3d.io.write_triangle_mesh(str(mesh_path), reconstruction.mesh):
+        raise OSError(f"could not write fused mesh {mesh_path}")
+
+    manifest_path = output_dir / "fusion_manifest.json"
+    write_json(
+        {
+            "cloud": cloud_path.name,
+            "mesh": mesh_path.name,
+            "frame_count": reconstruction.frame_count,
+            "frame_indices": list(reconstruction.frame_indices),
+            "contract": reconstruction.contract_report or {},
+        },
+        manifest_path,
+    )
+    return {"cloud": cloud_path, "mesh": mesh_path, "manifest": manifest_path}
+
+
 class _LabelPlacer:
     """Keeps dimension labels on the floor plan from overlapping each other.
 

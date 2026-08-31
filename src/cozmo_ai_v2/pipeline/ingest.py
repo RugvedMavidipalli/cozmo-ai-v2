@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,9 +101,9 @@ class CaptureBundle:
         poses: The camera's position and orientation at each frame, as an
             (N, 4, 4) array of camera-to-world transform matrices, using
             OpenCV's coordinate convention.
-        has_depth: Always `True` for a `CaptureBundle` built by
-            `load_capture`; this field exists so other parts of the code
-            can tell a LiDAR capture apart from a video-only one.
+        has_depth: `True` when raw LiDAR depth is present. It remains
+            `False` for a video-only capture driven by a precomputed dense
+            artifact, so uncertainty reporting can widen its intervals.
         fps: The capture's effective frame rate, in frames per second.
         gravity_up: A unit vector, in world coordinates, pointing away
             from the floor -- the pipeline's best guess at "up" for this
@@ -124,6 +125,13 @@ class CaptureBundle:
     fps: float
     gravity_up: np.ndarray
     gravity_consistency: float
+    # The original RGB calibration is retained alongside the depth-sized
+    # matrix.  Stage 4 produces depth at native RGB resolution, so consumers
+    # must not try to reuse ``intrinsics`` without scaling it back up.
+    rgb_size: tuple[int, int] | None = None
+    rgb_intrinsics: np.ndarray | None = None
+    pose_source: str = "arkit"
+    pose_path: str | None = None
 
     def __len__(self) -> int:
         """How many frames are in this capture."""
@@ -136,6 +144,34 @@ class CaptureBundle:
         if len(self.timestamps) < 2:
             return 0.0
         return float(self.timestamps[-1] - self.timestamps[0])
+
+    def intrinsics_for_size(self, width: int, height: int) -> np.ndarray:
+        """Return pinhole intrinsics scaled to ``(width, height)``.
+
+        ``rgb_intrinsics`` is the source calibration and is measured at
+        ``rgb_size``.  Keeping the scaling here makes the resolution contract
+        explicit for both raw LiDAR and full-resolution dense depth.
+        """
+        if width <= 0 or height <= 0:
+            raise ValueError(f"invalid image size ({width}x{height})")
+
+        if self.rgb_intrinsics is not None and self.rgb_size is not None:
+            source_width, source_height = self.rgb_size
+            base = self.rgb_intrinsics
+        else:
+            source_width, source_height = self.depth_size
+            base = self.intrinsics
+
+        if source_width <= 0 or source_height <= 0:
+            raise ValueError("capture has no valid calibration image size")
+        sx = width / source_width
+        sy = height / source_height
+        scaled = np.asarray(base, dtype=np.float64).copy()
+        scaled[0, 0] *= sx
+        scaled[1, 1] *= sy
+        scaled[0, 2] *= sx
+        scaled[1, 2] *= sy
+        return scaled
 
 
 def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -237,7 +273,13 @@ def _quaternion_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndar
     )
 
 
-def load_capture(root: str | Path) -> CaptureBundle:
+def load_capture(
+    root: str | Path,
+    *,
+    pose_source: str = "auto",
+    slam_poses_path: str | Path | None = None,
+    dense_depth_dir: str | Path | None = None,
+) -> CaptureBundle:
     """Reads a Stray Scanner capture directory from disk and builds a
     `CaptureBundle` describing it.
 
@@ -248,22 +290,42 @@ def load_capture(root: str | Path) -> CaptureBundle:
     actual frame processing starts.
 
     Args:
-        root: The capture directory. It must contain `odometry.csv`, a
-            non-empty `depth/` directory, and `rgb.mp4`. An `imu.csv` file
-            is optional -- without it, the up direction falls back to a
-            default guess.
+        root: The capture directory. A normal Stray Scanner capture contains
+            `odometry.csv`, a non-empty `depth/` directory, and `rgb.mp4`.
+            With `dense_depth_dir`, a precomputed Stage 4 raster may replace
+            the raw depth directory. `pose_source="slam"` selects an offline
+            SLAM pose table and falls back to ARKit when available.
 
     Returns:
-        A populated `CaptureBundle`, always with `has_depth=True` since
-        this function only handles captures that include LiDAR depth
-        data.
+        A populated `CaptureBundle`. `has_depth` indicates whether raw
+        LiDAR is present; a dense-only bundle is marked video-only.
 
     Raises:
-        FileNotFoundError: `root` doesn't contain an `odometry.csv` file,
-            or contains no depth frames.
+        FileNotFoundError: `root` has no usable pose table, calibration,
+            video, or raw/dense depth size.
     """
     root = Path(root)
     odometry_path = root / "odometry.csv"
+    slam_path = _find_slam_poses(root, slam_poses_path)
+    if pose_source not in {"auto", "arkit", "slam"}:
+        raise ValueError(f"pose_source must be 'auto', 'arkit', or 'slam', got {pose_source!r}")
+    selected_pose_source = "arkit"
+    if pose_source == "slam" or (pose_source == "auto" and not odometry_path.exists()):
+        if slam_path is not None:
+            try:
+                return _load_slam_capture(root, slam_path, dense_depth_dir)
+            except (OSError, ValueError) as exc:
+                if not odometry_path.exists():
+                    raise FileNotFoundError(f"could not load SLAM poses from {slam_path}: {exc}") from exc
+                selected_pose_source = "arkit_fallback"
+        if pose_source == "slam":
+            # Explicit SLAM selection may still use ARKit as a documented
+            # fallback when a capture contains it, rather than silently
+            # inventing identity poses.
+            if odometry_path.exists():
+                selected_pose_source = "arkit_fallback"
+            else:
+                raise FileNotFoundError(f"no SLAM pose table found for {root}")
     if not odometry_path.exists():
         raise FileNotFoundError(f"no odometry.csv in {root}; not a Stray capture")
 
@@ -271,22 +333,40 @@ def load_capture(root: str | Path) -> CaptureBundle:
     depth_dir = root / "depth"
     has_depth = depth_dir.is_dir() and any(depth_dir.glob("*.png"))
     if not has_depth:
-        raise FileNotFoundError(
-            f"no depth frames in {depth_dir}; use the no-LiDAR path instead"
-        )
-
-    # Peek at one depth PNG just to learn its resolution -- the depth
-    # images are usually a lower resolution than the color video.
-    probe = cv2.imread(str(sorted(depth_dir.glob("*.png"))[0]), cv2.IMREAD_UNCHANGED)
-    depth_height, depth_width = probe.shape[:2]
+        dense_dir = Path(dense_depth_dir) if dense_depth_dir is not None else root / "dense_depth"
+        if dense_dir is not None and dense_dir.is_dir() and not any(dense_dir.glob("*.png")) and (dense_dir / "dense_depth").is_dir():
+            dense_dir = dense_dir / "dense_depth"
+        dense_size = _dense_probe(dense_dir) if dense_dir is not None and dense_dir.is_dir() else None
+        if dense_size is None:
+            raise FileNotFoundError(
+                f"no depth frames in {depth_dir}; use the no-LiDAR path instead"
+            )
+        # A precomputed, QC-gated Stage 4 artifact is enough to ingest a
+        # capture with no raw sensor raster.  ``has_depth`` remains false so
+        # uncertainty reporting still identifies this as video-only.
+        depth_height, depth_width = dense_size[1], dense_size[0]
+    else:
+        # Peek at one depth PNG just to learn its resolution -- the depth
+        # images are usually a lower resolution than the color video.
+        probe = cv2.imread(str(sorted(depth_dir.glob("*.png"))[0]), cv2.IMREAD_UNCHANGED)
+        depth_height, depth_width = probe.shape[:2]
 
     # The per-frame intrinsics from odometry.csv are given at the color
     # video's native resolution, so they need to be rescaled to match the
     # depth image's (usually smaller) resolution.
-    rgb_width = _video_width(root / "rgb.mp4")
-    scale = depth_width / rgb_width
-    fx, fy, cx, cy = np.median(rgb_intrinsics, axis=0) * scale
-    intrinsics = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    rgb_width, rgb_height = _video_size(root / "rgb.mp4")
+    rgb_fx, rgb_fy, rgb_cx, rgb_cy = np.median(rgb_intrinsics, axis=0)
+    rgb_matrix = np.array(
+        [[rgb_fx, 0.0, rgb_cx], [0.0, rgb_fy, rgb_cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    scale_x = depth_width / rgb_width
+    scale_y = depth_height / rgb_height
+    depth_matrix = rgb_matrix.copy()
+    depth_matrix[0, 0] *= scale_x
+    depth_matrix[1, 1] *= scale_y
+    depth_matrix[0, 2] *= scale_x
+    depth_matrix[1, 2] *= scale_y
 
     # Fall back to a reasonable default frame rate when there's only one
     # timestamp to work with, since there's no time span to divide by.
@@ -296,14 +376,223 @@ def load_capture(root: str | Path) -> CaptureBundle:
     return CaptureBundle(
         root=root,
         name=root.name,
-        intrinsics=intrinsics,
+        intrinsics=depth_matrix,
         depth_size=(depth_width, depth_height),
         timestamps=timestamps,
         poses=poses,
-        has_depth=True,
+        has_depth=has_depth,
         fps=float(fps),
         gravity_up=gravity_up,
         gravity_consistency=consistency,
+        rgb_size=(int(rgb_width), int(rgb_height)),
+        rgb_intrinsics=rgb_matrix,
+        pose_source=selected_pose_source,
+        pose_path=str(odometry_path),
+    )
+
+
+def _find_slam_poses(root: Path, explicit: str | Path | None) -> Path | None:
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.exists():
+            raise FileNotFoundError(f"SLAM pose table does not exist: {path}")
+        return path
+    for candidate in (
+        root / "slam_poses.csv",
+        root / "slam_poses.json",
+        root / "slam_poses.npy",
+        root / "slam_poses.npz",
+        root / "poses.csv",
+        root / "poses.json",
+        root / "poses.npy",
+        root / "poses.npz",
+        root / "slam" / "poses.csv",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _read_slam_poses(path: Path, fps: float) -> tuple[np.ndarray, np.ndarray]:
+    """Read common offline SLAM pose exports as camera-to-world matrices."""
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        poses = np.asarray(np.load(path, allow_pickle=False), dtype=np.float64)
+        timestamps = np.arange(len(poses), dtype=np.float64) / fps
+    elif suffix == ".npz":
+        with np.load(path, allow_pickle=False) as archive:
+            key = next((key for key in ("poses", "pose", "trajectory") if key in archive), None)
+            if key is None:
+                raise ValueError(f"{path} has no poses/trajectory array")
+            poses = np.asarray(archive[key], dtype=np.float64)
+            time_key = next((key for key in ("timestamps", "times", "timestamp") if key in archive), None)
+            timestamps = (
+                np.asarray(archive[time_key], dtype=np.float64)
+                if time_key is not None
+                else np.arange(len(poses), dtype=np.float64) / fps
+            )
+    elif suffix == ".json":
+        payload = json.loads(path.read_text())
+        if isinstance(payload, dict):
+            raw_poses = payload.get("poses", payload.get("trajectory"))
+            raw_times = payload.get("timestamps", payload.get("times"))
+        else:
+            raw_poses, raw_times = payload, None
+        if raw_poses is None:
+            raise ValueError(f"{path} has no poses/trajectory field")
+        poses = np.asarray(raw_poses, dtype=np.float64)
+        timestamps = (
+            np.asarray(raw_times, dtype=np.float64)
+            if raw_times is not None
+            else np.arange(len(poses), dtype=np.float64) / fps
+        )
+    else:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = [{str(k).strip().lower(): value.strip() for k, value in row.items() if k} for row in reader]
+        if not rows:
+            raise ValueError(f"SLAM pose table is empty: {path}")
+        index_key = next((key for key in ("index", "frame", "frame_index", "frame_id") if key in rows[0]), None)
+        if index_key is not None:
+            try:
+                rows.sort(key=lambda row: int(row[index_key]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"SLAM frame indices are not integers in {path}") from exc
+        poses_list: list[np.ndarray] = []
+        timestamps_list: list[float] = []
+        for position, row in enumerate(rows):
+            poses_list.append(_pose_from_mapping(row, path))
+            timestamp_value = row.get("timestamp", row.get("time", row.get("t")))
+            timestamps_list.append(float(timestamp_value) if timestamp_value else position / fps)
+        poses = np.asarray(poses_list, dtype=np.float64)
+        timestamps = np.asarray(timestamps_list, dtype=np.float64)
+
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError(f"SLAM poses must have shape (N, 4, 4), got {poses.shape}")
+    if len(poses) == 0 or len(timestamps) != len(poses):
+        raise ValueError(f"SLAM pose/timestamp count mismatch in {path}")
+    if not np.isfinite(poses).all() or not np.isfinite(timestamps).all():
+        raise ValueError(f"SLAM pose table contains non-finite values: {path}")
+    return timestamps, poses
+
+
+def _pose_from_mapping(row: dict[str, str], path: Path) -> np.ndarray:
+    def value(*names: str) -> float | None:
+        for name in names:
+            raw = row.get(name)
+            if raw not in (None, ""):
+                return float(raw)
+        return None
+
+    matrix = np.eye(4, dtype=np.float64)
+    matrix_names = [f"m{r}{c}" for r in range(4) for c in range(4)]
+    if all(name in row and row[name] != "" for name in matrix_names):
+        return np.asarray([float(row[name]) for name in matrix_names], dtype=np.float64).reshape(4, 4)
+    translation = [value(axis, f"t{axis}") for axis in ("x", "y", "z")]
+    quaternion = [value(f"q{axis}") for axis in ("x", "y", "z")] + [value("qw", "w")]
+    if any(item is None for item in translation + quaternion):
+        raise ValueError(f"SLAM row in {path} has neither a 4x4 matrix nor x/y/z/qx/qy/qz/qw fields")
+    matrix[:3, :3] = _quaternion_to_matrix(*[float(item) for item in quaternion])
+    matrix[:3, 3] = np.asarray([float(item) for item in translation])
+    return matrix
+
+
+def _dense_probe(path: Path) -> tuple[int, int] | None:
+    candidates = (
+        sorted(path.glob("*.png"))
+        + sorted(path.glob("*.npy"))
+        + sorted(path.glob("*.npz"))
+    )
+    if not candidates:
+        return None
+    candidate = candidates[0]
+    if candidate.suffix.lower() == ".npy":
+        shape = np.load(candidate, mmap_mode="r", allow_pickle=False).shape
+    elif candidate.suffix.lower() == ".npz":
+        with np.load(candidate, allow_pickle=False) as archive:
+            shape = archive[archive.files[0]].shape if archive.files else ()
+    else:
+        raster = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
+        shape = raster.shape if raster is not None else ()
+    if len(shape) != 2:
+        raise ValueError(f"dense depth probe must be a single-channel raster: {candidate}")
+    return int(shape[1]), int(shape[0])
+
+
+def _read_intrinsics_sidecar(root: Path, rgb_size: tuple[int, int], pose_path: Path) -> np.ndarray:
+    """Read calibration for a video/SLAM capture without ARKit odometry."""
+    candidates = [root / "camera_matrix.csv", root / "intrinsics.yaml", root / "intrinsics.json"]
+    candidates.extend([pose_path.parent / "intrinsics.yaml", pose_path.parent / "intrinsics.json"])
+    for path in candidates:
+        if not path.exists():
+            continue
+        if path.suffix.lower() == ".csv":
+            matrix = np.loadtxt(path, delimiter=",")
+            if matrix.shape != (3, 3):
+                raise ValueError(f"expected a 3x3 matrix in {path}, got {matrix.shape}")
+            return np.asarray(matrix, dtype=np.float64)
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text())
+        else:
+            import yaml
+            payload = yaml.safe_load(path.read_text())
+        calibration = payload.get("calibration") if isinstance(payload, dict) else None
+        if calibration is not None and len(calibration) == 4:
+            fx, fy, cx, cy = (float(value) for value in calibration)
+            source_width = int(payload.get("width", rgb_size[0]))
+            source_height = int(payload.get("height", rgb_size[1]))
+            matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+            matrix[0, [0, 2]] *= rgb_size[0] / source_width
+            matrix[1, [1, 2]] *= rgb_size[1] / source_height
+            return matrix
+    raise FileNotFoundError(
+        f"no camera calibration found for SLAM capture {root}; expected camera_matrix.csv or intrinsics.yaml"
+    )
+
+
+def _load_slam_capture(
+    root: Path,
+    pose_path: Path,
+    dense_depth_dir: str | Path | None,
+) -> CaptureBundle:
+    rgb_width, rgb_height = _video_size(root / "rgb.mp4")
+    fps = 30.0
+    capture = cv2.VideoCapture(str(root / "rgb.mp4"))
+    if capture.isOpened() and capture.get(cv2.CAP_PROP_FPS) > 0:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+    capture.release()
+    timestamps, poses = _read_slam_poses(pose_path, fps)
+    rgb_matrix = _read_intrinsics_sidecar(root, (int(rgb_width), int(rgb_height)), pose_path)
+
+    raw_depth_dir = root / "depth"
+    raw_depth = _dense_probe(raw_depth_dir) if raw_depth_dir.is_dir() else None
+    dense_dir = Path(dense_depth_dir) if dense_depth_dir is not None else root / "dense_depth"
+    if dense_dir.is_dir() and not any(dense_dir.glob("*.png")) and (dense_dir / "dense_depth").is_dir():
+        dense_dir = dense_dir / "dense_depth"
+    dense_depth = _dense_probe(dense_dir) if dense_dir.is_dir() else None
+    depth_size = raw_depth or dense_depth or (int(rgb_width), int(rgb_height))
+    depth_matrix = rgb_matrix.copy()
+    depth_matrix[0, [0, 2]] *= depth_size[0] / rgb_width
+    depth_matrix[1, [1, 2]] *= depth_size[1] / rgb_height
+
+    gravity_up, consistency = _imu_gravity(root / "imu.csv", timestamps, poses) if (root / "imu.csv").exists() else (
+        np.array([0.0, 1.0, 0.0]), 0.0
+    )
+    return CaptureBundle(
+        root=root,
+        name=root.name,
+        intrinsics=depth_matrix,
+        depth_size=depth_size,
+        timestamps=timestamps,
+        poses=poses,
+        has_depth=raw_depth is not None,
+        fps=fps,
+        gravity_up=gravity_up,
+        gravity_consistency=consistency,
+        rgb_size=(int(rgb_width), int(rgb_height)),
+        rgb_intrinsics=rgb_matrix,
+        pose_source="slam",
+        pose_path=str(pose_path),
     )
 
 
@@ -372,7 +661,7 @@ def _imu_gravity(
     return up, float(np.abs(unit @ up).mean())
 
 
-def _video_width(path: Path) -> float:
+def _video_size(path: Path) -> tuple[float, float]:
     """Opens a video file just long enough to read off its native frame
     width, in pixels.
 
@@ -380,7 +669,7 @@ def _video_width(path: Path) -> float:
         path: Path to a video file (normally `rgb.mp4`).
 
     Returns:
-        The video's frame width, in pixels.
+        The video's `(width, height)`, in pixels.
 
     Raises:
         FileNotFoundError: `path` couldn't be opened as a video.
@@ -389,8 +678,16 @@ def _video_width(path: Path) -> float:
     if not capture.isOpened():
         raise FileNotFoundError(f"cannot open {path}")
     width = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
     capture.release()
-    return width
+    if width <= 0 or height <= 0:
+        raise FileNotFoundError(f"video {path} reports invalid dimensions")
+    return width, height
+
+
+def _video_width(path: Path) -> float:
+    """Backward-compatible width-only wrapper used by older callers."""
+    return _video_size(path)[0]
 
 
 def iter_raw_frames(

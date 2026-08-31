@@ -102,6 +102,7 @@ def _sample_provenance(
     stride: int,
     min_confidence: int,
     max_depth: float,
+    frame_contract=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Turns a set of frames' depth images into 3D world points, while
     also remembering where the camera was and when each point was seen.
@@ -139,14 +140,16 @@ def _sample_provenance(
         come back empty if no frame contributed any valid depth.
     """
     pose_table = bundle.poses if poses is None else poses
-    intrinsics = bundle.intrinsics
     point_chunks: list[np.ndarray] = []
     origin_chunks: list[np.ndarray] = []
     time_chunks: list[np.ndarray] = []
 
-    for frame in iter_frames(
-        bundle, indices, min_confidence=min_confidence, max_depth=max_depth
-    ):
+    frames = (
+        frame_contract.iter_frames(indices)
+        if frame_contract is not None
+        else iter_frames(bundle, indices, min_confidence=min_confidence, max_depth=max_depth)
+    )
+    for frame in frames:
         depth = frame.depth[::stride, ::stride]
         valid = depth > 0
         if not valid.any():
@@ -156,6 +159,7 @@ def _sample_provenance(
         # Turn each valid depth pixel into a 3D point in the camera's own
         # coordinates, using the focal length and centre pixel from the
         # intrinsics matrix.
+        intrinsics = frame.intrinsics if frame_contract is not None else bundle.intrinsics
         camera_points = np.stack(
             [
                 (us * stride - intrinsics[0, 2]) * z / intrinsics[0, 0],
@@ -164,7 +168,7 @@ def _sample_provenance(
             ],
             axis=1,
         )
-        pose = pose_table[frame.index]
+        pose = frame.pose if frame_contract is not None else pose_table[frame.index]
         world = camera_points @ pose[:3, :3].T + pose[:3, 3]
         point_chunks.append(world)
         origin_chunks.append(np.broadcast_to(pose[:3, 3], world.shape))
@@ -186,6 +190,7 @@ def sample_world_points(
     stride: int = 3,
     min_confidence: int = 1,
     max_depth: float = 5.0,
+    frame_contract=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Samples a set of frames into 3D world points, plus the timestamp
     each point was observed at.
@@ -205,7 +210,7 @@ def sample_world_points(
         and an (N,) array of their capture timestamps.
     """
     points, _origins, times = _sample_provenance(
-        bundle, indices, poses, stride, min_confidence, max_depth
+        bundle, indices, poses, stride, min_confidence, max_depth, frame_contract
     )
     return points, times
 
@@ -217,6 +222,7 @@ def sample_world_points_with_origin(
     stride: int = 3,
     min_confidence: int = 1,
     max_depth: float = 5.0,
+    frame_contract=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The same sampling as `sample_world_points`, but also keeps track
     of the camera position each point was seen from.
@@ -240,7 +246,7 @@ def sample_world_points_with_origin(
         `_sample_provenance`.
     """
     return _sample_provenance(
-        bundle, indices, poses, stride, min_confidence, max_depth
+        bundle, indices, poses, stride, min_confidence, max_depth, frame_contract
     )
 
 

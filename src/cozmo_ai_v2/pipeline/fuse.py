@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 import open3d as o3d
 
-from .ingest import CaptureBundle, iter_frames, open3d_intrinsics
+from .frame_contract import FrameContract, build_frame_contract
+from .ingest import CaptureBundle
 
 
 @dataclass
@@ -31,6 +32,8 @@ class Reconstruction:
     mesh: o3d.geometry.TriangleMesh
     cloud: o3d.geometry.PointCloud
     frame_count: int
+    frame_indices: tuple[int, ...] = ()
+    contract_report: dict | None = None
 
 
 def fuse(
@@ -41,6 +44,10 @@ def fuse(
     sdf_trunc: float | None = None,
     min_confidence: int = 1,
     max_depth: float = 3.5,
+    frame_contract: FrameContract | None = None,
+    dense_depth_dir: str | None = None,
+    densify_manifest: str | None = None,
+    pose_source: str | None = None,
 ) -> Reconstruction:
     """Merges a set of a capture's depth frames into one mesh and point
     cloud, using TSDF fusion.
@@ -71,33 +78,59 @@ def fuse(
         A `Reconstruction` holding the fused mesh, the fused point cloud,
         and how many frames actually made it into the volume.
     """
+    if frame_contract is None:
+        frame_contract = build_frame_contract(
+            bundle,
+            indices=indices,
+            poses=poses,
+            pose_source=pose_source,
+            dense_depth_dir=dense_depth_dir,
+            densify_manifest=densify_manifest,
+            min_confidence=min_confidence,
+            max_depth=max_depth,
+        )
+
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size,
         sdf_trunc=sdf_trunc if sdf_trunc is not None else voxel_size * 4,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
-    intrinsics = open3d_intrinsics(bundle)
-    pose_table = bundle.poses if poses is None else poses
-
     count = 0
-    for frame in iter_frames(
-        bundle, indices, min_confidence=min_confidence, max_depth=max_depth
-    ):
+    integrated_indices: list[int] = []
+    resolutions: set[tuple[int, int]] = set()
+    for frame in frame_contract.iter_frames(indices):
+        resolutions.add((int(frame.depth.shape[1]), int(frame.depth.shape[0])))
+        intrinsics = o3d.camera.PinholeCameraIntrinsic(
+            frame.depth.shape[1], frame.depth.shape[0],
+            frame.intrinsics[0, 0], frame.intrinsics[1, 1],
+            frame.intrinsics[0, 2], frame.intrinsics[1, 2],
+        )
         # depth_scale=1.0 because `frame.depth` is already stored in
         # metres, not in raw sensor units that would need converting.
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(np.ascontiguousarray(frame.color)),
-            o3d.geometry.Image(frame.depth),
+            o3d.geometry.Image(np.ascontiguousarray(frame.depth)),
             depth_scale=1.0,
             depth_trunc=max_depth,
             convert_rgb_to_intensity=False,
         )
         # TSDF fusion wants the world-to-camera transform for each frame,
         # which is why the stored camera-to-world pose gets inverted here.
-        volume.integrate(rgbd, intrinsics, np.linalg.inv(pose_table[frame.index]))
+        volume.integrate(rgbd, intrinsics, np.linalg.inv(frame.pose))
         count += 1
+        integrated_indices.append(frame.index)
+        frame_contract.integrated_indices.add(frame.index)
 
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
     cloud = volume.extract_point_cloud()
-    return Reconstruction(mesh=mesh, cloud=cloud, frame_count=count)
+    report = frame_contract.report()
+    report["frame_count"] = count
+    report["resolutions"] = [list(size) for size in sorted(resolutions)]
+    return Reconstruction(
+        mesh=mesh,
+        cloud=cloud,
+        frame_count=count,
+        frame_indices=tuple(integrated_indices),
+        contract_report=report,
+    )

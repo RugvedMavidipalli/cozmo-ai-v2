@@ -40,6 +40,8 @@ out/<capture>/
   scene.glb                    # 3D reconstruction — every wall, plus each room's floor
                                 # and ceiling, as individually named, selectable planes
   cloud.ply                    # fused point cloud
+  mesh.ply                     # triangle mesh extracted from the same TSDF volume
+  fusion_manifest.json         # depth/pose provenance and frame fallback decisions
   scope_sketch.csv             # room/wall geometry table (Xactimate-sketch-style export)
   scope_line_items.csv         # scope-of-work line items (action/material/qty/rule/source)
   damage_overlays/             # per-frame detection box + mask + label, full video
@@ -62,13 +64,17 @@ out/<capture>/
 | `--model` | `claude-opus-5` | VLM model for damage detection |
 | `--stride N` | `4` | Frame stride for the main fusion pass. Lower is slower and denser |
 | `--voxel` | `0.02` | TSDF voxel size, metres |
+| `--dense-depth-dir` | auto | QC-approved Stage 4 `dense_depth/` directory; raw LiDAR is used per frame when dense data is unavailable |
+| `--densify-manifest` | auto | Stage 4 manifest carrying the QC approval and mask paths |
+| `--pose-source` | `auto` | ARKit for Stray Scanner captures, SLAM for video captures, with explicit fallback metadata |
+| `--slam-poses` | — | Offline SLAM pose table (`CSV`, `JSON`, `NPY`, or `NPZ`) |
 | `--max-depth` | `3.5` | Depth cutoff — the knee where ARKit depth starts reading systematically far |
 | `--min-confidence 0\|1\|2` | `1` | ARKit depth-confidence floor. The glass/mirror ablation |
 | `--damage-frames N` | `40` | Max keyframes sent to the VLM for damage detection |
 | `--min-views N` | `2` | Independent views required to accept a damage region |
 | `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |
 | `--coverage` | `0.90` | Target confidence-interval coverage |
-| `--no-refine` | off | Use raw ARKit poses. The pose-refinement ablation |
+| `--no-refine` | off | Use raw selected SLAM/ARKit poses. The pose-refinement ablation |
 | `--no-loop-closure` | off | Refine sequentially only, without loop edges |
 | `--no-damage` | off | Geometry only; skips all API calls |
 | `--no-sam` | off | Local GrabCut masks instead of hosted SAM 2 |
@@ -257,6 +263,11 @@ docs/            design rationale, algorithm derivations, and a gap analysis
   confidence, but is noisy.
 - Water Class (1–4) is rarely inferable from imagery alone and is usually
   returned null rather than guessed.
-- The no-LiDAR fallback path is not yet wired into the CLI.
+- Stage 4 dense depth is consumed only when its manifest entry is
+  `qc_approved`; missing or rejected entries fall back to same-index raw
+  LiDAR and are recorded in `fusion_manifest.json` and `result.json`.
+- The Metric3D adapter is offline by default: supply a local checkpoint and
+  local repository explicitly to run densification. It never downloads model
+  weights implicitly.
 - Damage output requires `ANTHROPIC_API_KEY`; without it the geometry tracks
   run and the scope comes out empty.

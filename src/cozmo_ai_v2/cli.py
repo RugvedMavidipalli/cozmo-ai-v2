@@ -61,6 +61,9 @@ def run_densify(
     max_depth: float,
     guide_radius: int,
     guide_eps: float,
+    weights_path: Path | None = None,
+    repository: Path | None = None,
+    device: str | None = None,
 ) -> int:
     try:
         capture = require_lidar_capture(input_path)
@@ -69,7 +72,10 @@ def run_densify(
         return 1
 
     try:
-        model = Metric3Dv2Model(variant=variant)
+        model = Metric3Dv2Model(
+            variant=variant, weights_path=weights_path,
+            repository=repository, device=device,
+        )
     except ModelUnavailableError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -108,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     densify.add_argument("--max-depth", type=float, default=8.0, help="Maximum LiDAR depth (meters) to trust")
     densify.add_argument("--guide-radius", type=int, default=20, help="Guided filter window radius (pixels) for local residual fusion")
     densify.add_argument("--guide-eps", type=float, default=100.0, help="Guided filter regularization epsilon")
+    densify.add_argument(
+        "--weights", type=Path, default=None,
+        help="local Metric3D v2 checkpoint; no weights are downloaded automatically",
+    )
+    densify.add_argument(
+        "--metric3d-repository", type=Path, default=None,
+        help="local Metric3D checkout used to construct the model architecture",
+    )
+    densify.add_argument("--device", default=None, help="inference device (cpu/cuda/mps)")
 
     return parser
 
@@ -121,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_densify(
             args.input, args.output_dir, args.variant,
             args.min_confidence, args.max_depth, args.guide_radius, args.guide_eps,
+            args.weights, args.metric3d_repository, args.device,
         )
     parser.error(f"unknown command: {args.command}")
     return 2

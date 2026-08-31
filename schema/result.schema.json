@@ -83,6 +83,27 @@
             "coverage_target": { "type": "number" }
           }
         },
+        "fusion": {
+          "type": "object",
+          "description": "Stage 4-to-5 depth/pose contract and deterministic frame decisions.",
+          "properties": {
+            "depth_sources": { "type": "array", "items": { "type": "string" } },
+            "dense_depth_dir": { "type": ["string", "null"] },
+            "densify_manifest": { "type": ["string", "null"] },
+            "pose_source": { "type": "string" },
+            "pose_path": { "type": ["string", "null"] },
+            "requested_indices": { "type": "array", "items": { "type": "integer" } },
+            "integrated_indices": { "type": "array", "items": { "type": "integer" } },
+            "frame_provenance": { "type": "array", "items": { "$ref": "#/$defs/frame_provenance" } },
+            "rejected_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
+            "fallback_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
+            "frame_count": { "type": "integer", "minimum": 0 },
+            "resolutions": {
+              "type": "array",
+              "items": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+            }
+          }
+        },
         "warnings": { "type": "array", "items": { "type": "string" } }
       }
     }
@@ -93,6 +114,32 @@
       "items": { "type": "number" },
       "minItems": 3,
       "maxItems": 3
+    },
+    "frame_decision": {
+      "type": "object",
+      "required": ["index", "reason", "attempted_depth_source"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" },
+        "attempted_depth_source": { "type": "string" }
+      }
+    },
+    "frame_provenance": {
+      "type": "object",
+      "required": [
+        "index", "depth_source", "confidence_source", "qc_source", "pose_source"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "depth_source": { "type": "string" },
+        "depth_path": { "type": ["string", "null"] },
+        "confidence_source": { "type": "string" },
+        "confidence_path": { "type": ["string", "null"] },
+        "qc_source": { "type": "string" },
+        "qc_path": { "type": ["string", "null"] },
+        "pose_source": { "type": "string" },
+        "pose_path": { "type": ["string", "null"] }
+      }
     },
     "point2": {
       "type": "array",

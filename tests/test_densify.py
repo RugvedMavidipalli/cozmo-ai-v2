@@ -50,12 +50,18 @@ def test_densify_capture_end_to_end(lidar_stray_scanner_dataset, tmp_path):
     assert len(manifest["frames"]) == 2
     for report in manifest["frames"]:
         assert report["scale"] > 0
+        assert report["qc_approved"] is True
+        assert report["depth_path"].startswith("dense_depth/")
+        assert report["confidence_path"].startswith("dense_confidence/")
+        assert report["qc_mask_path"].startswith("dense_qc/")
 
     for index, true_depth in enumerate(true_depths):
         dense_png = cv2.imread(str(output_dir / "dense_depth" / f"{index:06d}.png"), cv2.IMREAD_UNCHANGED)
         assert dense_png.shape == (VIDEO_HEIGHT, VIDEO_WIDTH)
         dense_m = dense_png.astype(np.float32) / 1000.0
         assert np.abs(dense_m - true_depth).mean() < 0.05
+        assert (output_dir / "dense_confidence" / f"{index:06d}.png").exists()
+        assert (output_dir / "dense_qc" / f"{index:06d}.png").exists()
 
 
 def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path, capsys):

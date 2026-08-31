@@ -14,6 +14,7 @@ from .damage import fusion as damage_fusion
 from .damage.masks import refine
 from .damage.vlm import FURNITURE_CLASS, DamageAnalyzer
 from .drift import measure_drift, refit_wall_offsets, sample_world_points_with_origin
+from .frame_contract import build_frame_contract
 from .fuse import fuse
 from .geometry import estimate_gravity
 from .ingest import display_rotation, load_capture, iter_frames
@@ -108,8 +109,17 @@ def run(args: argparse.Namespace) -> int:
 
     # Stage 1: ingest
     print(f"Capture: {args.capture}")
+    dense_depth_dir = getattr(args, "dense_depth_dir", None)
+    densify_manifest = getattr(args, "densify_manifest", None)
+    if dense_depth_dir is None and densify_manifest is not None:
+        dense_depth_dir = Path(densify_manifest).parent / "dense_depth"
     with timings.stage("ingest"):
-        bundle = load_capture(args.capture)
+        bundle = load_capture(
+            args.capture,
+            pose_source=getattr(args, "pose_source", "auto"),
+            slam_poses_path=getattr(args, "slam_poses", None),
+            dense_depth_dir=dense_depth_dir,
+        )
     print(
         f"  {len(bundle)} frames, {bundle.duration:.0f}s, "
         f"gravity consistency {bundle.gravity_consistency:.3f}"
@@ -123,7 +133,7 @@ def run(args: argparse.Namespace) -> int:
     # Stage 2: pose refinement
     poses = bundle.poses
     drift_report = None
-    if not args.no_refine:
+    if not args.no_refine and bundle.has_depth:
         with timings.stage("pose refinement"):
             keyframes = select_keyframes(bundle)
             poses, drift_report = refine_trajectory(
@@ -133,20 +143,52 @@ def run(args: argparse.Namespace) -> int:
             f"  {drift_report.keyframe_count} keyframes, "
             f"{drift_report.loop_edges}/{drift_report.loop_candidates} loop edges"
         )
+    elif not args.no_refine:
+        warnings.append(
+            "pose refinement skipped: no raw LiDAR depth is available; "
+            "using the selected SLAM/ARKit pose table"
+        )
 
-    # Stage 3: fusion
+    # Stage 3: fusion.  The contract is the single source of truth for
+    # depth resolution, QC masks, provenance, and the pose table used by
+    # both TSDF integration and the later provenance-aware sampling pass.
+    pose_provenance = (
+        f"refined_{bundle.pose_source}" if not args.no_refine else bundle.pose_source
+    )
+    with timings.stage("frame contract"):
+        frame_contract = build_frame_contract(
+            bundle,
+            indices=np.arange(0, len(bundle), args.stride),
+            poses=poses,
+            pose_source=pose_provenance,
+            dense_depth_dir=dense_depth_dir,
+            densify_manifest=densify_manifest,
+            min_confidence=args.min_confidence,
+            max_depth=args.max_depth,
+        )
+
     with timings.stage("fusion"):
         indices = np.arange(0, len(bundle), args.stride)
         reconstruction = fuse(
             bundle, indices, poses=poses, voxel_size=args.voxel,
             min_confidence=args.min_confidence, max_depth=args.max_depth,
+            frame_contract=frame_contract,
         )
     cloud = reconstruction.cloud
     import open3d as o3d
 
-    cloud.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=0.12, max_nn=30)
-    )
+    contract_report = reconstruction.contract_report or {}
+    rejected_count = len(contract_report.get("rejected_frames", []))
+    fallback_count = len(contract_report.get("fallback_frames", []))
+    if rejected_count:
+        warnings.append(f"{rejected_count} requested frame(s) rejected by the depth/pose contract")
+    if fallback_count:
+        print(f"  {fallback_count} frame(s) used raw LiDAR fallback after dense-depth QC")
+
+    if len(cloud.points):
+        cloud.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=0.12, max_nn=30)
+        )
     points = np.asarray(cloud.points)
     normals = np.asarray(cloud.normals)
     print(f"  {len(points)} points")
@@ -155,7 +197,7 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("sampling"):
         sampled, origins, times = sample_world_points_with_origin(
             bundle, np.arange(0, len(bundle), max(args.stride, 3)), poses=poses,
-            max_depth=args.max_depth,
+            max_depth=args.max_depth, frame_contract=frame_contract,
         )
 
     # Stage 5: geometry
@@ -279,7 +321,7 @@ def run(args: argparse.Namespace) -> int:
         result = _assemble(
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
             line_items, drift, drift_report, surface_grids, uncertainty,
-            timings, warnings, engine,
+            timings, warnings, engine, reconstruction.contract_report,
         )
         export.write_json(result, out_dir / "result.json")
         problems = export.validate(result, REPO_ROOT / "schema" / "result.schema.json")
@@ -295,7 +337,7 @@ def run(args: argparse.Namespace) -> int:
             rooms=result["rooms"],
         )
         export.export_scope_csv(result, out_dir)
-        o3d.io.write_point_cloud(str(out_dir / "cloud.ply"), cloud)
+        export.export_reconstruction(reconstruction, out_dir)
 
     result["diagnostics"]["timings_s"]["total"] = round(time.time() - total_start, 2)
     export.write_json(result, out_dir / "result.json")
@@ -570,7 +612,7 @@ def _infer_adjacency_via(
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
-    timings, warnings, engine,
+    timings, warnings, engine, fusion_report=None,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -778,6 +820,7 @@ def _assemble(
                 "scale": uncertainty.scale,
                 "coverage_target": uncertainty.coverage,
             },
+            "fusion": fusion_report or {},
             "warnings": warnings,
         },
     }
@@ -817,6 +860,23 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--voxel", type=float, default=0.02)
     runner.add_argument("--max-depth", type=float, default=3.5)
     runner.add_argument("--min-confidence", type=int, default=1)
+    runner.add_argument(
+        "--dense-depth-dir", type=Path, default=None,
+        help="Stage 4 dense_depth directory (must have a QC-approved manifest); "
+             "defaults to <capture>/dense_depth when present",
+    )
+    runner.add_argument(
+        "--densify-manifest", type=Path, default=None,
+        help="Stage 4 densify_manifest.json; defaults beside --dense-depth-dir",
+    )
+    runner.add_argument(
+        "--pose-source", choices=("auto", "arkit", "slam"), default="auto",
+        help="select ARKit odometry for LiDAR captures or SLAM poses for video inputs",
+    )
+    runner.add_argument(
+        "--slam-poses", type=Path, default=None,
+        help="SLAM pose table (CSV/NPY/NPZ/JSON) for a video input",
+    )
     runner.add_argument("--damage-frames", type=int, default=40)
     runner.add_argument("--min-views", type=int, default=2)
     runner.add_argument(
@@ -825,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
              "this confidence before masking/fusion; e.g. 0.6",
     )
     runner.add_argument("--coverage", type=float, default=0.90)
-    runner.add_argument("--no-refine", action="store_true", help="use raw ARKit poses")
+    runner.add_argument("--no-refine", action="store_true", help="use the selected raw SLAM/ARKit poses")
     runner.add_argument("--no-loop-closure", action="store_true")
     runner.add_argument("--no-damage", action="store_true")
     runner.add_argument("--no-sam", action="store_true", help="use local GrabCut masks")

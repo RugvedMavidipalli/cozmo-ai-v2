@@ -25,16 +25,19 @@ surface, and C needs B's damage regions to price a scope against. A single run o
 (`Timings.stage`, printed live and recorded in `diagnostics.timings_s`) and its
 output feeds the next:
 
-1. **ingest** (`ingest.load_capture`) — parses `odometry.csv`, `imu.csv`, the depth
-   PNGs, and `rgb.mp4` into a `CaptureBundle`: poses, intrinsics, per-frame gravity
-   direction. This is also where the pipeline's hardest current limitation lives — it
-   requires a Stray-Scanner-shaped capture with real depth and poses, and raises
-   immediately if either is missing (see track-a-reconstruction.md's gaps section).
+1. **ingest** (`ingest.load_capture`) — parses the capture's RGB video, calibration,
+   and either ARKit `odometry.csv` or an offline SLAM pose table into a
+   `CaptureBundle`; raw LiDAR is optional when a precomputed Stage 4 dense raster is
+   supplied. Per-frame gravity is read when available, and missing/invalid pose or
+   depth artifacts are reported by the frame contract.
 2. **pose refinement** (`poses.refine_trajectory`, skippable with `--no-refine`) —
    corrects ARKit's accumulated drift with a pose graph: sequential edges from ARKit
    itself, loop-closure edges from ICP between spatially-near, temporally-far frames.
-3. **fusion** (`fuse.fuse`) — TSDF-integrates posed depth frames into a mesh and point
-   cloud.
+3. **frame contract + fusion** (`frame_contract.build_frame_contract`, `fuse.fuse`) —
+   consumes QC-approved full-resolution Stage 4 depth with aligned confidence/QC
+   masks and correctly scaled intrinsics. A rejected dense frame falls back to its
+   same-index raw LiDAR frame. The selected pose table is recorded as ARKit or SLAM
+   provenance, and the Open3D TSDF exports both a cloud and mesh.
 4. **sampling** — back-projects a wider frame set into provenance-tagged 3D points
    (each carrying which camera observed it), used by both occlusion filtering and
    drift measurement below.
@@ -97,6 +100,8 @@ Everything below lands in `<out>/<capture-name>/` (or `--out`'s value directly):
 | `floorplan.svg` | `export.render_floorplan` | Dimensioned 2D floor plan — wall lengths with intervals, openings, occluded spans marked as inferred, damage shaded on its wall |
 | `scene.glb` | `export.export_scene` | 3D model: every wall, and (this session) every room's floor and ceiling, as individually named, selectable planes (`room_1.north_wall`, `room_1.floor`, `room_1.ceiling`) — no dense mesh; the raw fused surface lives separately in `cloud.ply` |
 | `cloud.ply` | fusion | Raw fused point cloud |
+| `mesh.ply` | fusion | Triangle mesh extracted from the same TSDF volume |
+| `fusion_manifest.json` | fusion | Deterministic integrated/rejected/fallback frame indices and depth/pose provenance |
 | `scope_sketch.csv` | `export.export_scope_csv` | Room/wall geometry table (room, area, ceiling height, wall, wall length) — the sketch half of an Xactimate-style import |
 | `scope_line_items.csv` | `export.export_scope_csv` | Line-item table (room, surface, action, material, description, quantity, unit, trade, rule_id, source, basis) — the scope half |
 | `damage_overlays/frame_NNNNNN.jpg` | `export.render_damage_overlays` | Per-frame images with the fused damage mask, box, and class/confidence label drawn on — saved at native video resolution, correctly oriented |
