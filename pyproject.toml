@@ -1,7 +1,7 @@
 [project]
 name = "cozmo-ai-v2"
 version = "0.1.0"
-description = "Handheld capture to dimensioned floor plan: Stray Scanner / video ingestion, geometry, and scope generation"
+description = "Handheld capture pipeline with MASt3R-SLAM RGB-video ingestion"
 requires-python = ">=3.10"
 dependencies = [
     # numpy is held below 2 by open3d 0.19, which the reconstruction path needs.

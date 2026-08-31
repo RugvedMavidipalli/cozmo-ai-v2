@@ -304,3 +304,21 @@ docs/            design rationale, algorithm derivations, and a gap analysis
   weights implicitly.
 - Damage output requires `ANTHROPIC_API_KEY`; without it the geometry tracks
   run and the scope comes out empty.
+
+## MASt3R-SLAM RGB video
+
+To run an installed [MASt3R-SLAM](https://github.com/rmurai0610/MASt3R-SLAM)
+checkout on a standalone RGB MP4 without calibration:
+
+```console
+cozmo-ai-v2 run recording.mp4 \
+  --mast3r-slam-dir /path/to/MASt3R-SLAM \
+  --python /path/to/mast3r-slam-environment/bin/python \
+  --no-viz \
+  --save-as recording
+```
+
+The checkout must contain MASt3R-SLAM, its submodules, model checkpoints, and
+GPU-enabled dependencies. The command runs from that checkout so its relative
+config and checkpoint paths resolve. Results are written beneath its `logs/`
+directory. This project does not bundle those external dependencies.

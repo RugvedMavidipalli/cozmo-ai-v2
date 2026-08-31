@@ -11,6 +11,7 @@ from .depth.densify import densify_capture
 from .depth.model import Metric3Dv2Model, ModelUnavailableError
 from .detect import InputDetectionError, InputKind, detect_input
 from .intrinsics_writer import write_intrinsics_yaml
+from .mast3r_slam import Mast3rSlamError, run_rgb_video
 from .manifest import build_manifest, write_manifest
 from .pipeline.measurements import validate_reference_scale
 from .video import VideoProbeError, probe_video
@@ -92,6 +93,54 @@ def run_densify(
     return 0
 
 
+def run_slam(
+    input_path: Path,
+    mast3r_slam_dir: Path,
+    config: str,
+    python_executable: str,
+    save_as: str | None,
+    no_viz: bool,
+) -> int:
+    """Validate and run MASt3R-SLAM for an uncalibrated RGB video."""
+
+    try:
+        detected = detect_input(input_path)
+    except InputDetectionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if detected.kind is not InputKind.PLAIN_VIDEO:
+        print(
+            "error: the 'run' command only accepts a standalone RGB video; "
+            "use 'prepare' for a Stray Scanner dataset",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        probe_video(detected.video_path)
+    except VideoProbeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        invocation = run_rgb_video(
+            detected.video_path,
+            mast3r_slam_dir,
+            config,
+            python_executable=python_executable,
+            save_as=save_as,
+            no_viz=no_viz,
+        )
+    except Mast3rSlamError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"MASt3R-SLAM completed for {detected.video_path}")
+    print(f"Results are in {invocation.cwd / 'logs'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cozmo-ai-v2")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -136,6 +185,26 @@ def build_parser() -> argparse.ArgumentParser:
     scale.add_argument("--known-m", type=float, required=True)
     scale.add_argument("--tolerance-m", type=float)
 
+    run = subparsers.add_parser(
+        "run",
+        help="Run MASt3R-SLAM on a standalone RGB video without calibration",
+    )
+    run.add_argument("input", type=Path, help="Path to an RGB video file")
+    run.add_argument(
+        "--mast3r-slam-dir",
+        type=Path,
+        required=True,
+        help="Path to an installed MASt3R-SLAM checkout",
+    )
+    run.add_argument("--config", default="config/base.yaml", help="Config path relative to the MASt3R-SLAM checkout")
+    run.add_argument(
+        "--python",
+        dest="python_executable",
+        default=sys.executable,
+        help="Python executable from the MASt3R-SLAM environment",
+    )
+    run.add_argument("--save-as", help="Optional subdirectory name under MASt3R-SLAM/logs")
+    run.add_argument("--no-viz", action="store_true", help="Run MASt3R-SLAM without its visualization window")
     return parser
 
 
@@ -161,6 +230,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(validation.to_dict(), indent=2))
         return 0 if validation.status in {"validated", "advisory"} else 1
+    if args.command == "run":
+        return run_slam(
+            args.input,
+            args.mast3r_slam_dir,
+            args.config,
+            args.python_executable,
+            args.save_as,
+            args.no_viz,
+        )
     parser.error(f"unknown command: {args.command}")
     return 2
 
