@@ -450,6 +450,22 @@ def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
+def load_odometry_pose_priors(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load timestamped Stray Scanner/ARKit camera-to-world pose priors.
+
+    The returned transforms are already in the pipeline's measured OpenCV
+    camera convention. Callers must not apply ``ARKIT_TO_CV`` again: that
+    conversion is for a different raw ARKit convention and would corrupt
+    Stray Scanner's exported odometry.
+    """
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"ARKit pose-prior file not found: {path}")
+    timestamps, poses, _intrinsics = _read_odometry(path)
+    return timestamps, poses
+
+
 def _quaternion_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     """Converts a quaternion -- a compact, four-number way of representing
     a 3D rotation -- into an ordinary 3x3 rotation matrix.

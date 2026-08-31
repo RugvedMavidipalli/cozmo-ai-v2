@@ -14,6 +14,14 @@ from .intrinsics_writer import write_intrinsics_yaml
 from .mast3r_slam import Mast3rSlamError, run_rgb_video
 from .manifest import build_manifest, write_manifest
 from .pipeline.measurements import validate_reference_scale
+from .pipeline.slam import (
+    SlamResultError,
+    integrate_mast3r_results,
+    mast3r_results_dir,
+    mast3r_trajectory_path,
+    write_pose_failure_manifest,
+    write_pose_integration_manifest,
+)
 from .video import VideoProbeError, probe_video
 
 
@@ -100,6 +108,9 @@ def run_slam(
     python_executable: str,
     save_as: str | None,
     no_viz: bool,
+    pose_priors_path: Path | None = None,
+    metrics_path: Path | None = None,
+    pose_manifest_path: Path | None = None,
 ) -> int:
     """Validate and run MASt3R-SLAM for an uncalibrated RGB video."""
 
@@ -117,6 +128,11 @@ def run_slam(
         )
         return 1
 
+    if pose_priors_path is None:
+        discovered_priors = detected.video_path.parent / "odometry.csv"
+        if discovered_priors.is_file():
+            pose_priors_path = discovered_priors
+
     try:
         probe_video(detected.video_path)
     except VideoProbeError as exc:
@@ -131,13 +147,71 @@ def run_slam(
             python_executable=python_executable,
             save_as=save_as,
             no_viz=no_viz,
+            pose_priors_path=pose_priors_path,
         )
     except Mast3rSlamError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        failure_manifest = pose_manifest_path
+        if failure_manifest is None and mast3r_slam_dir.is_dir():
+            failure_manifest = mast3r_results_dir(mast3r_slam_dir, detected.video_path, save_as) / "pose_provenance.json"
+        if failure_manifest is not None:
+            try:
+                write_pose_failure_manifest(
+                    failure_manifest,
+                    exc,
+                    pose_priors_path=pose_priors_path,
+                )
+            except OSError as manifest_error:
+                print(
+                    f"error: {exc}; additionally could not write diagnostics to "
+                    f"{failure_manifest}: {manifest_error}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"error: {exc}; wrote diagnostics to {failure_manifest}", file=sys.stderr)
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    results_dir = mast3r_results_dir(invocation.cwd, detected.video_path, save_as)
+    manifest_path = pose_manifest_path or results_dir / "pose_provenance.json"
+    try:
+        integration = integrate_mast3r_results(
+            mast3r_trajectory_path(invocation.cwd, detected.video_path, save_as),
+            pose_priors_path=pose_priors_path,
+            pose_prior_mode=invocation.pose_prior_mode,
+            results_dir=results_dir,
+            metrics_path=metrics_path,
+        )
+        write_pose_integration_manifest(manifest_path, integration)
+    except SlamResultError as exc:
+        write_pose_failure_manifest(
+            manifest_path,
+            exc,
+            pose_priors_path=pose_priors_path,
+            pose_prior_mode=invocation.pose_prior_mode,
+        )
+        print(f"error: {exc}; wrote diagnostics to {manifest_path}", file=sys.stderr)
         return 1
 
     print(f"MASt3R-SLAM completed for {detected.video_path}")
-    print(f"Results are in {invocation.cwd / 'logs'}")
+    print(f"Results are in {results_dir}")
+    print(f"Wrote pose provenance to {manifest_path}")
+    print(f"Loop closure: {integration.loop_closure.status}")
+    if integration.alignment is not None:
+        alignment = integration.alignment
+        print(
+            f"ARKit alignment: {alignment.method}, {alignment.matched_frames} matches, "
+            f"translation RMSE {alignment.translation_rmse_m:.3f} m, "
+            f"rotation RMSE {alignment.rotation_rmse_degrees:.2f}°, "
+            f"scale divergence {alignment.scale_divergence_fraction:.1%}"
+        )
+    if integration.fusion_allowed is False:
+        print(
+            "error: MASt3R-SLAM trajectory failed ARKit divergence gates; "
+            "do not fuse this trajectory",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -205,6 +279,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--save-as", help="Optional subdirectory name under MASt3R-SLAM/logs")
     run.add_argument("--no-viz", action="store_true", help="Run MASt3R-SLAM without its visualization window")
+    run.add_argument(
+        "--pose-priors",
+        type=Path,
+        help=(
+            "Optional Stray Scanner/ARKit odometry.csv. If upstream MASt3R-SLAM "
+            "does not support priors directly, it is used for post-run validation."
+        ),
+    )
+    run.add_argument(
+        "--metrics-path",
+        type=Path,
+        help="Optional MASt3R-SLAM loop-closure metrics JSON sidecar",
+    )
+    run.add_argument(
+        "--pose-manifest",
+        type=Path,
+        help="Where to write pose provenance (default: MASt3R-SLAM results directory)",
+    )
     return parser
 
 
@@ -238,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
             args.python_executable,
             args.save_as,
             args.no_viz,
+            args.pose_priors,
+            args.metrics_path,
+            args.pose_manifest,
         )
     parser.error(f"unknown command: {args.command}")
     return 2

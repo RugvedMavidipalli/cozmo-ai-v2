@@ -133,6 +133,33 @@
             }
           }
         },
+        "mast3r_slam": {
+          "type": "object",
+          "description": "MASt3R-SLAM pose provenance and pre-fusion ARKit divergence gate.",
+          "properties": {
+            "pose_source": { "type": "string" },
+            "pose_provenance_path": { "type": "string" },
+            "fusion_allowed": { "type": ["boolean", "null"] },
+            "loop_closure": {
+              "type": "object",
+              "properties": {
+                "status": { "type": "string" },
+                "candidate_count": { "type": ["integer", "null"] },
+                "accepted_count": { "type": ["integer", "null"] }
+              }
+            },
+            "alignment": {
+              "type": "object",
+              "properties": {
+                "method": { "enum": ["se3", "sim3"] },
+                "translation_rmse_m": { "type": "number" },
+                "rotation_rmse_degrees": { "type": "number" },
+                "scale_divergence_fraction": { "type": "number" },
+                "timestamp_offset_seconds": { "type": "number" }
+              }
+            }
+          }
+        },
         "warnings": { "type": "array", "items": { "type": "string" } },
         "geometry": {
           "type": ["object", "null"],

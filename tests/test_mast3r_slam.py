@@ -7,6 +7,7 @@ import pytest
 from cozmo_ai_v2.mast3r_slam import (
     Mast3rSlamError,
     build_rgb_video_command,
+    detect_mast3r_slam_capabilities,
     run_rgb_video,
 )
 
@@ -85,3 +86,39 @@ def test_run_rgb_video_reports_external_failure(synthetic_video, tmp_path):
 
     with pytest.raises(Mast3rSlamError, match="status 42"):
         run_rgb_video(synthetic_video, mast3r_slam_dir, run_process=fake_run)
+
+
+def test_pose_priors_fall_back_to_post_run_alignment_when_unsupported(synthetic_video, tmp_path):
+    mast3r_slam_dir = tmp_path / "MASt3R-SLAM"
+    mast3r_slam_dir.mkdir()
+    (mast3r_slam_dir / "main.py").write_text('parser.add_argument("--dataset")\n')
+    prior_path = tmp_path / "odometry.csv"
+    prior_path.write_text("placeholder\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    invocation = run_rgb_video(
+        synthetic_video,
+        mast3r_slam_dir,
+        pose_priors_path=prior_path,
+        run_process=fake_run,
+    )
+
+    assert invocation.capabilities is not None
+    assert invocation.capabilities.supports_pose_priors is False
+    assert invocation.pose_prior_mode == "post_alignment"
+    assert "--pose-priors" not in calls[0]
+
+
+def test_capability_detection_uses_advertised_upstream_pose_prior_option(tmp_path):
+    mast3r_slam_dir = tmp_path / "MASt3R-SLAM"
+    mast3r_slam_dir.mkdir()
+    (mast3r_slam_dir / "main.py").write_text('parser.add_argument("--pose-priors")\n')
+
+    capabilities = detect_mast3r_slam_capabilities(mast3r_slam_dir)
+
+    assert capabilities.supports_pose_priors is True
+    assert capabilities.pose_prior_argument == "--pose-priors"

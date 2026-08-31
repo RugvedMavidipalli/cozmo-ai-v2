@@ -42,6 +42,12 @@ from .planes import (
 from .poses import refine_trajectory, select_keyframes
 from .rooms import build_plan_grid, check_no_overlaps, segment_rooms
 from .scope import ScopeEngine
+from .slam import (
+    SlamResultError,
+    integrate_mast3r_results,
+    write_pose_failure_manifest,
+    write_pose_integration_manifest,
+)
 from .uncertainty import UncertaintyModel
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -161,11 +167,63 @@ def run(args: argparse.Namespace) -> int:
             "using the selected SLAM/ARKit pose table"
         )
 
+    # A completed MASt3R-SLAM trajectory takes precedence over the local
+    # ARKit refinement only after metric alignment and divergence gates pass.
+    # Interpolation fills capture timestamps; it is not another registration
+    # pass. This must happen before the frame contract is built so fusion and
+    # provenance observe the selected pose table.
+    mast3r_integration = None
+    if args.mast3r_trajectory:
+        mast3r_manifest = out_dir / "mast3r_pose_provenance.json"
+        try:
+            with timings.stage("MASt3R-SLAM trajectory validation"):
+                mast3r_integration = integrate_mast3r_results(
+                    args.mast3r_trajectory,
+                    pose_priors_path=bundle.root / "odometry.csv",
+                    pose_prior_mode="post_alignment",
+                    results_dir=Path(args.mast3r_trajectory).parent,
+                    metrics_path=args.mast3r_metrics,
+                    target_timestamps=bundle.timestamps,
+                    interpolation_max_gap_seconds=args.mast3r_max_pose_gap,
+                )
+            write_pose_integration_manifest(mast3r_manifest, mast3r_integration)
+        except SlamResultError as exc:
+            write_pose_failure_manifest(
+                mast3r_manifest,
+                exc,
+                pose_priors_path=bundle.root / "odometry.csv",
+                pose_prior_mode="post_alignment",
+            )
+            print(f"error: {exc}; wrote diagnostics to {mast3r_manifest}", file=sys.stderr)
+            return 1
+        if not mast3r_integration.fusion_allowed:
+            print(
+                "error: MASt3R-SLAM trajectory failed ARKit divergence gates; "
+                f"see {mast3r_manifest} before fusion",
+                file=sys.stderr,
+            )
+            return 1
+        poses = mast3r_integration.trajectory.poses
+        alignment = mast3r_integration.alignment
+        print(
+            f"  MASt3R-SLAM {alignment.method} alignment: "
+            f"{alignment.matched_frames} matches, "
+            f"translation RMSE {alignment.translation_rmse_m:.3f} m, "
+            f"rotation RMSE {alignment.rotation_rmse_degrees:.2f}°, "
+            f"scale divergence {alignment.scale_divergence_fraction:.1%}"
+        )
+
     # Stage 3: fusion.  The contract is the single source of truth for
     # depth resolution, QC masks, provenance, and the pose table used by
     # both TSDF integration and the later provenance-aware sampling pass.
     pose_provenance = (
-        f"refined_{bundle.pose_source}" if not args.no_refine else bundle.pose_source
+        mast3r_integration.pose_source
+        if mast3r_integration is not None
+        else (
+            f"refined_{bundle.pose_source}"
+            if drift_report is not None and not drift_report.rejected
+            else bundle.pose_source
+        )
     )
     with timings.stage("frame contract"):
         frame_contract = build_frame_contract(
@@ -515,6 +573,27 @@ def run(args: argparse.Namespace) -> int:
             scene_measurements=scene_measurements,
             reference_validation=reference_validation,
         )
+        if mast3r_integration is not None:
+            alignment = mast3r_integration.alignment
+            mast3r_diagnostics = {
+                "pose_source": mast3r_integration.pose_source,
+                "pose_provenance_path": str(out_dir / "mast3r_pose_provenance.json"),
+                "fusion_allowed": mast3r_integration.fusion_allowed,
+                "loop_closure": {
+                    "status": mast3r_integration.loop_closure.status,
+                    "candidate_count": mast3r_integration.loop_closure.candidate_count,
+                    "accepted_count": mast3r_integration.loop_closure.accepted_count,
+                },
+            }
+            if alignment is not None:
+                mast3r_diagnostics["alignment"] = {
+                    "method": alignment.method,
+                    "translation_rmse_m": alignment.translation_rmse_m,
+                    "rotation_rmse_degrees": alignment.rotation_rmse_degrees,
+                    "scale_divergence_fraction": alignment.scale_divergence_fraction,
+                    "timestamp_offset_seconds": alignment.timestamp_offset_seconds,
+                }
+            result["diagnostics"]["mast3r_slam"] = mast3r_diagnostics
         export.write_json(result, out_dir / "result.json")
         problems = export.validate(result, REPO_ROOT / "schema" / "result.schema.json")
         if problems:
@@ -1321,6 +1400,25 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--reference-known-m", type=float)
     runner.add_argument("--no-refine", action="store_true", help="use raw ARKit/SLAM poses")
     runner.add_argument("--no-loop-closure", action="store_true")
+    runner.add_argument(
+        "--mast3r-trajectory",
+        type=Path,
+        help=(
+            "MASt3R-SLAM trajectory file to align to this capture's ARKit priors "
+            "and use only if it passes pre-fusion divergence gates"
+        ),
+    )
+    runner.add_argument(
+        "--mast3r-metrics",
+        type=Path,
+        help="optional MASt3R-SLAM loop-closure metrics JSON sidecar",
+    )
+    runner.add_argument(
+        "--mast3r-max-pose-gap",
+        type=float,
+        default=1.0,
+        help="maximum seconds between MASt3R poses that may be interpolated for fusion",
+    )
     runner.add_argument("--no-damage", action="store_true")
     runner.add_argument("--no-sam", action="store_true", help="use local GrabCut masks")
     runner.add_argument(
