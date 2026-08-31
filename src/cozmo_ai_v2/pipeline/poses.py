@@ -5,10 +5,20 @@ from dataclasses import dataclass, field
 import numpy as np
 import open3d as o3d
 
-from .ingest import CaptureBundle, iter_frames
+from .ingest import CaptureBundle, STRAY_ODOMETRY_CONVENTION, iter_frames
 
 ODOMETRY_INFORMATION = 1000.0
 LOOP_INFORMATION = 10.0
+ROTATION_OBJECTIVE_METERS = 0.25
+
+
+@dataclass(frozen=True)
+class _PoseConstraint:
+    source_id: int
+    target_id: int
+    transformation: np.ndarray
+    information: float
+    is_loop: bool
 
 
 @dataclass
@@ -38,6 +48,17 @@ class DriftReport:
             original position, in metres.
         max_correction: The largest single move any keyframe made, in
             metres.
+        objective_before: Weighted pose-graph residual under raw ARKit poses.
+        objective_after: The same residual under the candidate refined poses.
+        loop_residual_before: Average loop-edge residual before refinement.
+        loop_residual_after: Average loop-edge residual after refinement.
+        candidate_loop_closure_gap_after: Start/end gap before acceptance; this
+            differs from ``loop_closure_gap_after`` when the candidate is
+            rejected.
+        rejection_reasons: Objective evidence explaining why raw ARKit poses
+            were retained, if any.
+        pose_source: Which trajectory was actually returned to fusion.
+        pose_convention: Provenance for the returned camera-to-world poses.
         stages: An optional place for a caller to attach extra timing
             info; this module doesn't fill it in.
     """
@@ -51,7 +72,64 @@ class DriftReport:
     loop_closure_gap_after: float
     mean_correction: float
     max_correction: float
+    objective_before: float
+    objective_after: float
+    loop_residual_before: float | None
+    loop_residual_after: float | None
+    candidate_loop_closure_gap_after: float
+    rejection_reasons: tuple[str, ...]
+    pose_source: str
+    pose_convention: str = STRAY_ODOMETRY_CONVENTION
     stages: dict[str, float] = field(default_factory=dict)
+
+
+def evaluate_refinement_acceptance(
+    *,
+    max_correction: float,
+    max_total_correction: float,
+    loop_edges: int,
+    objective_before: float,
+    objective_after: float,
+    loop_residual_before: float | None,
+    loop_residual_after: float | None,
+    loop_gap_before: float,
+    loop_gap_after: float,
+    min_objective_improvement: float = 1e-6,
+    min_loop_residual_improvement: float = 1e-4,
+    max_loop_gap_worsening: float = 0.05,
+) -> tuple[bool, tuple[str, ...]]:
+    """Accept a pose-graph result only when its objective evidence improves.
+
+    The raw CSV ARKit trajectory is the prior. A refinement is not accepted
+    merely because the optimizer returned a self-consistent graph: it must
+    lower both the weighted graph objective and the independent loop-edge
+    residual, and it must not materially worsen the observed loop gap.
+    """
+
+    reasons: list[str] = []
+    if max_correction > max_total_correction:
+        reasons.append(
+            f"maximum correction {max_correction:.3f} m exceeds {max_total_correction:.3f} m"
+        )
+    if loop_edges == 0:
+        reasons.append("no loop-closure edge was accepted; retaining raw ARKit poses")
+    if objective_after >= objective_before - min_objective_improvement:
+        reasons.append(
+            f"pose-graph objective did not improve ({objective_before:.6f} -> {objective_after:.6f})"
+        )
+    if loop_residual_before is None or loop_residual_after is None:
+        reasons.append("loop residual is unavailable; retaining raw ARKit poses")
+    elif loop_residual_after >= loop_residual_before - min_loop_residual_improvement:
+        reasons.append(
+            "loop residual did not improve "
+            f"({loop_residual_before:.4f} -> {loop_residual_after:.4f})"
+        )
+    if loop_gap_after > loop_gap_before + max_loop_gap_worsening:
+        reasons.append(
+            "loop closure gap worsened "
+            f"({loop_gap_before:.3f} m -> {loop_gap_after:.3f} m)"
+        )
+    return not reasons, tuple(reasons)
 
 
 def select_keyframes(
@@ -267,6 +345,49 @@ def find_loop_candidates(
     return [(i, j) for _, i, j in scored[:max_candidates]]
 
 
+def _constraint_error(pose_source: np.ndarray, pose_target: np.ndarray, measurement: np.ndarray) -> tuple[float, float]:
+    """Return translation and rotation disagreement with one graph edge."""
+
+    predicted = np.linalg.inv(pose_target) @ pose_source
+    residual = np.linalg.inv(measurement) @ predicted
+    translation = float(np.linalg.norm(residual[:3, 3]))
+    cosine = np.clip((np.trace(residual[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+    rotation = float(np.arccos(cosine))
+    return translation, rotation
+
+
+def _graph_objective(poses: np.ndarray, constraints: list[_PoseConstraint]) -> float:
+    """Compute a comparable weighted residual before and after optimization."""
+
+    if not constraints:
+        return 0.0
+    weighted_error = 0.0
+    total_information = 0.0
+    for constraint in constraints:
+        translation, rotation = _constraint_error(
+            poses[constraint.source_id], poses[constraint.target_id], constraint.transformation
+        )
+        error = translation * translation + (ROTATION_OBJECTIVE_METERS * rotation) ** 2
+        weighted_error += constraint.information * error
+        total_information += constraint.information
+    return weighted_error / total_information
+
+
+def _loop_residual(poses: np.ndarray, constraints: list[_PoseConstraint]) -> float | None:
+    """Return the average unweighted loop-edge residual in metres-equivalent."""
+
+    loop_constraints = [constraint for constraint in constraints if constraint.is_loop]
+    if not loop_constraints:
+        return None
+    errors = []
+    for constraint in loop_constraints:
+        translation, rotation = _constraint_error(
+            poses[constraint.source_id], poses[constraint.target_id], constraint.transformation
+        )
+        errors.append(np.hypot(translation, ROTATION_OBJECTIVE_METERS * rotation))
+    return float(np.mean(errors))
+
+
 def refine_trajectory(
     bundle: CaptureBundle,
     keyframes: np.ndarray | None = None,
@@ -289,8 +410,10 @@ def refine_trajectory(
     the only way to catch drift that built up gradually over the whole
     capture. If the end result looks physically implausible (some
     keyframe moved further than it reasonably should), the whole
-    correction is thrown out and the original ARKit poses are returned
-    instead.
+    correction is thrown out and the original CSV poses are returned instead.
+    Acceptance requires improvement in both the weighted pose-graph objective
+    and the independent loop-edge residual; the observed loop gap must also
+    stay within its tolerance.
 
     Args:
         bundle: The parsed capture to correct.
@@ -319,6 +442,31 @@ def refine_trajectory(
     clouds = _keyframe_clouds(bundle, keyframes, voxel_size, min_confidence, max_depth)
     keyframes = np.asarray([k for k in keyframes if k in clouds])
 
+    raw_loop_gap = float(
+        np.linalg.norm(bundle.poses[-1][:3, 3] - bundle.poses[0][:3, 3])
+    )
+    if len(keyframes) < 2:
+        report = DriftReport(
+            keyframe_count=len(keyframes),
+            loop_edges=0,
+            loop_candidates=0,
+            rejected=True,
+            sequential_rmse=0.0,
+            loop_closure_gap_before=raw_loop_gap,
+            loop_closure_gap_after=raw_loop_gap,
+            mean_correction=0.0,
+            max_correction=0.0,
+            objective_before=0.0,
+            objective_after=0.0,
+            loop_residual_before=None,
+            loop_residual_after=None,
+            candidate_loop_closure_gap_after=raw_loop_gap,
+            rejection_reasons=("fewer than two depth-supported keyframes",),
+            pose_source="arkit_csv_raw",
+            pose_convention=bundle.pose_convention,
+        )
+        return bundle.poses.copy(), report
+
     graph = o3d.pipelines.registration.PoseGraph()
     for keyframe in keyframes:
         graph.nodes.append(
@@ -327,6 +475,7 @@ def refine_trajectory(
 
     threshold = voxel_size * 1.5
     sequential_errors: list[float] = []
+    constraints: list[_PoseConstraint] = []
     for position in range(len(keyframes) - 1):
         source_id, target_id = position, position + 1
         source, target = keyframes[source_id], keyframes[target_id]
@@ -345,6 +494,9 @@ def refine_trajectory(
                 np.eye(6) * ODOMETRY_INFORMATION,
                 uncertain=False,
             )
+        )
+        constraints.append(
+            _PoseConstraint(source_id, target_id, relative, ODOMETRY_INFORMATION, False)
         )
 
     candidates = (
@@ -376,7 +528,14 @@ def refine_trajectory(
                 uncertain=True,
             )
         )
+        constraints.append(
+            _PoseConstraint(source_id, target_id, transformation, LOOP_INFORMATION, True)
+        )
         accepted += 1
+
+    original_keyframe_poses = bundle.poses[keyframes]
+    objective_before = _graph_objective(original_keyframe_poses, constraints)
+    loop_residual_before = _loop_residual(original_keyframe_poses, constraints)
 
     # Solve for the poses that best satisfy every connection at once,
     # rather than applying each correction one at a time.
@@ -393,31 +552,50 @@ def refine_trajectory(
 
     refined_keyframe_poses = np.asarray([node.pose for node in graph.nodes])
     corrections = np.linalg.norm(
-        refined_keyframe_poses[:, :3, 3] - bundle.poses[keyframes][:, :3, 3], axis=1
+        refined_keyframe_poses[:, :3, 3] - original_keyframe_poses[:, :3, 3], axis=1
     )
-
-    # If any single keyframe moved further than seems physically
-    # reasonable, don't trust any of this -- fall back to the raw poses.
-    rejected = float(corrections.max()) > max_total_correction
+    objective_after = _graph_objective(refined_keyframe_poses, constraints)
+    loop_residual_after = _loop_residual(refined_keyframe_poses, constraints)
+    candidate_poses = _propagate(bundle.poses, keyframes, refined_keyframe_poses)
+    candidate_loop_gap = float(
+        np.linalg.norm(candidate_poses[-1][:3, 3] - candidate_poses[0][:3, 3])
+    )
+    accepted_refinement, rejection_reasons = evaluate_refinement_acceptance(
+        max_correction=float(corrections.max()),
+        max_total_correction=max_total_correction,
+        loop_edges=accepted,
+        objective_before=objective_before,
+        objective_after=objective_after,
+        loop_residual_before=loop_residual_before,
+        loop_residual_after=loop_residual_after,
+        loop_gap_before=raw_loop_gap,
+        loop_gap_after=candidate_loop_gap,
+    )
+    rejected = not accepted_refinement
     if rejected:
         poses = bundle.poses.copy()
-        refined_keyframe_poses = bundle.poses[keyframes]
     else:
-        poses = _propagate(bundle.poses, keyframes, refined_keyframe_poses)
+        poses = candidate_poses
     report = DriftReport(
         keyframe_count=len(keyframes),
         loop_edges=accepted,
         loop_candidates=len(candidates),
         rejected=rejected,
         sequential_rmse=float(np.mean(sequential_errors)) if sequential_errors else 0.0,
-        loop_closure_gap_before=float(
-            np.linalg.norm(bundle.poses[-1][:3, 3] - bundle.poses[0][:3, 3])
-        ),
+        loop_closure_gap_before=raw_loop_gap,
         loop_closure_gap_after=float(
             np.linalg.norm(poses[-1][:3, 3] - poses[0][:3, 3])
         ),
         mean_correction=float(corrections.mean()),
         max_correction=float(corrections.max()),
+        objective_before=objective_before,
+        objective_after=objective_after,
+        loop_residual_before=loop_residual_before,
+        loop_residual_after=loop_residual_after,
+        candidate_loop_closure_gap_after=candidate_loop_gap,
+        rejection_reasons=rejection_reasons,
+        pose_source="arkit_csv_raw" if rejected else "arkit_refined_loop_closure",
+        pose_convention=bundle.pose_convention,
     )
     return poses, report
 

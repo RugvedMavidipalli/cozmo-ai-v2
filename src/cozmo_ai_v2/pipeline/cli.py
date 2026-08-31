@@ -161,6 +161,15 @@ def run(args: argparse.Namespace) -> int:
             f"  {drift_report.keyframe_count} keyframes, "
             f"{drift_report.loop_edges}/{drift_report.loop_candidates} loop edges"
         )
+        refinement_status = "rejected; raw ARKit retained" if drift_report.rejected else "accepted"
+        print(
+            f"  refinement {refinement_status}: objective "
+            f"{drift_report.objective_before:.6f} -> {drift_report.objective_after:.6f}, "
+            f"loop gap {drift_report.loop_closure_gap_before:.3f} m -> "
+            f"{drift_report.candidate_loop_closure_gap_after:.3f} m"
+        )
+        if drift_report.rejected:
+            warnings.extend(f"pose refinement rejected: {reason}" for reason in drift_report.rejection_reasons)
     elif not args.no_refine:
         warnings.append(
             "pose refinement skipped: no raw LiDAR depth is available; "
@@ -1193,6 +1202,7 @@ def _assemble(
         "capture": {
             "name": bundle.name,
             "modality": "lidar" if bundle.has_depth else "video_only",
+            "pose_convention": bundle.pose_convention,
             "frame_count": len(bundle),
             "duration_s": round(bundle.duration, 2),
             "path_length_m": round(

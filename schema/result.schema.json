@@ -10,6 +10,7 @@
       "required": ["name", "modality", "frame_count"],
       "properties": {
         "name": { "type": "string" },
+        "pose_convention": { "type": "string" },
         "modality": {
           "type": "string",
           "enum": ["lidar", "video_only"],

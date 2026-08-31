@@ -111,8 +111,12 @@ Sensor conventions were **measured, not assumed** — `tools/conv_test.py` and
 that silently produce confident, geometrically meaningless output if guessed:
 
 - Poses in `odometry.csv` are *already* camera-to-world in the OpenCV
-  convention. Applying the textbook ARKit→OpenCV flip degrades frame alignment
-  from 4.2 cm to 25.9 cm.
+  convention. On recordings-2, the measured median alignment error is 4.80 cm
+  with no flip versus 24.59 cm with an ARKit→OpenCV flip; treating the CSV as
+  world-to-camera is worse still (70.41 cm median / 99.44 cm metric). The
+  pipeline structurally validates the expected homogeneous camera-to-world
+  transforms and records `camera_to_world_opencv_csv_no_arkit_to_cv_flip` as
+  provenance instead of inferring or applying a flip.
 - The IMU body frame is rotated from the camera frame by `rotZ(-90°)`. Only that
   mapping resolves the accelerometer to a constant world vector (0.992
   consistency); the identity mapping scores 0.59 and yields a 10 m "room height".
@@ -211,7 +215,10 @@ exposed as `--max-depth` and `--min-confidence`.
 pose-graph edges from pairwise ICP *lowered* measured drift by 66% while
 stretching the 2.99 m storey to 4.48 m — a self-consistent, badly wrong
 solution. Sequential edges now come from ARKit weighted ~100× above ICP loop
-edges, and `refine_trajectory` refuses its own output past a 75 cm correction.
+edges. A refinement is accepted only when both the weighted pose-graph objective
+and the independent loop residual improve, the loop gap does not worsen by more
+than 5 cm, and no keyframe moves more than 75 cm. Otherwise raw ARKit poses and
+the full rejection rationale are retained in diagnostics.
 
 **A wall behind a wall gets filtered by ray occlusion, not proximity.**
 `merge_collinear` removes clutter too *close* to the camera (furniture in
