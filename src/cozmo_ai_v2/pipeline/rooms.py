@@ -6,6 +6,7 @@ import numpy as np
 from scipy import ndimage
 
 from .planes import HorizontalFrame, WallSegment
+from .projection import DensityMap, project_wall_density
 
 
 @dataclass
@@ -33,12 +34,26 @@ class PlanGrid:
         free: A grid of integers, one per cell, counting how many
             floor-height points (or camera positions -- see
             `build_plan_grid`) landed in each cell.
+        wall_density: The typed wall-height projection that produced
+            `occupied`, including its metric bounds and observed/empty masks;
+            `None` for manually assembled compatibility grids.
     """
 
     resolution: float
     origin: np.ndarray
     occupied: np.ndarray
     free: np.ndarray
+    wall_density: DensityMap | None = None
+
+    @property
+    def density(self) -> DensityMap | None:
+        """The wall-height density projection used to build ``occupied``.
+
+        Manually constructed ``PlanGrid`` instances may leave this as
+        ``None``; grids produced by :func:`build_plan_grid` always carry the
+        projection metadata for downstream vectorizers.
+        """
+        return self.wall_density
 
     def to_cell(self, plan: np.ndarray) -> np.ndarray:
         """Converts a real-world (x, y) position into the grid cell it
@@ -172,7 +187,8 @@ def build_plan_grid(
     Returns:
         A `PlanGrid` sized to cover every point with half a metre of
         margin around the edges, with wall and floor evidence already
-        counted up per cell.
+        counted up per cell. Its `wall_density` field is the complete typed
+        projection metadata passed to the vectorizer.
     """
     points = np.asarray(points, dtype=float)
     if points.ndim == 1 and points.size == 0:
@@ -180,32 +196,29 @@ def build_plan_grid(
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must have shape (N, 3)")
     floor_height = float(floor_height) if np.isfinite(floor_height) else 0.0
+    wall_density = project_wall_density(
+        points,
+        frame,
+        floor_height,
+        ceiling_height,
+        resolution=resolution,
+        wall_band=wall_band,
+    )
     points = points[np.isfinite(points).all(axis=1)]
     if not len(points):
         return PlanGrid(
             resolution=resolution,
-            origin=np.zeros(2, dtype=float),
-            occupied=np.zeros((1, 1), dtype=np.int32),
+            origin=wall_density.origin,
+            occupied=wall_density.counts,
             free=np.zeros((1, 1), dtype=np.int32),
+            wall_density=wall_density,
         )
     heights = frame.height(points)
     plan = frame.to_plan(points)
 
-    lower = np.minimum(plan.min(axis=0) - 0.5, plan.min(axis=0))
-    upper = plan.max(axis=0) + 0.5
-    shape = np.ceil((upper - lower) / resolution).astype(int) + 1
+    lower = wall_density.origin
+    shape = np.asarray(wall_density.shape, dtype=int)
 
-    # Missing ceiling evidence must not turn a high wall return or a sensor
-    # outlier into a room boundary.  The fixed wall-band upper bound remains
-    # useful for wall evidence while staying deterministic.
-    ceiling = (
-        float(ceiling_height)
-        if ceiling_height is not None and np.isfinite(ceiling_height)
-        else float(floor_height + wall_band[1])
-    )
-    wall_mask = (heights > floor_height + wall_band[0]) & (
-        heights < min(floor_height + wall_band[1], ceiling - 0.15)
-    )
     floor_mask = np.abs(heights - floor_height) < floor_band
 
     free = _accumulate(plan[floor_mask], lower, shape, resolution)
@@ -226,8 +239,9 @@ def build_plan_grid(
     return PlanGrid(
         resolution=resolution,
         origin=lower,
-        occupied=_accumulate(plan[wall_mask], lower, shape, resolution),
+        occupied=wall_density.counts,
         free=free,
+        wall_density=wall_density,
     )
 
 
