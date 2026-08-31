@@ -76,6 +76,11 @@ out/<capture>/
 | `--min-confidence 0\|1\|2` | `1` | ARKit depth-confidence floor. The glass/mirror ablation |
 | `--damage-frames N` | `40` | Max keyframes sent to the VLM for damage detection |
 | `--min-views N` | `2` | Independent views required to accept a damage region |
+| `--rgb-openings` | off | Enable local-only Grounding DINO + SAM2 door/window evidence |
+| `--grounding-dino-model` | — | Local Grounding DINO checkpoint; model downloads are never attempted |
+| `--sam2-checkpoint` / `--sam2-config` | — | Local SAM2 checkpoint/config paths |
+| `--opening-frames N` | `40` | Maximum spatially diverse, sharp frames sampled for RGB openings |
+| `--roomformer-predictions` | — | Precomputed RoomFormer SD-TQ predictions; image-only hints stay unmeasured |
 | `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |
 | `--coverage` | `0.90` | Target confidence-interval coverage |
 | `--no-refine` | off | Use raw selected SLAM/ARKit poses. The pose-refinement ablation |
@@ -240,6 +245,9 @@ pipeline/
   planes.py      wall extraction, Manhattan frame, corner intersection
   rooms.py       watershed room segmentation, adjacency, wall naming
   occupancy.py   per-surface UV grids: openings, occlusion, damage
+  openings.py    normalized opening contract and cross-source fusion
+  rgb_openings.py lazy Grounding DINO/SAM2 RGB adapter and depth association
+  roomformer.py  RoomFormer SD-TQ prediction adapter
   drift.py       revisit-spread drift measurement
   damage/        vlm.py (detection) · masks.py (SAM/GrabCut) · fusion.py (cross-frame)
   scope.py       rules.yaml → line items + concealed-damage flags

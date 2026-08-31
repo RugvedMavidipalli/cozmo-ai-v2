@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
 
+from .openings import NormalizedOpening
 from .planes import HorizontalFrame, WallSegment
 
 
@@ -128,7 +129,7 @@ class SurfaceGrid:
 
 
 @dataclass
-class Opening:
+class _LegacyOpening:
     """A gap found in one wall's observed surface -- most likely a door,
     window, or an open pass-through to another room.
 
@@ -180,6 +181,11 @@ class Opening:
         """How high the opening's top edge sits above the floor, in
         metres."""
         return self.v_range[1]
+
+
+# Keep the historical import path (`occupancy.Opening`) while making every
+# producer use the source-neutral contract.
+Opening = NormalizedOpening
 
 
 def build_surface_grid(
@@ -332,6 +338,13 @@ def find_openings(
     silhouette = ndimage.binary_closing(observed, np.ones((5, 5)))
     silhouette = ndimage.binary_fill_holes(silhouette)
     holes = silhouette & ~ndimage.binary_dilation(observed, np.ones((3, 3)))
+    # A blank region backed by repeated near-plane returns is more likely a
+    # sofa/cabinet than a real opening. Keep this gate separate from the
+    # silhouette construction so sparse but clean gaps retain the old path.
+    blocked = ndimage.binary_dilation(
+        occluded_mask(grid, min_near=2), np.ones((3, 3))
+    )
+    holes &= ~blocked
     holes = ndimage.binary_opening(holes, np.ones((3, 3)))
 
     labels, count = ndimage.label(holes)
@@ -352,6 +365,14 @@ def find_openings(
         if fill < 0.45:
             continue
 
+        # Require a wall-supported rim around the candidate. This prevents
+        # an unobserved edge of the silhouette from becoming a measurement.
+        component = labels == label
+        rim = ndimage.binary_dilation(component, np.ones((5, 5))) & ~component
+        rim_support = float(observed[rim].mean()) if rim.any() else 0.0
+        if rim_support < 0.18:
+            continue
+
         reaches_floor = v_lo <= door_floor_tolerance
         if reaches_floor and height >= min_door_height:
             kind = "door"
@@ -366,6 +387,16 @@ def find_openings(
                 u_range=(float(u_lo), float(u_hi)),
                 v_range=(float(v_lo), float(v_hi)),
                 confidence=float(min(1.0, fill)),
+                provenance=["geometry"],
+                state="measured",
+                uncertainty={
+                    "u_sigma_m": float(grid.resolution / np.sqrt(12.0)),
+                    "v_sigma_m": float(grid.resolution / np.sqrt(12.0)),
+                    "rim_support": float(rim_support),
+                    "basis": "surface occupancy cell resolution and observed rim support",
+                },
+                wall_association_confidence=1.0,
+                wall_distance_m=0.0,
             )
         )
     return openings

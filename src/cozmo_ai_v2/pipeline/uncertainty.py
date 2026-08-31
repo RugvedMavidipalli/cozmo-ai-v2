@@ -299,7 +299,13 @@ class UncertaintyModel:
             f"{perimeter:.1f} m perimeter at {edge_sigma * 1000:.1f} mm edge sigma",
         )
 
-    def opening_width(self, width: float, resolution: float, confidence: float) -> Interval:
+    def opening_width(
+        self,
+        width: float,
+        resolution: float,
+        confidence: float,
+        measurement_sigma: float = 0.0,
+    ) -> Interval:
         """Builds a confidence interval for a door or window's width.
 
         An opening's edges are only known down to the resolution of the
@@ -312,12 +318,15 @@ class UncertaintyModel:
         Args:
             width: The measured opening width, in metres.
             resolution: The surface grid's cell size, in metres.
-            confidence: The opening's `confidence` score, from 0 to 1.
+        confidence: The opening's `confidence` score, from 0 to 1.
+        measurement_sigma: Optional source-specific bound uncertainty in
+            metres, such as RGB depth/back-projection scatter.
 
         Returns:
             An `Interval` around `width` at `self.coverage`.
         """
         sigma = resolution / np.sqrt(12) * 2
+        sigma = float(np.hypot(sigma, max(float(measurement_sigma), 0.0)))
         sigma = float(np.hypot(sigma, 0.01 * (1.0 - confidence) * 3))
         half = self.z * sigma * self.scale * self._modality()
         return Interval(

@@ -310,6 +310,12 @@ def render_floorplan(
         # inferred rather than observed) -- then walk them left to right.
         cuts: list[tuple[float, float, str]] = []
         for opening in openings_by_wall.get(wall["name"], []):
+            # Image-only RoomFormer hints remain visible in JSON but cannot
+            # cut a scaled floor plan without a wall and metric bounds.
+            if opening.get("state", opening.get("measurement_state", "measured")) != "measured":
+                continue
+            if not isinstance(opening.get("width"), dict) or opening.get("u_offset") is None:
+                continue
             u0 = opening.get("u_offset", 0.0)
             u1 = u0 + opening["width"]["value"]
             cuts.append((u0, u1, opening["kind"]))
@@ -978,3 +984,49 @@ def export_scope_csv(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
             )
 
     return sketch_path, scope_path
+
+
+def export_openings_csv(result: dict, out_dir: str | Path) -> Path:
+    """Export normalized door/window evidence, including unmeasured hints."""
+    import csv
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "openings.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "wall", "kind", "state", "provenance", "width_m",
+                "width_ci_half_width_m", "height_m", "height_ci_half_width_m",
+                "sill_height_m", "header_height_m", "u_offset_m", "confidence",
+                "wall_association_confidence", "source_frames", "observation_count",
+                "depth_support", "mask_method",
+            ]
+        )
+        for opening in result.get("reconstruction", {}).get("openings", []):
+            width = opening.get("width") or {}
+            height = opening.get("height") or {}
+            association = opening.get("wall_association") or {}
+            writer.writerow(
+                [
+                    opening.get("wall") or "",
+                    opening.get("kind", ""),
+                    opening.get("state", opening.get("measurement_state", "unmeasured")),
+                    "+".join(opening.get("provenance", [])),
+                    width.get("value", ""),
+                    width.get("half_width", ""),
+                    height.get("value", ""),
+                    height.get("half_width", ""),
+                    opening.get("sill_height", ""),
+                    opening.get("header_height", ""),
+                    opening.get("u_offset", ""),
+                    opening.get("confidence", ""),
+                    association.get("confidence", ""),
+                    "+".join(str(frame) for frame in opening.get("source_frames", [])),
+                    opening.get("observation_count", ""),
+                    opening.get("depth_support", ""),
+                    opening.get("mask_method", "") or "",
+                ]
+            )
+    return path

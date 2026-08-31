@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import time
@@ -20,6 +21,7 @@ from .geometry import estimate_gravity
 from .ingest import display_rotation, load_capture, iter_frames
 from .keyframes import select_damage_keyframes
 from .occupancy import build_surface_grid, find_openings, occluded_spans
+from .openings import fuse_openings
 from .planes import (
     estimate_horizontal_frame,
     extract_walls,
@@ -265,11 +267,12 @@ def run(args: argparse.Namespace) -> int:
             )
     print(f"  {len(rooms)} rooms")
 
-    # Stage 8: surfaces.  Surface dimensions are metric geometry, so do not
-    # fabricate a wall grid height when the ceiling was not observed.
+    # Stage 8: surfaces/openings. Geometry remains the default source. RGB
+    # and RoomFormer evidence is optional and must earn a wall association and
+    # valid depth before it can enter the same normalized opening contract.
     with timings.stage("surfaces"):
         surface_grids = {}
-        openings = []
+        geometry_openings = []
         if gravity.ceiling_observed and ceiling is not None:
             for wall in walls:
                 if wall.length < 0.6:
@@ -278,10 +281,86 @@ def run(args: argparse.Namespace) -> int:
                     wall, frame, points, gravity.floor_height, ceiling
                 )
                 surface_grids[wall.index] = surface
-                openings.extend(find_openings(surface))
+                geometry_openings.extend(find_openings(surface))
         else:
             warnings.append("ceiling not observed; wall opening heights are unavailable")
-    print(f"  {len(openings)} openings")
+
+        opening_rejections = []
+        roomformer_openings = []
+        predictions_path = getattr(args, "roomformer_predictions", None)
+        if predictions_path:
+            try:
+                from .roomformer import RoomFormerSDTQAdapter
+
+                predictions = json.loads(Path(predictions_path).read_text())
+                roomformer_adapter = RoomFormerSDTQAdapter(
+                    min_confidence=getattr(args, "roomformer_min_confidence", 0.25)
+                )
+                roomformer_openings = roomformer_adapter.adapt(
+                    predictions, walls=walls
+                )
+                opening_rejections.extend(roomformer_adapter.rejections)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                warnings.append(f"RoomFormer opening predictions unavailable: {exc}")
+
+        rgb_openings = []
+        if getattr(args, "rgb_openings", False):
+            with timings.stage("rgb openings"):
+                if not bundle.has_depth:
+                    warnings.append("RGB opening detection skipped: calibrated depth is unavailable")
+                elif not getattr(args, "grounding_dino_model", None) or not getattr(args, "sam2_checkpoint", None) or not getattr(args, "sam2_config", None):
+                    warnings.append(
+                        "RGB opening detection skipped: provide local Grounding DINO, SAM2 checkpoint, and SAM2 config paths"
+                    )
+                else:
+                    try:
+                        from .rgb_openings import (
+                            GroundingDINOAdapter,
+                            ModelUnavailable,
+                            SAM2Adapter,
+                            detect_rgb_openings_with_diagnostics,
+                        )
+
+                        detector = GroundingDINOAdapter(
+                            getattr(args, "grounding_dino_model"),
+                            box_threshold=getattr(args, "rgb_box_threshold", 0.30),
+                            text_threshold=getattr(args, "rgb_text_threshold", 0.25),
+                            device=getattr(args, "rgb_device", "cuda"),
+                        )
+                        refiner = SAM2Adapter(
+                            getattr(args, "sam2_checkpoint"),
+                            model_cfg=getattr(args, "sam2_config"),
+                            device=getattr(args, "rgb_device", "cuda"),
+                        )
+                        rgb_result = detect_rgb_openings_with_diagnostics(
+                            bundle,
+                            poses,
+                            frame,
+                            walls,
+                            detector=detector,
+                            refiner=refiner,
+                            surface_grids=surface_grids,
+                            floor_height=gravity.floor_height,
+                            ceiling_height=ceiling,
+                            max_frames=getattr(args, "opening_frames", 40),
+                            min_detection_confidence=getattr(args, "rgb_min_confidence", 0.35),
+                        )
+                        rgb_openings = rgb_result.openings
+                        opening_rejections.extend(
+                            item.to_dict() if hasattr(item, "to_dict") else item
+                            for item in rgb_result.rejected
+                        )
+                    except ModelUnavailable as exc:
+                        warnings.append(f"RGB opening detection unavailable: {exc}")
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        warnings.append(f"RGB opening detection failed: {exc}")
+
+        openings = fuse_openings(geometry_openings + roomformer_openings + rgb_openings)
+    print(
+        f"  {len(openings)} openings "
+        f"({len(geometry_openings)} geometry, {len(rgb_openings)} RGB, "
+        f"{len(roomformer_openings)} RoomFormer)"
+    )
 
     # Stage 9: damage
     regions = []
@@ -341,6 +420,7 @@ def run(args: argparse.Namespace) -> int:
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
             line_items, drift, drift_report, surface_grids, uncertainty,
             timings, warnings, engine, reconstruction.contract_report,
+            opening_rejections,
         )
         export.write_json(result, out_dir / "result.json")
         problems = export.validate(result, REPO_ROOT / "schema" / "result.schema.json")
@@ -357,6 +437,7 @@ def run(args: argparse.Namespace) -> int:
         )
         export.export_scope_csv(result, out_dir)
         export.export_reconstruction(reconstruction, out_dir)
+        export.export_openings_csv(result, out_dir)
 
     result["diagnostics"]["timings_s"]["total"] = round(time.time() - total_start, 2)
     export.write_json(result, out_dir / "result.json")
@@ -618,6 +699,8 @@ def _infer_adjacency_via(
     for opening in openings:
         if opening.kind not in ("door", "pass-through"):
             continue
+        if opening.wall_index is None:
+            continue
         wall = walls_by_index.get(opening.wall_index)
         if wall is None or wall.room_id not in (room_a.id, room_b.id):
             continue
@@ -631,7 +714,7 @@ def _infer_adjacency_via(
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
-    timings, warnings, engine, fusion_report=None,
+    timings, warnings, engine, fusion_report=None, opening_rejections=None,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -710,20 +793,64 @@ def _assemble(
     for opening in openings:
         grid = surface_grids.get(opening.wall_index)
         resolution = grid.resolution if grid else 0.04
+        width = (
+            uncertainty.opening_width(
+                opening.width,
+                resolution,
+                opening.confidence,
+                _opening_sigma(opening, "u_sigma_m"),
+            ).to_dict()
+            if opening.width is not None
+            else None
+        )
+        height = (
+            uncertainty.opening_width(
+                opening.height,
+                resolution,
+                opening.confidence,
+                _opening_sigma(opening, "v_sigma_m"),
+            ).to_dict()
+            if opening.height is not None
+            else None
+        )
         opening_docs.append(
             {
-                "wall": wall_names.get(opening.wall_index, f"wall_{opening.wall_index}"),
+                "wall": (
+                    wall_names.get(opening.wall_index, f"wall_{opening.wall_index}")
+                    if opening.wall_index is not None
+                    else None
+                ),
                 "kind": opening.kind,
-                "width": uncertainty.opening_width(
-                    opening.width, resolution, opening.confidence
-                ).to_dict(),
-                "height": uncertainty.opening_width(
-                    opening.height, resolution, opening.confidence
-                ).to_dict(),
-                "sill_height": round(opening.sill_height, 3),
-                "header_height": round(opening.header_height, 3),
-                "u_offset": round(opening.u_range[0], 3),
+                "width": width,
+                "height": height,
+                "sill_height": round(opening.sill_height, 3) if opening.sill_height is not None else None,
+                "header_height": round(opening.header_height, 3) if opening.header_height is not None else None,
+                "u_offset": round(opening.u_range[0], 3) if opening.u_range is not None else None,
+                "u_range": [round(v, 3) for v in opening.u_range] if opening.u_range is not None else None,
+                "v_range": [round(v, 3) for v in opening.v_range] if opening.v_range is not None else None,
                 "confidence": round(opening.confidence, 3),
+                "source": opening.source,
+                "state": opening.state,
+                "measurement_state": opening.state,
+                "provenance": opening.provenance,
+                "uncertainty": opening.uncertainty,
+                "wall_association": (
+                    {
+                        "wall_index": opening.wall_index,
+                        "confidence": round(opening.wall_association_confidence, 3),
+                        "distance_m": (
+                            round(opening.wall_distance_m, 4)
+                            if opening.wall_distance_m is not None
+                            else None
+                        ),
+                    }
+                    if opening.wall_index is not None
+                    else None
+                ),
+                "source_frames": opening.source_frames,
+                "observation_count": opening.observation_count,
+                "depth_support": opening.depth_support,
+                "mask_method": opening.mask_method,
             }
         )
 
@@ -840,9 +967,19 @@ def _assemble(
                 "coverage_target": uncertainty.coverage,
             },
             "fusion": fusion_report or {},
+            "opening_rejections": list(opening_rejections or []),
             "warnings": warnings,
         },
     }
+
+
+def _opening_sigma(opening, key: str) -> float:
+    """Read a numeric source-specific sigma without trusting free-form metadata."""
+    try:
+        value = opening.uncertainty.get(key, 0.0)
+        return max(0.0, float(value))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -914,6 +1051,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     runner.add_argument("--damage-frames", type=int, default=40)
     runner.add_argument("--min-views", type=int, default=2)
+    runner.add_argument(
+        "--rgb-openings", action="store_true",
+        help="enable optional local Grounding DINO + SAM2 door/window detection",
+    )
+    runner.add_argument(
+        "--grounding-dino-model",
+        help="local Grounding DINO checkpoint directory (no model download is attempted)",
+    )
+    runner.add_argument(
+        "--sam2-checkpoint",
+        help="local SAM2 checkpoint path (no model download is attempted)",
+    )
+    runner.add_argument(
+        "--sam2-config",
+        help="local SAM2 model config path",
+    )
+    runner.add_argument(
+        "--rgb-device", default="cuda",
+        help="device for explicitly enabled RGB models (default: cuda)",
+    )
+    runner.add_argument("--opening-frames", type=int, default=40)
+    runner.add_argument("--rgb-box-threshold", type=float, default=0.30)
+    runner.add_argument("--rgb-text-threshold", type=float, default=0.25)
+    runner.add_argument("--rgb-min-confidence", type=float, default=0.35)
+    runner.add_argument(
+        "--roomformer-predictions",
+        help="JSON file containing precomputed RoomFormer SD-TQ predictions",
+    )
+    runner.add_argument("--roomformer-min-confidence", type=float, default=0.25)
     runner.add_argument(
         "--min-detection-confidence", type=float, default=0.0,
         help="drop VLM detections (any class, including furniture) below "
