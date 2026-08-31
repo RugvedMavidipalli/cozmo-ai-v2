@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from cozmo_ai_v2.pipeline.geometry import GravityEstimate, estimate_gravity
+from cozmo_ai_v2.pipeline.geometry import (
+    GravityEstimate,
+    _plane_fit_from_candidate,
+    estimate_gravity,
+)
 from cozmo_ai_v2.pipeline.planes import (
     HorizontalFrame,
     WallSegment,
@@ -80,6 +85,79 @@ def test_gravity_does_not_promote_wall_extent_to_ceiling():
     assert gravity.ceiling_confidence == 0.0
     mask = wall_band_mask(points, normals, gravity, gravity.up)
     assert not mask[heights > 1.9].any()
+
+
+@pytest.mark.parametrize(
+    ("floor_sigma", "expected_status"),
+    [(0.039, "high_confidence"), (0.0433, "low_confidence")],
+)
+def test_floor_quality_is_adaptive_at_the_40mm_boundary(floor_sigma, expected_status):
+    rng = np.random.default_rng(123)
+    floor = rng.normal(0.0, floor_sigma, 1000)
+    wall = rng.uniform(0.1, 2.4, 1000)
+    heights = np.concatenate((floor, wall))
+    points = np.column_stack(
+        (rng.uniform(-2.0, 2.0, len(heights)), rng.uniform(-2.0, 2.0, len(heights)), heights)
+    )
+    normals = np.concatenate(
+        (
+            np.tile([0.0, 0.0, 1.0], (len(floor), 1)),
+            np.tile([1.0, 0.0, 0.0], (len(wall), 1)),
+        )
+    )
+
+    gravity = estimate_gravity(points, np.array([0.0, 0.0, 1.0]), normals)
+
+    assert gravity.floor_observed is True
+    assert gravity.floor_quality_status == expected_status
+    assert gravity.floor_inlier_count >= 900
+    assert 0.4 < gravity.floor_support_fraction < 0.6
+    assert gravity.floor_residual_rms > 0.0
+    assert gravity.floor_confidence > 0.0
+    assert gravity.floor_adaptive_residual_limit >= gravity.floor_residual_rms
+    assert gravity.floor_low_confidence is (expected_status == "low_confidence")
+
+
+def test_floor_quality_boundary_changes_status_not_plane_presence():
+    at_target = _plane_fit_from_candidate(
+        (0.0, 100, 0.04, 1.0, 0.02), minimum_support=20, total_count=200
+    )
+    over_target = _plane_fit_from_candidate(
+        (0.0, 100, 0.040001, 1.0, 0.02), minimum_support=20, total_count=200
+    )
+
+    assert at_target.observed is True
+    assert at_target.quality_status == "high_confidence"
+    assert over_target.observed is True
+    assert over_target.quality_status == "low_confidence"
+    assert over_target.low_confidence is True
+    assert over_target.confidence > 0.0
+
+
+def test_missing_ceiling_does_not_block_room_polygonization():
+    walls = [
+        _wall(0, [0, 0], [4, 0], [0, 1]),
+        _wall(1, [4, 0], [4, 3], [1, 0]),
+        _wall(2, [4, 3], [0, 3], [0, 1]),
+        _wall(3, [0, 3], [0, 0], [1, 0]),
+    ]
+    frame = HorizontalFrame(
+        up=np.array([0.0, 0.0, 1.0]),
+        right=np.array([1.0, 0.0, 0.0]),
+        forward=np.array([0.0, 1.0, 0.0]),
+        yaw=0.0,
+        manhattan_fraction=1.0,
+    )
+    rng = np.random.default_rng(99)
+    floor_points = np.column_stack(
+        (rng.uniform(0.1, 3.9, 3000), rng.uniform(0.1, 2.9, 3000), rng.normal(0.0, 0.01, 3000))
+    )
+    grid = build_plan_grid(floor_points, frame, 0.0, None)
+
+    rooms = segment_rooms(grid, walls, frame, 0.0, None)
+
+    assert len(rooms) == 1
+    assert rooms[0].ceiling_height is None
 
 
 def test_geometry_degenerate_inputs_are_finite_and_conservative():

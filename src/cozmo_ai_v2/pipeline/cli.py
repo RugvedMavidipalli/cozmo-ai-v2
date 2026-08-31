@@ -428,6 +428,15 @@ def run(args: argparse.Namespace) -> int:
     )
     if gravity.room_height is None:
         warnings.append("no ceiling plane found; heights are unavailable")
+    if gravity.floor_low_confidence:
+        warnings.append(
+            "floor plane is low confidence: "
+            f"{gravity.floor_residual_rms * 1000.0:.1f} mm RMS over "
+            f"{gravity.floor_inlier_count} points "
+            f"(adaptive limit {gravity.floor_adaptive_residual_limit * 1000.0:.1f} mm)"
+        )
+    elif not gravity.floor_observed:
+        warnings.append("floor plane was not observed with sufficient support")
 
     # Stage 6: wall refinement
     with timings.stage("wall refinement"):
@@ -1406,6 +1415,15 @@ def _assemble(
             "ceiling_observed": bool(gravity.ceiling_observed),
             "ceiling_confidence": round(float(gravity.ceiling_confidence), 4),
             "floor_confidence": round(float(gravity.floor_confidence), 4),
+            "floor_observed": bool(gravity.floor_observed),
+            "floor_quality_status": gravity.floor_quality_status,
+            "floor_low_confidence": bool(gravity.floor_low_confidence),
+            "floor_support_fraction": round(float(gravity.floor_support_fraction), 4),
+            "floor_adaptive_residual_limit_mm": round(
+                float(gravity.floor_adaptive_residual_limit * 1000.0), 3
+            ),
+            "floor_inlier_count": int(gravity.floor_inlier_count),
+            "floor_residual_rms_mm": round(float(gravity.floor_residual_rms * 1000.0), 3),
             "manhattan_yaw_deg": round(float(np.degrees(frame.yaw)), 3),
             "manhattan_fraction": round(frame.manhattan_fraction, 4),
             "walls": wall_docs,

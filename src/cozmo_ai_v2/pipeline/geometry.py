@@ -28,6 +28,11 @@ class GravityEstimate:
         inlier_fraction: What share of all the points fall close to either
             the floor or the ceiling. A low value is a sign that the
             floor/ceiling heights found here might not be very trustworthy.
+        floor_observed: Whether any supported floor candidate was observed;
+            this is independent of the floor quality threshold.
+        floor_quality_status: ``high_confidence`` or ``low_confidence`` for
+            a supported candidate, with the residual/support evidence kept
+            in the remaining floor fields.
     """
 
     up: np.ndarray
@@ -40,6 +45,11 @@ class GravityEstimate:
     ceiling_observed: bool = True
     ceiling_confidence: float = 0.0
     floor_confidence: float = 0.0
+    floor_observed: bool = False
+    floor_quality_status: str = "unknown"
+    floor_low_confidence: bool = False
+    floor_support_fraction: float = 0.0
+    floor_adaptive_residual_limit: float = 0.0
     floor_inlier_count: int = 0
     ceiling_inlier_count: int = 0
     floor_residual_rms: float = 0.0
@@ -63,7 +73,26 @@ class GravityEstimate:
             self.ceiling_inlier_count = 0
             self.ceiling_residual_rms = None
         self.ceiling_confidence = float(np.clip(self.ceiling_confidence, 0.0, 1.0))
-        self.floor_confidence = float(np.clip(self.floor_confidence, 0.0, 1.0))
+        self.floor_confidence = float(
+            np.clip(self.floor_confidence, 0.0, 1.0)
+            if np.isfinite(self.floor_confidence)
+            else 0.0
+        )
+        self.floor_support_fraction = float(
+            np.clip(self.floor_support_fraction, 0.0, 1.0)
+            if np.isfinite(self.floor_support_fraction)
+            else 0.0
+        )
+        self.floor_adaptive_residual_limit = float(
+            max(0.0, self.floor_adaptive_residual_limit)
+            if np.isfinite(self.floor_adaptive_residual_limit)
+            else 0.0
+        )
+        self.floor_quality_status = str(self.floor_quality_status or "unknown")
+        self.floor_low_confidence = bool(
+            self.floor_low_confidence
+            or self.floor_quality_status == "low_confidence"
+        )
         self.inlier_fraction = float(
             np.clip(self.inlier_fraction, 0.0, 1.0)
             if np.isfinite(self.inlier_fraction)
@@ -151,6 +180,11 @@ def estimate_gravity(
         ceiling_observed=fit.ceiling.observed,
         ceiling_confidence=fit.ceiling.confidence,
         floor_confidence=fit.floor.confidence,
+        floor_observed=fit.floor.observed,
+        floor_quality_status=fit.floor.quality_status,
+        floor_low_confidence=fit.floor.low_confidence,
+        floor_support_fraction=fit.floor.support_fraction,
+        floor_adaptive_residual_limit=fit.floor.adaptive_residual_limit,
         floor_inlier_count=fit.floor.inlier_count,
         ceiling_inlier_count=fit.ceiling.inlier_count,
         floor_residual_rms=fit.floor.residual_rms,
@@ -199,13 +233,28 @@ def _refine_up(
 
 @dataclass(frozen=True)
 class PlaneFit:
-    """A robust one-dimensional fit of a horizontal plane."""
+    """A robust one-dimensional fit of a horizontal plane.
+
+    ``observed`` means the point cloud contains a supported candidate; it is
+    intentionally separate from ``quality_status``.  A floor just beyond
+    the 40 mm high-confidence target is therefore still reported with its
+    height, support, residual, adaptive limit, and ``low_confidence=True``.
+    """
 
     height: float | None
     inlier_count: int
     residual_rms: float
     confidence: float
     observed: bool
+    quality_status: str = "unknown"
+    low_confidence: bool = False
+    support_fraction: float = 0.0
+    adaptive_residual_limit: float = 0.0
+
+    @property
+    def status(self) -> str:
+        """Readable alias for the quality status in reports."""
+        return self.quality_status
 
 
 @dataclass(frozen=True)
@@ -275,7 +324,7 @@ def _fit_horizontal_planes(
         floor_seed = float(np.quantile(values, 0.02))
         peak_indices = [int(np.argmin(np.abs(centers - floor_seed)))]
 
-    candidates: list[tuple[float, int, float, float]] = []
+    candidates: list[tuple[float, int, float, float, float]] = []
     for index in peak_indices:
         seed = float(centers[index])
         near = np.abs(values - seed) <= plane_band
@@ -300,13 +349,20 @@ def _fit_horizontal_planes(
             if count
             else residual
         )
+        signed_deviations = values[inlier_mask] - fitted
+        candidate_mad = (
+            float(np.median(np.abs(signed_deviations - np.median(signed_deviations))))
+            if count
+            else 0.0
+        )
+        robust_sigma = max(0.005, 1.4826 * candidate_mad)
         wide = np.abs(values - fitted) <= min(0.4, max(4 * plane_band, 0.2))
         local_background = max(int(wide.sum()) - count, 1)
         prominence = count / local_background
         normal_quality = 1.0
         if alignment is not None and count:
             normal_quality = float(np.mean(alignment[inlier_mask]))
-        candidates.append((fitted, count, rms, prominence * normal_quality))
+        candidates.append((fitted, count, rms, prominence * normal_quality, robust_sigma))
 
     if not candidates:
         floor = PlaneFit(float(np.quantile(values, 0.02)), 0, 0.0, 0.0, False)
@@ -314,20 +370,11 @@ def _fit_horizontal_planes(
 
     floor_candidate = min(candidates, key=lambda item: (item[0], -item[1], item[2]))
     floor_minimum_support = max(20, int(np.ceil(0.03 * len(values))))
-    floor = (
-        _plane_fit_from_candidate(floor_candidate, minimum_support=1)
-        if (
-            floor_candidate[1] >= floor_minimum_support
-            and floor_candidate[2] <= 0.04
-            and floor_candidate[3] >= 0.35
-        )
-        else PlaneFit(
-            float(floor_candidate[0]),
-            int(floor_candidate[1]),
-            float(floor_candidate[2]),
-            0.0,
-            False,
-        )
+    floor = _plane_fit_from_candidate(
+        floor_candidate,
+        minimum_support=floor_minimum_support,
+        require_quality=True,
+        total_count=len(values),
     )
 
     ceiling_candidates = [
@@ -350,7 +397,11 @@ def _fit_horizontal_planes(
             ceiling_candidate = candidate
 
     ceiling = (
-        _plane_fit_from_candidate(ceiling_candidate, minimum_support=minimum_support)
+        _plane_fit_from_candidate(
+            ceiling_candidate,
+            minimum_support=minimum_support,
+            total_count=len(values),
+        )
         if ceiling_candidate is not None
         else PlaneFit(None, 0, 0.0, 0.0, False)
     )
@@ -401,15 +452,61 @@ def _robust_location(values: np.ndarray, band: float) -> tuple[float, int, float
 
 
 def _plane_fit_from_candidate(
-    candidate: tuple[float, int, float, float], minimum_support: int
+    candidate: tuple[float, int, float, float, float],
+    minimum_support: int,
+    require_quality: bool = False,
+    total_count: int | None = None,
 ) -> PlaneFit:
-    height, count, residual, quality = candidate
+    height, count, residual, quality = candidate[:4]
+    robust_sigma = candidate[4] if len(candidate) > 4 else max(0.005, residual)
     support_score = min(1.0, count / max(minimum_support, 1))
     residual_score = float(np.exp(-residual / 0.04))
     # Quality is allowed to influence confidence but cannot make an
     # otherwise well-supported plane disappear from the output.
     quality_score = min(1.0, max(0.0, quality))
-    confidence = float(
+    base_confidence = float(
         np.clip(0.45 * support_score + 0.35 * residual_score + 0.20 * quality_score, 0.0, 1.0)
     )
-    return PlaneFit(float(height), int(count), float(residual), confidence, True)
+    # A 40 mm RMS floor is a useful high-confidence target, not a cliff at
+    # which a physically supported plane disappears.  The adaptive bound is
+    # driven by robust residual scale and is capped to avoid accepting a
+    # broad wall/outlier population as a floor.  Support still affects both
+    # the confidence and whether the candidate is considered reportable.
+    adaptive_limit = float(np.clip(max(0.04, 2.5 * robust_sigma + 0.01), 0.04, 0.12))
+    has_support = count >= max(int(minimum_support), 1)
+    has_quality = quality >= 0.35
+    adaptive_ok = residual <= adaptive_limit
+    strict_ok = residual <= 0.04
+    observed = bool(count > 0)
+    if strict_ok and has_support and has_quality:
+        quality_status = "high_confidence"
+        low_confidence = False
+        confidence = base_confidence
+    elif (not require_quality or (has_support and has_quality)) and adaptive_ok:
+        quality_status = "low_confidence"
+        low_confidence = True
+        # Keep the quality signal useful while clearly below the strict
+        # target; callers can make their own acceptance decision.
+        confidence = float(0.65 * base_confidence)
+    else:
+        quality_status = "low_confidence"
+        low_confidence = True
+        confidence = float(0.35 * base_confidence)
+    support_fraction = float(
+        np.clip(
+            count / max(int(total_count or minimum_support), 1),
+            0.0,
+            1.0,
+        )
+    )
+    return PlaneFit(
+        float(height),
+        int(count),
+        float(residual),
+        confidence,
+        observed,
+        quality_status,
+        low_confidence,
+        support_fraction,
+        adaptive_limit,
+    )
