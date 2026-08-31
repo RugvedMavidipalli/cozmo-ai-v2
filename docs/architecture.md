@@ -57,13 +57,22 @@ output feeds the next:
    boxes and SAM2 masks; `--roomformer-predictions` adapts precomputed
    RoomFormer SD-TQ hints. All sources share `NormalizedOpening`, and only
    wall-associated masks with valid calibrated depth become metric evidence.
-9. **damage** (`cli._damage_pass`, skippable with `--no-damage`) — Track B in full:
+9. **measurements** (`measurements.measure_scene`) — metric wall lengths, room
+   interior-face/centerline/outer areas, perpendicular floor-to-ceiling height
+   statistics, wall inlier extents, and observed-only thickness. The primary
+   area is the interior-face area. It consumes finite extents, plane
+   intersections, and bounded faces supplied by the geometry stages; it does
+   not close the graph or polygonize raster corners. Missing or low-confidence
+   faces are explicitly unmeasured. An explicit marker/tape/user reference can
+   be checked with `validate-scale`; door sizes remain advisory and never
+   silently calibrate the capture.
+10. **damage** (`cli._damage_pass`, skippable with `--no-damage`) — Track B in full:
    keyframe selection, VLM detection, mask refinement, fusion into per-surface
    regions. See track-b-damage-intelligence.md.
-10. **scope** (`scope.ScopeEngine.build`) — Track C: `rules.yaml` applied to the
-    damage regions from stage 9, producing line items and concealed-damage flags. See
+11. **scope** (`scope.ScopeEngine.build`) — Track C: `rules.yaml` applied to the
+   damage regions from stage 10, producing line items and concealed-damage flags. See
     track-c-scope-generation.md.
-11. **export** — writes every output file listed below, then validates the assembled
+12. **export** — writes every output file listed below, then validates the assembled
     result against `schema/result.schema.json` (a validation failure is a warning, not
     a crash, but a non-empty problem list makes the CLI exit non-zero).
 
@@ -109,7 +118,7 @@ Everything below lands in `<out>/<capture-name>/` (or `--out`'s value directly):
 
 | File | From | Contents |
 |---|---|---|
-| `result.json` | export | The full schema-shaped result: capture metadata, reconstruction (walls, openings), rooms, adjacency, damage, concealed flags, scope line items, diagnostics (timings, drift, calibration status, warnings) |
+| `result.json` | export | The full schema-shaped result: capture metadata, reconstruction (walls, openings), plane-derived measurements (explicit area conventions, height statistics, thickness status, tolerance/confidence/evidence/review flags), rooms, adjacency, damage, concealed flags, scope line items, diagnostics |
 | `floorplan.svg` | `export.render_floorplan` | Dimensioned 2D floor plan — wall lengths with intervals, openings, occluded spans marked as inferred, damage shaded on its wall |
 | `scene.glb` | `export.export_scene` | 3D model: every wall, and (this session) every room's floor and ceiling, as individually named, selectable planes (`room_1.north_wall`, `room_1.floor`, `room_1.ceiling`) — no dense mesh; the raw fused surface lives separately in `cloud.ply` |
 | `cloud.ply` | fusion | Raw fused point cloud |

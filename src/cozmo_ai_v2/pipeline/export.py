@@ -941,18 +941,40 @@ def export_scope_csv(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
             [
                 "room", "room_area_m2", "ceiling_height_m", "wall",
                 "wall_length_m", "wall_length_ci_half_width_m",
+                "wall_length_confidence", "wall_length_status",
+                "wall_inlier_vertical_extent_m", "wall_thickness_m",
+                "wall_thickness_status", "room_interior_face_area_m2",
+                "room_interior_face_confidence",
+                "room_wall_centerline_area_m2", "room_outer_footprint_area_m2",
+                "height_min_m", "height_mean_m", "height_max_m",
             ]
         )
         for wall in result["reconstruction"]["walls"]:
             room = rooms_by_id.get(wall["room_id"])
+            heights = room.get("floor_to_ceiling_height") if room else None
+            thickness = wall.get("thickness") or {}
             writer.writerow(
                 [
                     room["name"] if room else "",
                     f"{room['area']['value']:.3f}" if room else "",
-                    f"{room['ceiling_height']['value']:.3f}" if room else "",
+                    f"{room['ceiling_height']['value']:.3f}"
+                    if room and room.get("ceiling_height") and room["ceiling_height"].get("value") is not None
+                    else "",
                     wall["name"],
-                    f"{wall['length']['value']:.3f}",
-                    f"{wall['length']['half_width']:.3f}",
+                    _csv_measurement_value(wall.get("length")),
+                    f"{wall['length'].get('half_width') or 0.0:.3f}",
+                    f"{wall['length'].get('confidence', '')}",
+                    wall["length"].get("status", "measured"),
+                    _csv_measurement_value(wall.get("inlier_vertical_extent")),
+                    _csv_measurement_value(thickness),
+                    thickness.get("status", "unmeasured"),
+                    _csv_measurement_value(room.get("interior_face_area") if room else None),
+                    room.get("interior_face_area", {}).get("confidence", "") if room else "",
+                    _csv_measurement_value(room.get("wall_centerline_area") if room else None),
+                    _csv_measurement_value(room.get("outer_footprint_area") if room else None),
+                    _csv_measurement_value(heights.get("min") if heights else None),
+                    _csv_measurement_value(heights.get("mean") if heights else None),
+                    _csv_measurement_value(heights.get("max") if heights else None),
                 ]
             )
 
@@ -984,6 +1006,13 @@ def export_scope_csv(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
             )
 
     return sketch_path, scope_path
+
+
+def _csv_measurement_value(measurement: dict | None) -> str:
+    """Return a blank for an explicit unmeasured metric in CSV exports."""
+    if not measurement or measurement.get("value") is None:
+        return ""
+    return f"{measurement['value']:.3f}"
 
 
 def export_openings_csv(result: dict, out_dir: str | Path) -> Path:

@@ -12,6 +12,7 @@ from .depth.model import Metric3Dv2Model, ModelUnavailableError
 from .detect import InputDetectionError, InputKind, detect_input
 from .intrinsics_writer import write_intrinsics_yaml
 from .manifest import build_manifest, write_manifest
+from .pipeline.measurements import validate_reference_scale
 from .video import VideoProbeError, probe_video
 
 
@@ -124,6 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     densify.add_argument("--device", default=None, help="inference device (cpu/cuda/mps)")
 
+    scale = subparsers.add_parser(
+        "validate-scale",
+        help="validate an explicit marker, tape, or user-supplied reference scale",
+    )
+    scale.add_argument(
+        "--reference-type", choices=["marker", "tape", "user", "door"], required=True,
+    )
+    scale.add_argument("--observed-m", type=float, required=True)
+    scale.add_argument("--known-m", type=float, required=True)
+    scale.add_argument("--tolerance-m", type=float)
+
     return parser
 
 
@@ -138,6 +150,17 @@ def main(argv: list[str] | None = None) -> int:
             args.min_confidence, args.max_depth, args.guide_radius, args.guide_eps,
             args.weights, args.metric3d_repository, args.device,
         )
+    if args.command == "validate-scale":
+        import json
+
+        validation = validate_reference_scale(
+            args.observed_m,
+            args.known_m,
+            reference_type=args.reference_type,
+            tolerance_m=args.tolerance_m,
+        )
+        print(json.dumps(validation.to_dict(), indent=2))
+        return 0 if validation.status in {"validated", "advisory"} else 1
     parser.error(f"unknown command: {args.command}")
     return 2
 

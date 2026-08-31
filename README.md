@@ -35,14 +35,15 @@ second run is offline and free.
 
 ```
 out/<capture>/
-  result.json                 # schema/result.schema.json — validated on every run
+  result.json                 # schema/result.schema.json — validated on every run;
+                              # TLS-plane measurements + tolerances/confidence
   floorplan.svg                # dimensioned plan: openings, inferred spans, damage overlay
   scene.glb                    # 3D reconstruction — every wall, plus each room's floor
                                 # and ceiling, as individually named, selectable planes
   cloud.ply                    # fused point cloud
   mesh.ply                     # triangle mesh extracted from the same TSDF volume
   fusion_manifest.json         # depth/pose provenance, frame decisions, and video availability
-  scope_sketch.csv             # room/wall geometry table (Xactimate-sketch-style export)
+  scope_sketch.csv             # room/wall geometry + area/height/thickness measurements
   scope_line_items.csv         # scope-of-work line items (action/material/qty/rule/source)
   damage_overlays/             # per-frame detection box + mask + label, full video
                                 # resolution, correctly oriented (present when damage is found)
@@ -83,12 +84,22 @@ out/<capture>/
 | `--roomformer-predictions` | — | Precomputed RoomFormer SD-TQ predictions; image-only hints stay unmeasured |
 | `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |
 | `--coverage` | `0.90` | Target confidence-interval coverage |
-| `--no-refine` | off | Use raw selected SLAM/ARKit poses. The pose-refinement ablation |
+| `--wall-thickness` | `0.15` | Explicit default thickness used only for centerline/outer area offsets when opposing faces are unmeasured |
+| `--reference-type`, `--reference-observed-m`, `--reference-known-m` | — | Validate an explicit marker/tape/user reference; the factor is reported but not applied automatically |
+| `--no-refine` | off | Use raw ARKit poses. The pose-refinement ablation |
 | `--no-loop-closure` | off | Refine sequentially only, without loop edges |
 | `--no-damage` | off | Geometry only; skips all API calls |
 | `--no-sam` | off | Local GrabCut masks instead of hosted SAM 2 |
 | `--debug-furniture` | off | Diagnostic: also ask the VLM to tag named furniture, to sanity-check it's resolving objects in the frame at all — never reaches `result.json` or scope. Prints counts only |
 | `--furniture-overlays` | off | With `--debug-furniture`, also write annotated images to `furniture_debug_overlays/` (otherwise only console counts are printed) |
+
+An explicit reference can also be checked without running reconstruction:
+
+```bash
+python -m pipeline validate-scale --reference-type tape --observed-m 2.01 --known-m 2.00
+```
+
+Door dimensions are reported as advisory only and never calibrate scale.
 
 ## Input formats
 
@@ -170,6 +181,14 @@ constraint the fitter cannot see — walls do not pass through each other — an
 each wall's offset is re-placed at the median of its per-visit offsets so the
 visit that lingered longest does not decide where the wall is. Result: drift
 median 9.9 mm (rec-1) / 10.3 mm (rec-2), inside the 2 cm gate's budget.
+
+**Measurements stay on the plane graph.** Stage 9 computes wall lengths and
+room boundaries from plane intersections, reports observed interior-face area
+as primary, and exposes centerline/outer areas only through documented
+thickness offsets. Opposing-face thickness is `unmeasured` unless both faces
+are observed; a configured default thickness is marked as an assumption for
+derived areas. Every Stage 9 quantity carries TLS residual/support/provenance
+evidence, tolerance, confidence, and manual-review flags.
 
 **Drift is measured by revisit spread, not by point scatter.** RMS scatter about
 a fitted wall is mostly depth noise, and a plane fit averages it away — it is

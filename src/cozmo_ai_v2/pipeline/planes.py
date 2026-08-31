@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
 
@@ -10,6 +10,181 @@ from .geometry import GravityEstimate
 
 if TYPE_CHECKING:
     from .geometry_diagnostics import GeometryDiagnostics
+
+
+@dataclass
+class TLSPlane:
+    """A structured plane record exchanged with the TLS geometry stages.
+
+    The measurement stage deliberately depends on this small contract rather
+    than on a raster or on a particular plane-fitting implementation.  A
+    plane is represented by ``normal . x = offset`` in world coordinates;
+    optional inlier points and provenance fields carry the evidence needed to
+    make honest confidence and tolerance estimates.  ``start``/``end`` are
+    optional finite extents for wall planes and are expressed in world
+    coordinates when present.
+
+    The fields after ``role`` are intentionally permissive.  Stage 6 can add
+    richer provenance without making Stage 9 depend on that branch landing at
+    the same time.
+    """
+
+    id: str | int
+    normal: np.ndarray
+    offset: float
+    role: str = "wall"
+    inlier_points: np.ndarray | None = None
+    inlier_count: int = 0
+    residual_rms: float = 0.0
+    support_density: float | None = None
+    start: np.ndarray | None = None
+    end: np.ndarray | None = None
+    observed: bool = True
+    pose_provenance: str = "unknown"
+    depth_provenance: str = "unknown"
+    calibration_status: str = "uncalibrated"
+    room_id: int | None = None
+    tags: list[str] = field(default_factory=list)
+    height_range: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        normal = np.asarray(self.normal, dtype=float).reshape(-1)
+        if normal.shape != (3,):
+            raise ValueError("TLS plane normal must have shape (3,)")
+        norm = float(np.linalg.norm(normal))
+        if not np.isfinite(norm) or norm <= 1e-9:
+            raise ValueError("TLS plane normal must be finite and non-zero")
+        self.normal = normal / norm
+        self.offset = float(self.offset)
+        if not np.isfinite(self.offset):
+            raise ValueError("TLS plane offset must be finite")
+        if self.inlier_points is not None:
+            points = np.asarray(self.inlier_points, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3:
+                raise ValueError("TLS plane inlier_points must have shape (N, 3)")
+            self.inlier_points = points[np.isfinite(points).all(axis=1)]
+            self.inlier_count = max(int(self.inlier_count), len(self.inlier_points))
+        self.inlier_count = max(int(self.inlier_count), 0)
+        self.residual_rms = max(float(self.residual_rms), 0.0)
+        if self.support_density is not None:
+            density = float(self.support_density)
+            self.support_density = density if np.isfinite(density) and density >= 0 else None
+        if self.start is not None:
+            self.start = np.asarray(self.start, dtype=float).reshape(-1)
+            if self.start.shape != (3,):
+                raise ValueError("TLS plane start must have shape (3,)")
+        if self.end is not None:
+            self.end = np.asarray(self.end, dtype=float).reshape(-1)
+            if self.end.shape != (3,):
+                raise ValueError("TLS plane end must have shape (3,)")
+        self.tags = list(self.tags)
+        if self.height_range is not None:
+            heights = np.asarray(self.height_range, dtype=float).reshape(-1)
+            if len(heights) < 2 or not np.isfinite(heights[:2]).all():
+                self.height_range = None
+            else:
+                self.height_range = (float(heights[0]), float(heights[1]))
+
+    @classmethod
+    def from_any(cls, value: object, *, default_id: str | int = "plane") -> "TLSPlane":
+        """Coerce a mapping or Stage 6-like object into the contract."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            get = value.get
+        else:
+            get = lambda key, default=None: getattr(value, key, default)
+        normal = get("normal", get("unit_normal"))
+        offset = get("offset", get("d", get("distance")))
+        if normal is None:
+            coefficients = get("coefficients", get("plane_equation"))
+            if coefficients is not None:
+                coefficients = np.asarray(coefficients, dtype=float).reshape(-1)
+                if coefficients.shape == (4,):
+                    normal = coefficients[:3]
+                    # The conventional TLS equation is ax+by+cz+d=0.
+                    offset = -float(coefficients[3])
+        if normal is None or offset is None:
+            raise ValueError("TLS plane requires normal and offset")
+        inliers = get("inlier_points", get("inliers"))
+        if isinstance(inliers, (int, float, np.integer, np.floating)):
+            inlier_count = int(inliers)
+            inliers = None
+        else:
+            inlier_count = int(get("inlier_count", get("support_points", 0)) or 0)
+        provenance = get("provenance", {})
+        if not isinstance(provenance, Mapping):
+            provenance = {}
+        calibration = get("calibration_status", get("calibration", provenance.get("calibration", "uncalibrated")))
+        if isinstance(calibration, bool):
+            calibration = "calibrated" if calibration else "uncalibrated"
+        return cls(
+            id=get("id", get("plane_id", default_id)),
+            normal=normal,
+            offset=offset,
+            role=str(get("role", get("kind", "wall"))),
+            inlier_points=inliers,
+            inlier_count=inlier_count,
+            residual_rms=float(get("residual_rms", get("residual_rms_m", get("rms", 0.0))) or 0.0),
+            support_density=get("support_density", get("density")),
+            start=get("start", get("endpoint_a")),
+            end=get("end", get("endpoint_b")),
+            observed=bool(get("observed", get("is_observed", True))),
+            pose_provenance=str(get("pose_provenance", get("pose_source", provenance.get("pose", "unknown")))),
+            depth_provenance=str(get("depth_provenance", get("depth_source", provenance.get("depth", "unknown")))),
+            calibration_status=str(calibration),
+            room_id=get("room_id"),
+            tags=list(get("tags", []) or []),
+            height_range=get("height_range", get("vertical_extent")),
+        )
+
+
+@dataclass
+class TLSPlaneModel:
+    """Container contract for structured TLS planes and their intersections."""
+
+    planes: list[TLSPlane] = field(default_factory=list)
+    intersections: list[object] = field(default_factory=list)
+    floor_plane: TLSPlane | None = None
+    ceiling_planes: list[TLSPlane] = field(default_factory=list)
+    pose_provenance: str = "unknown"
+    depth_provenance: str = "unknown"
+    calibration_status: str = "uncalibrated"
+
+    def __post_init__(self) -> None:
+        plane_values = (
+            [self.planes]
+            if isinstance(self.planes, Mapping) or hasattr(self.planes, "normal")
+            else list(self.planes or [])
+        )
+        self.planes = [TLSPlane.from_any(plane, default_id=i) for i, plane in enumerate(plane_values)]
+        if self.floor_plane is not None:
+            self.floor_plane = TLSPlane.from_any(self.floor_plane, default_id="floor")
+        ceiling_values = (
+            [self.ceiling_planes]
+            if isinstance(self.ceiling_planes, Mapping) or hasattr(self.ceiling_planes, "normal")
+            else list(self.ceiling_planes or [])
+        )
+        self.ceiling_planes = [
+            TLSPlane.from_any(plane, default_id=f"ceiling_{i}")
+            for i, plane in enumerate(ceiling_values)
+        ]
+
+    @property
+    def wall_planes(self) -> list[TLSPlane]:
+        return [
+            plane
+            for plane in self.planes
+            if plane.role.lower() in {"wall", "wall_face", "vertical"}
+        ]
+
+
+# Names used by early geometry prototypes and by the forthcoming Stage 6
+# branch.  Keeping these aliases costs nothing and lets the measurement layer
+# consume either spelling during the transition.
+Plane3D = TLSPlane
+StructuredTLSPlane = TLSPlane
+TLSModel = TLSPlaneModel
 
 
 @dataclass

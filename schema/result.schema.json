@@ -156,7 +156,15 @@
             "room_segmentation": { "type": "object" },
             "zero_room_reasons": { "type": "array", "items": { "type": "string" } }
           }
-        }
+        },
+        "scale_validation": {
+          "oneOf": [
+            { "$ref": "#/$defs/scale_validation" },
+            { "type": "null" }
+          ]
+        },
+        "measurement_conventions": { "type": ["object", "null"] },
+        "warnings": { "type": "array", "items": { "type": "string" } }
       }
     }
   },
@@ -282,15 +290,62 @@
     },
     "measurement": {
       "type": "object",
-      "description": "A value with a calibrated confidence interval.",
+      "description": "A value with a confidence interval, or an explicit unmeasured status when the TLS evidence is insufficient.",
       "required": ["value", "ci_low", "ci_high", "coverage"],
       "properties": {
-        "value": { "type": "number" },
-        "ci_low": { "type": "number" },
-        "ci_high": { "type": "number" },
-        "half_width": { "type": "number" },
+        "value": { "type": ["number", "null"] },
+        "ci_low": { "type": ["number", "null"] },
+        "ci_high": { "type": ["number", "null"] },
+        "half_width": { "type": ["number", "null"] },
+        "tolerance": { "type": ["number", "null"] },
         "coverage": { "type": "number" },
-        "basis": { "type": "string", "description": "How the interval was derived." }
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": {
+          "type": "string",
+          "enum": ["measured", "estimated", "advisory", "unmeasured"]
+        },
+        "basis": { "type": "string", "description": "How the interval was derived." },
+        "flags": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "$ref": "#/$defs/measurement_evidence" }
+      }
+    },
+    "measurement_evidence": {
+      "type": "object",
+      "properties": {
+        "tls_residual_rms_m": { "type": "number", "minimum": 0 },
+        "support_points": { "type": "integer", "minimum": 0 },
+        "support_density_per_m2": { "type": ["number", "null"], "minimum": 0 },
+        "pose_provenance": { "type": "string" },
+        "depth_provenance": { "type": "string" },
+        "calibration_status": { "type": "string" },
+        "pose_uncertainty_m": { "type": "number", "minimum": 0 }
+      }
+    },
+    "scale_validation": {
+      "type": "object",
+      "required": ["reference_type", "status", "applied"],
+      "properties": {
+        "reference_type": { "type": "string", "enum": ["marker", "tape", "user", "door"] },
+        "observed_length_m": { "type": ["number", "null"] },
+        "known_length_m": { "type": ["number", "null"] },
+        "recommended_scale_factor": { "type": ["number", "null"] },
+        "tolerance": { "type": ["number", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": { "type": "string", "enum": ["validated", "advisory", "unmeasured"] },
+        "flags": { "type": "array", "items": { "type": "string" } },
+        "basis": { "type": "string" },
+        "applied": { "type": "boolean" }
+      }
+    },
+    "height_statistics": {
+      "type": "object",
+      "required": ["min", "mean", "max", "primary"],
+      "properties": {
+        "min": { "$ref": "#/$defs/measurement" },
+        "mean": { "$ref": "#/$defs/measurement" },
+        "max": { "$ref": "#/$defs/measurement" },
+        "primary": { "type": "string", "enum": ["mean"] },
+        "convention": { "type": "string" }
       }
     },
     "wall": {
@@ -305,6 +360,18 @@
         "normal": { "$ref": "#/$defs/point2" },
         "length": { "$ref": "#/$defs/measurement" },
         "height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "inlier_vertical_extent": {
+          "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }]
+        },
+        "thickness": {
+          "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }]
+        },
+        "wall_thickness": {
+          "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }]
+        },
+        "geometry_source": { "type": "string" },
+        "corner_intersections": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "opposing_face_id": { "type": ["string", "integer", "null"] },
         "inferred_fraction": {
           "type": "number",
           "description": "Share of the wall reconstructed behind furniture rather than directly observed."
@@ -374,6 +441,14 @@
         "name": { "type": "string" },
         "area": { "$ref": "#/$defs/measurement" },
         "ceiling_height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "interior_face_area": { "$ref": "#/$defs/measurement" },
+        "wall_centerline_area": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "outer_footprint_area": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "areas": { "type": ["object", "null"] },
+        "floor_to_ceiling_height": {
+          "oneOf": [{ "$ref": "#/$defs/height_statistics" }, { "type": "null" }]
+        },
+        "area_convention": { "type": ["object", "null"] },
         "perimeter": { "type": "number" },
         "centroid": { "$ref": "#/$defs/point2" },
         "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
