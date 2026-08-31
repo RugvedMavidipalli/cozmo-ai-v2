@@ -1,0 +1,11 @@
+kind,name,value,notes
+# Laser ground truth. One row per measurement, values in METRES.
+# `name` must match the surface_ref / room name in result.json.
+# kind: wall_length | ceiling_height | floor_area | opening_width | damage_area
+# opening_width names are "<wall_name>:<door|window>".
+wall_length,room_1.north_wall,3.412,laser along baseboard
+wall_length,room_1.east_wall,4.105,
+ceiling_height,room_1,2.436,mean of 3 spots
+floor_area,room_1,14.01,from laser wall lengths
+opening_width,room_1.north_wall:door,0.812,rough opening
+damage_area,room_1.north_wall,1.85,taped extent of staged water stain

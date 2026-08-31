@@ -1,0 +1,15 @@
+numpy<2
+scipy
+opencv-python-headless
+open3d==0.19.0
+shapely
+trimesh
+pyyaml
+jsonschema
+svgwrite
+matplotlib
+anthropic
+replicate
+python-dotenv
+scikit-image
+networkx
