@@ -82,6 +82,31 @@ class DriftReport:
     pose_convention: str = STRAY_ODOMETRY_CONVENTION
     stages: dict[str, float] = field(default_factory=dict)
 
+    def diagnostics(self) -> dict[str, object]:
+        """Return JSON-safe refinement provenance for the result manifest."""
+
+        return {
+            "accepted": not self.rejected,
+            "rejected": self.rejected,
+            "pose_source": self.pose_source,
+            "pose_convention": self.pose_convention,
+            "keyframe_count": self.keyframe_count,
+            "loop_edges": self.loop_edges,
+            "loop_candidates": self.loop_candidates,
+            "sequential_rmse": self.sequential_rmse,
+            "objective_before": self.objective_before,
+            "objective_after": self.objective_after,
+            "loop_residual_before": self.loop_residual_before,
+            "loop_residual_after": self.loop_residual_after,
+            "loop_closure_gap_before": self.loop_closure_gap_before,
+            "loop_closure_gap_after": self.loop_closure_gap_after,
+            "candidate_loop_closure_gap_after": self.candidate_loop_closure_gap_after,
+            "mean_correction": self.mean_correction,
+            "max_correction": self.max_correction,
+            "rejection_reasons": list(self.rejection_reasons),
+            "stages": dict(self.stages),
+        }
+
 
 def evaluate_refinement_acceptance(
     *,
@@ -228,6 +253,10 @@ def _keyframe_clouds(
         cloud.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
         )
+        # ``iter_frames`` reads the depth sidecars by their stable capture
+        # index.  The PTS-aware frame contract is used by reconstruction;
+        # this local ICP helper deliberately keeps the same keyframe index
+        # space as the pose table.
         clouds[frame.index] = cloud
     return clouds
 
@@ -440,7 +469,7 @@ def refine_trajectory(
     if keyframes is None:
         keyframes = select_keyframes(bundle)
     clouds = _keyframe_clouds(bundle, keyframes, voxel_size, min_confidence, max_depth)
-    keyframes = np.asarray([k for k in keyframes if k in clouds])
+    keyframes = np.asarray(sorted(clouds), dtype=int)
 
     raw_loop_gap = float(
         np.linalg.norm(bundle.poses[-1][:3, 3] - bundle.poses[0][:3, 3])

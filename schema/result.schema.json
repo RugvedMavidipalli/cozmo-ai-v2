@@ -134,6 +134,24 @@
             }
           }
         },
+        "trajectory": {
+          "type": ["object", "null"],
+          "description": "Pose-refinement acceptance evidence and returned-pose provenance.",
+          "properties": {
+            "accepted": { "type": "boolean" },
+            "rejected": { "type": "boolean" },
+            "pose_source": { "type": "string" },
+            "pose_convention": { "type": "string" },
+            "objective_before": { "type": "number" },
+            "objective_after": { "type": "number" },
+            "loop_residual_before": { "type": ["number", "null"] },
+            "loop_residual_after": { "type": ["number", "null"] },
+            "loop_closure_gap_before": { "type": "number" },
+            "loop_closure_gap_after": { "type": "number" },
+            "candidate_loop_closure_gap_after": { "type": "number" },
+            "rejection_reasons": { "type": "array", "items": { "type": "string" } }
+          }
+        },
         "mast3r_slam": {
           "type": "object",
           "description": "MASt3R-SLAM pose provenance and pre-fusion ARKit divergence gate.",

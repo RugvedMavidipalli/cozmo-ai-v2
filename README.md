@@ -120,6 +120,11 @@ that silently produce confident, geometrically meaningless output if guessed:
 - The IMU body frame is rotated from the camera frame by `rotZ(-90°)`. Only that
   mapping resolves the accelerometer to a constant world vector (0.992
   consistency); the identity mapping scores 0.59 and yields a 10 m "room height".
+- Colour/depth frame IDs remain stable for file lookup, but their poses are
+  associated by the decoded RGB presentation timestamp (PTS), normalized to
+  the video clock origin and matched to the nearest odometry timestamp. This
+  preserves variable-frame-rate timing; a decoder that does not provide an
+  advancing PTS is explicitly marked as using the frame-index fallback.
 
 Rerun both scripts before trusting a new capture source.
 

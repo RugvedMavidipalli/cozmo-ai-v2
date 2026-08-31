@@ -1245,7 +1245,7 @@ def _assemble(
                 "max_mm": round(drift.max_spread * 1000, 2),
                 "revisited_walls": drift.revisited_walls,
             },
-            "trajectory": drift_report.__dict__ if drift_report else None,
+            "trajectory": drift_report.diagnostics() if drift_report else None,
             "calibration": {
                 "calibrated": uncertainty.calibrated,
                 "scale": uncertainty.scale,
