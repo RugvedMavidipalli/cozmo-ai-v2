@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from ..detect import InputDetectionError, InputKind, detect_input
+from ..pipeline.ingest import iter_raw_frames
 
 DEPTH_SCALE_MM_TO_M = 1000.0
 
@@ -65,29 +66,36 @@ def iter_capture_frames(
     capture: LidarCaptureInput,
     indices: list[int] | np.ndarray | None = None,
 ) -> Iterator[CaptureFrame]:
-    video = cv2.VideoCapture(str(capture.video_path))
-    if not video.isOpened():
-        raise LidarCaptureError(f"Could not open video file: {capture.video_path}")
+    """Yields a capture's frames with colour at full video resolution and
+    depth in metres, exactly as the sensor recorded them.
 
+    Nothing is filtered or resized here: densification needs the raw LiDAR
+    samples to anchor against, and the full-resolution colour to guide the
+    fusion. Contrast `pipeline.ingest.iter_frames`, which resizes colour
+    down to depth resolution and zeroes out low-confidence samples for the
+    reconstruction path.
+
+    Args:
+        capture: The validated capture to read from.
+        indices: Which frame numbers to yield; if `None`, every frame.
+
+    Yields:
+        `CaptureFrame`s in ascending index order. A frame missing either
+        its depth or its confidence image is skipped rather than reported,
+        since there is nothing to anchor against without both.
+
+    Raises:
+        LidarCaptureError: the capture's video could not be opened.
+    """
     try:
-        wanted = None if indices is None else sorted(int(i) for i in indices)
-        wanted_set = None if wanted is None else set(wanted)
-        last = None if wanted is None else (wanted[-1] if wanted else -1)
-
-        index = 0
-        while last is None or index <= last:
-            ok, bgr = video.read()
-            if not ok:
-                break
-            if wanted_set is None or index in wanted_set:
-                depth_path = capture.depth_dir / f"{index:06d}.png"
-                confidence_path = capture.confidence_dir / f"{index:06d}.png"
-                depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-                confidence = cv2.imread(str(confidence_path), cv2.IMREAD_UNCHANGED)
-                if depth_raw is not None and confidence is not None:
-                    color = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    depth_m = depth_raw.astype(np.float32) / DEPTH_SCALE_MM_TO_M
-                    yield CaptureFrame(index=index, color=color, depth_m=depth_m, confidence=confidence)
-            index += 1
-    finally:
-        video.release()
+        for index, bgr, depth_raw, confidence in iter_raw_frames(capture.root, indices):
+            if depth_raw is None or confidence is None:
+                continue
+            yield CaptureFrame(
+                index=index,
+                color=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                depth_m=depth_raw.astype(np.float32) / DEPTH_SCALE_MM_TO_M,
+                confidence=confidence,
+            )
+    except FileNotFoundError as exc:
+        raise LidarCaptureError(str(exc)) from exc

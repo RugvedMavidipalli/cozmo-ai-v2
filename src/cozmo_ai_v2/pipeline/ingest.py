@@ -393,6 +393,73 @@ def _video_width(path: Path) -> float:
     return width
 
 
+def iter_raw_frames(
+    root: Path,
+    indices: list[int] | np.ndarray | None = None,
+):
+    """Walks a capture's colour video alongside its per-frame depth and
+    confidence images, handing back whatever came off disk without
+    interpreting any of it.
+
+    This is the one place that knows how a Stray Scanner capture is laid
+    out on disk -- that colour lives in a single video which can only be
+    read forwards from the start, while depth and confidence are numbered
+    files beside it. Callers that want metres, filtering, or resizing
+    build that on top; see `iter_frames`.
+
+    Args:
+        root: The capture directory.
+        indices: Which frame numbers to yield; if `None`, every frame in
+            the video is yielded.
+
+    Yields:
+        Tuples of `(index, bgr, depth_raw, confidence)`, in ascending
+        index order. `bgr` is the raw colour frame at the video's own
+        resolution. `depth_raw` and `confidence` are `None` when that
+        frame has no matching file on disk, so callers can decide for
+        themselves whether that is worth skipping over.
+
+    Raises:
+        FileNotFoundError: `root` has no readable `rgb.mp4`.
+    """
+    wanted_set: set[int] | None = None
+    last: int | None = None
+    if indices is not None:
+        wanted = sorted(int(i) for i in indices)
+        if not wanted:
+            return
+        wanted_set = set(wanted)
+        last = wanted[-1]
+
+    video = cv2.VideoCapture(str(root / "rgb.mp4"))
+    if not video.isOpened():
+        raise FileNotFoundError(f"cannot open {root / 'rgb.mp4'}")
+
+    try:
+        index = 0
+        # Stop as soon as the last requested frame is behind us, rather
+        # than decoding the rest of the video for nothing.
+        while last is None or index <= last:
+            ok, bgr = video.read()
+            if not ok:
+                break
+            if wanted_set is None or index in wanted_set:
+                yield (
+                    index,
+                    bgr,
+                    cv2.imread(
+                        str(root / "depth" / f"{index:06d}.png"), cv2.IMREAD_UNCHANGED
+                    ),
+                    cv2.imread(
+                        str(root / "confidence" / f"{index:06d}.png"),
+                        cv2.IMREAD_UNCHANGED,
+                    ),
+                )
+            index += 1
+    finally:
+        video.release()
+
+
 def iter_frames(
     bundle: CaptureBundle,
     indices: list[int] | np.ndarray | None = None,
@@ -428,67 +495,38 @@ def iter_frames(
     """
     if indices is None:
         indices = np.arange(len(bundle))
-    wanted = sorted(int(i) for i in indices)
-    if not wanted:
-        return
-    wanted_set = set(wanted)
-    last = wanted[-1]
 
     width, height = bundle.depth_size
-    capture = cv2.VideoCapture(str(bundle.root / "rgb.mp4"))
-    if not capture.isOpened():
-        raise FileNotFoundError(f"cannot open {bundle.root / 'rgb.mp4'}")
+    for index, bgr, depth_raw, confidence in iter_raw_frames(bundle.root, indices):
+        if depth_raw is None:
+            continue
+        if confidence is None:
+            # No confidence file for this frame -- treat every pixel
+            # as fully trusted rather than dropping the frame.
+            confidence = np.full(depth_raw.shape, CONFIDENCE_HIGH, np.uint8)
 
-    try:
-        # Videos can only be read forward from the start, not jumped to a
-        # specific frame, so this reads sequentially and stops as soon as
-        # it passes the last requested index.
-        for index in range(last + 1):
-            ok, bgr = capture.read()
-            if not ok:
-                break
-            if index not in wanted_set:
-                continue
+        color = cv2.cvtColor(
+            cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2RGB,
+        )
+        color_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if include_full_res else None
 
-            color = cv2.cvtColor(
-                cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA),
-                cv2.COLOR_BGR2RGB,
-            )
-            color_full = (
-                cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if include_full_res else None
-            )
-            depth_raw = cv2.imread(
-                str(bundle.root / "depth" / f"{index:06d}.png"), cv2.IMREAD_UNCHANGED
-            )
-            confidence = cv2.imread(
-                str(bundle.root / "confidence" / f"{index:06d}.png"),
-                cv2.IMREAD_UNCHANGED,
-            )
-            if depth_raw is None:
-                continue
-            if confidence is None:
-                # No confidence file for this frame -- treat every pixel
-                # as fully trusted rather than dropping the frame.
-                confidence = np.full(depth_raw.shape, CONFIDENCE_HIGH, np.uint8)
+        depth = depth_raw.astype(np.float32) / DEPTH_SCALE
+        # A depth of 0 is this pipeline's way of marking a pixel as
+        # invalid, so anything too low-confidence or too far away
+        # simply gets zeroed out here rather than removed outright.
+        depth[confidence < min_confidence] = 0.0
+        depth[depth > max_depth] = 0.0
 
-            depth = depth_raw.astype(np.float32) / DEPTH_SCALE
-            # A depth of 0 is this pipeline's way of marking a pixel as
-            # invalid, so anything too low-confidence or too far away
-            # simply gets zeroed out here rather than removed outright.
-            depth[confidence < min_confidence] = 0.0
-            depth[depth > max_depth] = 0.0
-
-            yield Frame(
-                index=index,
-                timestamp=float(bundle.timestamps[index]),
-                pose=bundle.poses[index],
-                color=color,
-                depth=depth,
-                confidence=confidence,
-                color_full=color_full,
-            )
-    finally:
-        capture.release()
+        yield Frame(
+            index=index,
+            timestamp=float(bundle.timestamps[index]),
+            pose=bundle.poses[index],
+            color=color,
+            depth=depth,
+            confidence=confidence,
+            color_full=color_full,
+        )
 
 
 def open3d_intrinsics(bundle: CaptureBundle):
