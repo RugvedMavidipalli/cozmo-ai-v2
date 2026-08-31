@@ -1,0 +1,658 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cozmo capture result",
+  "description": "Per-capture output: metric reconstruction, damage intelligence, and scope of work. Every measurement carries a confidence interval; every scope quantity carries the rule and source it came from.",
+  "type": "object",
+  "required": ["capture", "reconstruction", "rooms", "damage", "scope", "diagnostics"],
+  "properties": {
+    "capture": {
+      "type": "object",
+      "required": ["name", "modality", "frame_count"],
+      "properties": {
+        "name": { "type": "string" },
+        "modality": {
+          "type": "string",
+          "enum": ["lidar", "video_only"],
+          "description": "video_only captures run the estimated-depth fallback and carry wider intervals."
+        },
+        "frame_count": { "type": "integer" },
+        "duration_s": { "type": "number" },
+        "path_length_m": { "type": "number" }
+      }
+    },
+    "reconstruction": {
+      "type": "object",
+      "required": ["up_axis", "floor_height", "ceiling_observed", "ceiling_confidence", "walls"],
+      "properties": {
+        "up_axis": { "$ref": "#/$defs/vector3" },
+        "gravity_consistency": { "type": "number" },
+        "floor_height": { "type": "number" },
+        "ceiling_height": { "type": ["number", "null"] },
+        "ceiling_observed": { "type": "boolean" },
+        "ceiling_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "floor_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "manhattan_yaw_deg": { "type": "number" },
+        "manhattan_fraction": { "type": "number" },
+        "wall_coordinate_convention": {
+          "type": "string",
+          "enum": ["finished_face", "centerline", "room_side"]
+        },
+        "walls": { "type": "array", "items": { "$ref": "#/$defs/wall" } },
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening" } },
+        "vectorization": { "$ref": "#/$defs/vectorization" }
+      }
+    },
+    "rooms": { "type": "array", "items": { "$ref": "#/$defs/room" } },
+    "adjacency": {
+      "type": "array",
+      "description": "Room connectivity graph; pairs of room ids sharing a wall or doorway.",
+      "items": {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {
+          "a": { "type": "integer" },
+          "b": { "type": "integer" },
+          "via": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "damage": { "type": "array", "items": { "$ref": "#/$defs/damage_region" } },
+    "concealed": { "type": "array", "items": { "$ref": "#/$defs/concealed_flag" } },
+    "scope": {
+      "type": "object",
+      "required": ["line_items"],
+      "properties": {
+        "line_items": { "type": "array", "items": { "$ref": "#/$defs/line_item" } },
+        "rules_version": { "type": ["integer", "string"] }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "description": "Stage timings and the error budget the report is built from.",
+      "properties": {
+        "timings_s": { "type": "object", "additionalProperties": { "type": "number" } },
+        "drift": {
+          "type": "object",
+          "properties": {
+            "median_mm": { "type": "number" },
+            "p90_mm": { "type": "number" },
+            "max_mm": { "type": "number" },
+            "revisited_walls": { "type": "integer" }
+          }
+        },
+        "calibration": {
+          "type": "object",
+          "properties": {
+            "calibrated": { "type": "boolean" },
+            "scale": { "type": "number" },
+            "coverage_target": { "type": "number" }
+          }
+        },
+        "geometry": { "$ref": "#/$defs/geometry_diagnostics" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "point2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "measurement": {
+      "type": "object",
+      "description": "A value with a calibrated confidence interval.",
+      "required": ["value", "ci_low", "ci_high", "coverage"],
+      "properties": {
+        "value": { "type": "number" },
+        "ci_low": { "type": "number" },
+        "ci_high": { "type": "number" },
+        "half_width": { "type": "number" },
+        "coverage": { "type": "number" },
+        "basis": { "type": "string", "description": "How the interval was derived." }
+      }
+    },
+    "wall": {
+      "type": "object",
+      "required": ["id", "name", "length", "start", "end"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string", "description": "Stable surface reference, e.g. room_1.north_wall." },
+        "room_id": { "type": ["integer", "null"] },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length": { "$ref": "#/$defs/measurement" },
+        "height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "inferred_fraction": {
+          "type": "number",
+          "description": "Share of the wall reconstructed behind furniture rather than directly observed."
+        },
+        "occluded_spans": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "residual_rms_mm": { "type": "number" },
+        "support_points": { "type": "integer" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fit_quality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "coordinate_convention": { "type": "string" },
+        "snap_status": { "type": "string" },
+        "snap_residual_mm": { "type": "number", "minimum": 0 },
+        "provenance": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "opening": {
+      "type": "object",
+      "required": ["wall", "kind", "width"],
+      "properties": {
+        "wall": { "type": "string" },
+        "kind": { "type": "string", "enum": ["door", "window", "pass-through"] },
+        "width": { "$ref": "#/$defs/measurement" },
+        "height": { "$ref": "#/$defs/measurement" },
+        "sill_height": { "type": "number" },
+        "header_height": { "type": "number" },
+        "u_offset": { "type": "number", "description": "Distance from the wall's start corner." },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence_cells": { "type": "integer", "minimum": 0 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "room": {
+      "type": "object",
+      "required": ["id", "name", "area"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "area": { "$ref": "#/$defs/measurement" },
+        "ceiling_height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "perimeter": { "type": "number" },
+        "centroid": { "$ref": "#/$defs/point2" },
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "wall_ids": { "type": "array", "items": { "type": "integer" } },
+        "neighbours": { "type": "array", "items": { "type": "integer" } },
+        "observed_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "vectorization": {
+      "type": "object",
+      "required": ["coordinate_convention", "density", "candidate_segments", "junctions", "openings", "adjacency", "faces"],
+      "properties": {
+        "coordinate_convention": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "density": { "$ref": "#/$defs/density_map" },
+        "candidate_segments": { "type": "array", "items": { "$ref": "#/$defs/candidate_segment" } },
+        "junctions": { "type": "array", "items": { "$ref": "#/$defs/junction" } },
+        "rejected_crossings": { "type": "array", "items": { "$ref": "#/$defs/range2int" } },
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening_evidence" } },
+        "adjacency": { "type": "array", "items": { "$ref": "#/$defs/adjacency_evidence" } },
+        "faces": { "type": "array", "items": { "$ref": "#/$defs/face_evidence" } },
+        "wall_graph": {
+          "oneOf": [
+            { "$ref": "#/$defs/wall_graph_diagnostics" },
+            { "type": "null" }
+          ]
+        },
+        "roomformer": {
+          "oneOf": [
+            { "$ref": "#/$defs/roomformer_proposal" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "geometry_diagnostics": {
+      "type": "object",
+      "required": ["diagnostics_version", "wall_stages", "wall_records", "endpoint_gaps", "polygonization", "grid", "room_segmentation", "zero_room_reasons"],
+      "properties": {
+        "diagnostics_version": { "type": "integer", "const": 1 },
+        "wall_stages": { "$ref": "#/$defs/wall_stage_diagnostics" },
+        "wall_records": { "type": "array", "items": { "$ref": "#/$defs/wall_diagnostic_record" } },
+        "endpoint_gaps": { "$ref": "#/$defs/endpoint_gap_diagnostics" },
+        "polygonization": { "$ref": "#/$defs/polygonization_diagnostics" },
+        "grid": { "$ref": "#/$defs/grid_diagnostics" },
+        "room_segmentation": { "$ref": "#/$defs/room_segmentation_diagnostics" },
+        "zero_room_reasons": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "wall_stage_diagnostics": {
+      "type": "object",
+      "required": ["stage_counts", "drops_by_reason", "quarantines_by_reason", "trims_by_reason"],
+      "properties": {
+        "stage_counts": {
+          "type": "object",
+          "required": ["raw", "merged", "occlusion", "crossing", "quarantine", "post_refinement_internal", "exported"],
+          "properties": {
+            "raw": { "type": "integer", "minimum": 0 },
+            "merged": { "type": "integer", "minimum": 0 },
+            "occlusion": { "type": "integer", "minimum": 0 },
+            "crossing": { "type": "integer", "minimum": 0 },
+            "quarantine": { "type": "integer", "minimum": 0 },
+            "post_refinement_internal": { "type": "integer", "minimum": 0 },
+            "exported": { "type": "integer", "minimum": 0 },
+            "final": { "type": "integer", "minimum": 0, "description": "Deprecated alias for post_refinement_internal." }
+          }
+        },
+        "drops_by_reason": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "quarantines_by_reason": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "trims_by_reason": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "wall_diagnostic_record": {
+      "type": "object",
+      "required": ["wall_id", "wall_index", "endpoint_ids", "stage", "action", "reason", "provenance"],
+      "properties": {
+        "wall_id": { "type": "string" },
+        "wall_index": { "type": "integer" },
+        "endpoint_ids": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 },
+        "stage": { "type": "string" },
+        "action": { "type": "string" },
+        "exported": { "type": "boolean" },
+        "exported_wall_index": { "type": ["integer", "null"] },
+        "reason": { "type": "string" },
+        "provenance": { "type": "string" },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length_m": { "type": "number", "minimum": 0 },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "related_wall_ids": { "type": "array", "items": { "type": "string" } },
+        "related_wall_indices": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "endpoint_gap_diagnostics": {
+      "type": "object",
+      "required": ["endpoint_count", "gap_quantiles_m", "component_count", "junction_counts", "node_tolerance_m"],
+      "properties": {
+        "endpoint_count": { "type": "integer", "minimum": 0 },
+        "gap_quantiles_m": { "$ref": "#/$defs/quantiles" },
+        "component_count": { "type": "integer", "minimum": 0 },
+        "junction_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "node_tolerance_m": { "type": "number", "exclusiveMinimum": 0 },
+        "before": { "type": "object" },
+        "after": { "type": "object" }
+      }
+    },
+    "before_after_int": {
+      "type": "object",
+      "required": ["before", "after"],
+      "properties": {
+        "before": { "type": "integer", "minimum": 0 },
+        "after": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "before_after_quantiles": {
+      "type": "object",
+      "required": ["before", "after"],
+      "properties": {
+        "before": { "$ref": "#/$defs/quantiles" },
+        "after": { "$ref": "#/$defs/quantiles" }
+      }
+    },
+    "quantiles": {
+      "type": "object",
+      "required": ["p50", "p75", "p90", "p95", "p99", "max"],
+      "properties": {
+        "p50": { "type": ["number", "null"], "minimum": 0 },
+        "p75": { "type": ["number", "null"], "minimum": 0 },
+        "p90": { "type": ["number", "null"], "minimum": 0 },
+        "p95": { "type": ["number", "null"], "minimum": 0 },
+        "p99": { "type": ["number", "null"], "minimum": 0 },
+        "max": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "polygonization_diagnostics": {
+      "type": "object",
+      "required": ["candidate_face_count", "accepted_face_count", "rejected_faces_by_reason", "geometry_types"],
+      "properties": {
+        "candidate_face_count": { "type": "integer", "minimum": 0 },
+        "accepted_face_count": { "type": "integer", "minimum": 0 },
+        "rejected_faces_by_reason": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "geometry_types": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "faces": { "type": "array", "items": { "$ref": "#/$defs/face_diagnostic" } }
+      }
+    },
+    "face_diagnostic": {
+      "type": "object",
+      "required": ["face_id", "polygon", "area_m2", "observed_coverage", "visibility", "accepted", "reason", "provenance"],
+      "properties": {
+        "face_id": { "type": "string" },
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "area_m2": { "type": "number", "minimum": 0 },
+        "observed_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+        "accepted": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "provenance": { "type": "string" }
+      }
+    },
+    "grid_diagnostics": {
+      "type": "object",
+      "required": ["resolution_m", "origin", "shape", "occupied_cells", "free_cells", "unknown_cells", "free_component_count"],
+      "properties": {
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0 },
+        "origin": { "$ref": "#/$defs/point2" },
+        "bounds_plan": {
+          "type": "object",
+          "required": ["min", "max"],
+          "properties": {
+            "min": { "$ref": "#/$defs/point2" },
+            "max": { "$ref": "#/$defs/point2" }
+          }
+        },
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 },
+        "transforms": {
+          "type": "object",
+          "required": ["world_to_plan", "world_height_axis", "yaw_rad"],
+          "properties": {
+            "world_to_plan": {
+              "type": "object",
+              "required": ["right", "forward"],
+              "properties": {
+                "right": { "$ref": "#/$defs/vector3" },
+                "forward": { "$ref": "#/$defs/vector3" }
+              }
+            },
+            "world_height_axis": { "$ref": "#/$defs/vector3" },
+            "yaw_rad": { "type": "number" }
+          }
+        },
+        "occupied_cells": { "type": "integer", "minimum": 0 },
+        "free_cells": { "type": "integer", "minimum": 0 },
+        "unknown_cells": { "type": "integer", "minimum": 0 },
+        "free_component_count": { "type": "integer", "minimum": 0 },
+        "occupied_evidence_cells": { "type": "integer", "minimum": 0 },
+        "free_evidence_cells": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "room_segmentation_diagnostics": {
+      "type": "object",
+      "required": ["method", "fallback_used", "fallback_geometry_types", "room_count", "zero_room_reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "fallback_used": { "type": "boolean" },
+        "fallback_geometry_types": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "room_count": { "type": "integer", "minimum": 0 },
+        "zero_room_reason": { "type": ["string", "null"] }
+      }
+    },
+    "density_map": {
+      "type": "object",
+      "required": ["resolution_m", "origin", "bounds", "shape", "wall_band_m_above_floor", "count_semantics", "density_semantics", "counts", "observed", "empty", "retained_count"],
+      "properties": {
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0 },
+        "origin": { "$ref": "#/$defs/point2" },
+        "bounds": { "type": "array", "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 },
+        "clip_bounds": { "type": ["array", "null"], "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 },
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 },
+        "wall_band_m_above_floor": { "$ref": "#/$defs/range2" },
+        "effective_height_bounds_m": { "$ref": "#/$defs/range2" },
+        "floor_height_m": { "type": "number" },
+        "ceiling_height_m": { "type": ["number", "null"] },
+        "count_semantics": { "type": "string" },
+        "density_semantics": { "type": "string" },
+        "counts": { "type": "array" },
+        "observed": { "type": "array" },
+        "empty": { "type": "array" },
+        "input_count": { "type": "integer", "minimum": 0 },
+        "finite_input_count": { "type": "integer", "minimum": 0 },
+        "invalid_input_count": { "type": "integer", "minimum": 0 },
+        "band_count": { "type": "integer", "minimum": 0 },
+        "retained_count": { "type": "integer", "minimum": 0 },
+        "out_of_bounds_count": { "type": "integer", "minimum": 0 },
+        "observed_cell_count": { "type": "integer", "minimum": 0 },
+        "empty_cell_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "range2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "range2int": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "candidate_segment": {
+      "type": "object",
+      "required": ["id", "start", "end", "normal", "confidence", "accepted", "quarantined", "coordinate_convention"],
+      "properties": {
+        "id": { "type": "integer" },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length_m": { "type": "number" },
+        "support_points": { "type": "integer", "minimum": 0 },
+        "residual_rms_m": { "type": ["number", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fit_quality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "accepted": { "type": "boolean" },
+        "quarantined": { "type": "boolean" },
+        "coordinate_convention": { "type": "string" },
+        "provenance": { "type": "string" },
+        "snap_status": { "type": "string" },
+        "snap_residual_m": { "type": "number", "minimum": 0 },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "junction": {
+      "type": "object",
+      "required": ["id", "coordinate", "kind", "incident_walls", "confidence"],
+      "properties": {
+        "id": { "type": "integer" },
+        "coordinate": { "$ref": "#/$defs/point2" },
+        "kind": { "type": "string", "enum": ["corner", "t", "x"] },
+        "incident_walls": { "type": "array", "items": { "type": "integer" } },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "opening_evidence": {
+      "type": "object",
+      "required": ["wall_id", "kind", "u_range_m", "v_range_m", "confidence"],
+      "properties": {
+        "wall_id": { "type": "integer" },
+        "kind": { "type": "string" },
+        "u_range_m": { "$ref": "#/$defs/range2" },
+        "v_range_m": { "$ref": "#/$defs/range2" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" }
+      }
+    },
+    "adjacency_evidence": {
+      "type": "object",
+      "required": ["room_a", "room_b", "confidence"],
+      "properties": {
+        "room_a": { "type": "integer" },
+        "room_b": { "type": "integer" },
+        "via": { "type": ["string", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" }
+      }
+    },
+    "face_evidence": {
+      "type": "object",
+      "required": ["polygon", "area_m2", "observed_coverage", "visibility", "confidence", "provenance"],
+      "properties": {
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "area_m2": { "type": "number" },
+        "observed_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "wall_graph_diagnostics": {
+      "type": "object",
+      "required": ["proposed_connections", "accepted_connections", "rejected_connections", "optimization"],
+      "properties": {
+        "proposed_connections": { "type": "array", "items": { "$ref": "#/$defs/wall_graph_connection" } },
+        "accepted_connections": { "type": "array", "items": { "$ref": "#/$defs/wall_graph_connection" } },
+        "rejected_connections": { "type": "array", "items": { "$ref": "#/$defs/wall_graph_connection" } },
+        "optimization": {
+          "type": "object",
+          "properties": {
+            "proposed_endpoint_extensions": { "type": "integer", "minimum": 0 },
+            "accepted_endpoint_extensions": { "type": "integer", "minimum": 0 },
+            "rejected_crossing_count": { "type": "integer", "minimum": 0 },
+            "node_tolerance_m": { "type": "number", "exclusiveMinimum": 0 },
+            "max_endpoint_extension_m": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        }
+      }
+    },
+    "wall_graph_connection": {
+      "type": "object",
+      "required": ["wall_ids", "endpoint_ids", "movement_m", "movement_by_wall_m", "type", "evidence_score", "confidence", "decision", "reason", "before_coordinates", "after_coordinates"],
+      "properties": {
+        "wall_ids": { "$ref": "#/$defs/range2int" },
+        "endpoint_ids": { "type": "array", "items": { "type": ["string", "null"] }, "minItems": 2, "maxItems": 2 },
+        "movement_m": { "type": "number", "minimum": 0 },
+        "movement_by_wall_m": { "type": "array", "items": { "type": "number", "minimum": 0 }, "minItems": 2, "maxItems": 2 },
+        "type": { "type": "string", "enum": ["L", "T", "X", "extension"] },
+        "evidence_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "decision": { "type": "string" },
+        "reason": { "type": "string" },
+        "before_coordinates": { "type": "array", "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 },
+        "after_coordinates": { "type": "array", "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 }
+      }
+    },
+    "roomformer_proposal": {
+      "type": "object",
+      "required": ["available", "model_provenance", "confidence", "tensor", "graph", "opening_extension", "opening_predictions"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "model_provenance": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fallback_reason": { "type": ["string", "null"] },
+        "tensor": { "$ref": "#/$defs/roomformer_tensor" },
+        "graph": { "$ref": "#/$defs/roomformer_graph" },
+        "opening_extension": { "type": "string" },
+        "opening_predictions": { "type": "array", "items": { "$ref": "#/$defs/opening_evidence" } }
+      }
+    },
+    "roomformer_tensor": {
+      "type": "object",
+      "required": ["shape", "layout", "channels", "coordinate_convention"],
+      "properties": {
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 4, "maxItems": 4 },
+        "layout": { "type": "string", "const": "(batch, channel, x, y)" },
+        "channels": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 },
+        "coordinate_convention": { "type": "string" }
+      }
+    },
+    "roomformer_graph": {
+      "type": "object",
+      "required": ["coordinate_convention", "confidence", "provenance", "topology", "corners", "junctions", "segments", "polygons"],
+      "properties": {
+        "coordinate_convention": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" },
+        "topology": { "type": "array", "items": { "$ref": "#/$defs/range2int" } },
+        "corners": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "junctions": { "type": "array" },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/roomformer_segment" } },
+        "polygons": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/point2" } } }
+      }
+    },
+    "roomformer_segment": {
+      "type": "object",
+      "required": ["id", "start", "end", "normal", "length_m", "confidence", "coordinate_convention", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length_m": { "type": "number" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "coordinate_convention": { "type": "string" },
+        "provenance": { "type": "string" }
+      }
+    },
+    "damage_region": {
+      "type": "object",
+      "required": ["id", "surface_ref", "damage_class", "area"],
+      "properties": {
+        "id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "damage_class": { "type": "string", "enum": ["water", "fire", "mold", "combined"] },
+        "subtype": { "type": ["string", "null"] },
+        "area": { "$ref": "#/$defs/measurement" },
+        "water_category": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "water_class": { "type": ["integer", "null"], "minimum": 1, "maximum": 4 },
+        "mold_condition": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "classification_basis": { "type": "string" },
+        "extent": {
+          "type": "object",
+          "description": "Position on the surface: u along the wall, v up from the floor.",
+          "properties": {
+            "u_range": { "$ref": "#/$defs/point2" },
+            "v_range": { "$ref": "#/$defs/point2" }
+          }
+        },
+        "description": { "type": "string" },
+        "view_count": { "type": "integer" },
+        "confidence": { "type": "number" },
+        "contributing_frames": { "type": "array", "items": { "type": "integer" } },
+        "mask_method": { "type": "string" }
+      }
+    },
+    "concealed_flag": {
+      "type": "object",
+      "required": ["rule_id", "inferred", "probability"],
+      "properties": {
+        "rule_id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "inferred": { "type": "string" },
+        "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": { "type": "string" },
+        "source": { "type": "string" },
+        "triggered_by": { "type": "string" }
+      }
+    },
+    "line_item": {
+      "type": "object",
+      "required": ["code", "action", "quantity", "unit", "rule_id"],
+      "properties": {
+        "code": { "type": "string" },
+        "description": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["remove", "replace", "clean", "treat", "seal", "detach_and_reset", "install", "operate", "monitor", "supply"]
+        },
+        "material": { "type": "string" },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "trade": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "rule_id": { "type": "string" },
+        "source": { "type": "string", "description": "The standard the rule cites." },
+        "basis": { "type": "string", "description": "How this quantity was derived, in words." },
+        "derived_from": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
