@@ -1,5 +1,5 @@
 import numpy as np, cv2
-from pipeline.ingest import load_capture, _read_odometry, ARKIT_TO_CV
+from cozmo_ai_v2.pipeline.ingest import load_capture, _read_odometry, ARKIT_TO_CV
 from pathlib import Path
 
 b = load_capture('../recordings-1')

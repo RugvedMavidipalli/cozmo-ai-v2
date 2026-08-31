@@ -34,7 +34,7 @@ from .rooms import build_plan_grid, check_no_overlaps, segment_rooms
 from .scope import ScopeEngine
 from .uncertainty import UncertaintyModel
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Timings(dict):

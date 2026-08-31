@@ -9,8 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline.uncertainty import fit_calibration  # noqa: E402
+from cozmo_ai_v2.pipeline.uncertainty import fit_calibration
 
 GATES = {
     "wall_length": (

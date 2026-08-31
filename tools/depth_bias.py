@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline.fuse import fuse  # noqa: E402
-from pipeline.geometry import estimate_gravity  # noqa: E402
-from pipeline.ingest import iter_frames, load_capture  # noqa: E402
-from pipeline.planes import (  # noqa: E402
+from cozmo_ai_v2.pipeline.fuse import fuse
+from cozmo_ai_v2.pipeline.geometry import estimate_gravity
+from cozmo_ai_v2.pipeline.ingest import iter_frames, load_capture
+from cozmo_ai_v2.pipeline.planes import (
     estimate_horizontal_frame,
     extract_walls,
     merge_collinear,

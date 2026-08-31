@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import argparse
 import copy
-import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline.damage.fusion import DamageRegion  # noqa: E402
-from pipeline.rooms import Room  # noqa: E402
-from pipeline.scope import ScopeEngine  # noqa: E402
+from cozmo_ai_v2.pipeline.damage.fusion import DamageRegion
+from cozmo_ai_v2.pipeline.rooms import Room
+from cozmo_ai_v2.pipeline.scope import ScopeEngine
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

@@ -1,5 +1,5 @@
 import numpy as np, csv
-from pipeline.ingest import load_capture
+from cozmo_ai_v2.pipeline.ingest import load_capture
 b = load_capture('../recordings-1')
 ts_imu=[]; acc=[]
 with open('../recordings-1/imu.csv') as f:
