@@ -41,3 +41,6 @@ packages = ["src/cozmo_ai_v2"]
 # tools/*_test.py are ad-hoc diagnostic scripts, not a test suite: they run
 # module-level code against hardcoded capture paths. Only collect tests/.
 testpaths = ["tests"]
+markers = [
+    "recording_regression: opt-in checks against externally supplied recording result.json files",
+]

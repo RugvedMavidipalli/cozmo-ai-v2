@@ -133,7 +133,30 @@
             }
           }
         },
-        "warnings": { "type": "array", "items": { "type": "string" } }
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "geometry": {
+          "type": ["object", "null"],
+          "description": "Optional versioned diagnostics for deterministic geometry stages.",
+          "required": ["diagnostics_version"],
+          "properties": {
+            "diagnostics_version": { "type": "integer" },
+            "wall_stages": {
+              "type": "object",
+              "properties": {
+                "stage_counts": { "type": "object", "additionalProperties": { "type": "integer" } },
+                "drops_by_reason": { "type": "object", "additionalProperties": { "type": "integer" } },
+                "quarantines_by_reason": { "type": "object", "additionalProperties": { "type": "integer" } },
+                "trims_by_reason": { "type": "object", "additionalProperties": { "type": "integer" } }
+              }
+            },
+            "wall_records": { "type": "array", "items": { "type": "object" } },
+            "endpoint_gaps": { "type": "object" },
+            "polygonization": { "type": "object" },
+            "grid": { "type": "object" },
+            "room_segmentation": { "type": "object" },
+            "zero_room_reasons": { "type": "array", "items": { "type": "string" } }
+          }
+        }
       }
     }
   },

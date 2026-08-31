@@ -18,6 +18,7 @@ from .drift import measure_drift, refit_wall_offsets, sample_world_points_with_o
 from .frame_contract import build_frame_contract
 from .fuse import fuse
 from .geometry import estimate_gravity
+from .geometry_diagnostics import GeometryDiagnostics
 from .ingest import display_rotation, load_capture, iter_frames
 from .keyframes import select_damage_keyframes
 from .occupancy import build_surface_grid, find_openings, occluded_spans
@@ -105,6 +106,7 @@ def run(args: argparse.Namespace) -> int:
     """
     timings = Timings()
     warnings: list[str] = []
+    geometry_diagnostics = GeometryDiagnostics()
     out_dir = Path(args.out or f"out/{Path(args.capture).name}")
     out_dir.mkdir(parents=True, exist_ok=True)
     total_start = time.time()
@@ -226,9 +228,21 @@ def run(args: argparse.Namespace) -> int:
         gravity = estimate_gravity(points, hint=bundle.gravity_up, normals=normals)
         frame = estimate_horizontal_frame(normals, gravity.up)
         band = wall_band_mask(points, normals, gravity, gravity.up)
-        walls = extract_walls(frame.to_plan(points[band]), frame.height(points[band]))
-        walls = merge_collinear(snap_to_frame(walls, frame))
-        walls, occluded_out = filter_occluded_walls(walls, frame, sampled, origins)
+        walls = extract_walls(
+            frame.to_plan(points[band]),
+            frame.height(points[band]),
+            diagnostics=geometry_diagnostics,
+        )
+        walls = snap_to_frame(walls, frame, diagnostics=geometry_diagnostics)
+        walls = merge_collinear(walls, diagnostics=geometry_diagnostics)
+        geometry_diagnostics.set_wall_stage("quarantine", walls)
+        walls, occluded_out = filter_occluded_walls(
+            walls,
+            frame,
+            sampled,
+            origins,
+            diagnostics=geometry_diagnostics,
+        )
     ceiling = gravity.ceiling_height
     print(
         f"  {len(walls)} walls ({occluded_out} occlusion-inconsistent removed), "
@@ -242,8 +256,8 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("wall refinement"):
         refitted = refit_wall_offsets(walls, frame, sampled, times)
         drift = measure_drift(walls, frame, sampled, times)
-        walls = resolve_crossings(walls)
-        corners = snap_corners(walls)
+        walls = resolve_crossings(walls, diagnostics=geometry_diagnostics)
+        corners = snap_corners(walls, diagnostics=geometry_diagnostics)
     print(
         f"  {refitted} offsets refitted by visit, {len(walls)} walls after "
         f"crossing resolution, {corners} endpoints snapped to corners"
@@ -256,7 +270,17 @@ def run(args: argparse.Namespace) -> int:
             points, frame, gravity.floor_height, ceiling,
             trajectory=poses[:, :3, 3],
         )
-        rooms = segment_rooms(grid, walls, frame, gravity.floor_height, ceiling)
+        geometry_diagnostics.set_wall_stage("crossing", walls)
+        geometry_diagnostics.set_wall_stage("final", walls)
+        geometry_diagnostics.record_endpoint_gaps(walls)
+        rooms = segment_rooms(
+            grid,
+            walls,
+            frame,
+            gravity.floor_height,
+            ceiling,
+            diagnostics=geometry_diagnostics,
+        )
         overlaps = check_no_overlaps(rooms)
         if overlaps:
             warnings.append(
@@ -266,6 +290,16 @@ def run(args: argparse.Namespace) -> int:
                 )
             )
     print(f"  {len(rooms)} rooms")
+    print(
+        "  geometry stages: "
+        + ", ".join(
+            f"{stage}={count}"
+            for stage, count in geometry_diagnostics.stage_counts.items()
+        )
+    )
+    if not rooms:
+        reason = geometry_diagnostics.room_segmentation.get("zero_room_reason")
+        print(f"  room extraction reason: {reason or 'not reported'}")
 
     # Stage 8: surfaces/openings. Geometry remains the default source. RGB
     # and RoomFormer evidence is optional and must earn a wall association and
@@ -421,6 +455,7 @@ def run(args: argparse.Namespace) -> int:
             line_items, drift, drift_report, surface_grids, uncertainty,
             timings, warnings, engine, reconstruction.contract_report,
             opening_rejections,
+            geometry_diagnostics,
         )
         export.write_json(result, out_dir / "result.json")
         problems = export.validate(result, REPO_ROOT / "schema" / "result.schema.json")
@@ -715,6 +750,7 @@ def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
     timings, warnings, engine, fusion_report=None, opening_rejections=None,
+    geometry_diagnostics=None,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -969,6 +1005,11 @@ def _assemble(
             "fusion": fusion_report or {},
             "opening_rejections": list(opening_rejections or []),
             "warnings": warnings,
+            "geometry": (
+                geometry_diagnostics.to_dict()
+                if geometry_diagnostics is not None
+                else None
+            ),
         },
     }
 

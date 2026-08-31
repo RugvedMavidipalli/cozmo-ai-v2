@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy import ndimage
 
 from .planes import HorizontalFrame, WallSegment
+
+if TYPE_CHECKING:
+    from .geometry_diagnostics import GeometryDiagnostics
 
 
 @dataclass
@@ -277,6 +281,7 @@ def segment_rooms(
     min_area: float = 1.4,
     wall_threshold: int = 6,
     floor_threshold: int = 3,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[Room]:
     """Extract rooms as bounded faces of the fitted wall graph.
 
@@ -292,14 +297,52 @@ def segment_rooms(
     # The graph itself supplies the face barriers; this mask only validates
     # that a proposed face was actually observed at floor height.
     free = (grid.free >= floor_threshold) & (grid.occupied < wall_threshold)
-    polygons = polygonize_wall_graph(walls, min_area=min_area)
-    accepted = [
-        polygon for polygon in polygons if _has_observed_floor(polygon, grid, free)
-    ]
+    if diagnostics is not None:
+        diagnostics.record_plan_grid(
+            grid,
+            frame,
+            occupied_mask=grid.occupied >= wall_threshold,
+            free_mask=free,
+        )
+    polygons = polygonize_wall_graph(
+        walls, min_area=min_area, diagnostics=diagnostics
+    )
+    accepted = []
+    for polygon in polygons:
+        observed = _has_observed_floor(polygon, grid, free)
+        if diagnostics is not None:
+            diagnostics.record_polygon_face_decision(
+                accepted=observed,
+                reason=None if observed else "no-observed-floor",
+            )
+        if observed:
+            accepted.append(polygon)
 
+    fallback_used = False
     if not accepted:
-        accepted = _observed_floor_polygons(grid, free, min_area)
+        fallback_used = True
+        accepted = _observed_floor_polygons(
+            grid, free, min_area, diagnostics=diagnostics
+        )
     if not accepted:
+        reasons = []
+        if not polygons:
+            reasons.append("no-bounded-wall-faces")
+        elif not any(_has_observed_floor(polygon, grid, free) for polygon in polygons):
+            reasons.append("candidate-faces-have-no-observed-floor")
+        if not free.any():
+            reasons.append("no-observed-free-cells")
+        elif fallback_used:
+            reasons.append("no-usable-observed-floor-components")
+        if not reasons:
+            reasons.append("no-accepted-room-faces")
+        reason = "; ".join(dict.fromkeys(reasons))
+        if diagnostics is not None:
+            diagnostics.record_room_segmentation(
+                room_count=0,
+                fallback_used=fallback_used,
+                zero_room_reason=reason,
+            )
         return []
 
     rooms: list[Room] = []
@@ -319,6 +362,11 @@ def segment_rooms(
 
     _assign_graph_walls(rooms, walls)
     _link_graph_neighbours(rooms, walls)
+    if diagnostics is not None:
+        diagnostics.record_room_segmentation(
+            room_count=len(rooms),
+            fallback_used=fallback_used,
+        )
     return rooms
 
 
@@ -327,6 +375,7 @@ def polygonize_wall_graph(
     *,
     min_area: float = 1.4,
     node_tolerance: float = 0.08,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[object]:
     """Return bounded Shapely faces formed by the usable wall graph.
 
@@ -359,9 +408,54 @@ def polygonize_wall_graph(
     if node_tolerance > 0:
         network = snap(network, network, node_tolerance)
         network = unary_union(network)
-    faces = [face for face in polygonize(network) if face.area >= min_area]
+    raw_faces = list(polygonize(network))
+
+    def face_key(face):
+        return (
+            round(float(face.centroid.x), 8),
+            round(float(face.centroid.y), 8),
+            round(float(face.area), 8),
+            tuple(
+                round(value, 8)
+                for point in face.exterior.coords
+                for value in point
+            ),
+        )
+
+    valid_faces = []
+    for face in sorted(raw_faces, key=face_key):
+        if face.is_empty or face.geom_type != "Polygon":
+            if diagnostics is not None:
+                diagnostics.record_polygon_candidate(
+                    face,
+                    accepted=False,
+                    reason="non-polygon-face",
+                )
+            continue
+        if not face.is_valid or face.area <= 1e-9:
+            if diagnostics is not None:
+                diagnostics.record_polygon_candidate(
+                    face,
+                    accepted=False,
+                    reason="invalid-or-degenerate-face",
+                )
+            continue
+        if face.area < min_area:
+            if diagnostics is not None:
+                diagnostics.record_polygon_candidate(
+                    face,
+                    accepted=False,
+                    reason="below-min-area",
+                )
+            continue
+        valid_faces.append(face)
+        if diagnostics is not None:
+            diagnostics.record_polygon_candidate(face, accepted=False)
+
+    if diagnostics is not None:
+        diagnostics.polygonization["candidate_face_count"] = len(raw_faces)
     return sorted(
-        faces,
+        valid_faces,
         key=lambda face: (
             round(float(face.centroid.x), 8),
             round(float(face.centroid.y), 8),
@@ -391,7 +485,10 @@ def _has_observed_floor(polygon, grid: PlanGrid, free: np.ndarray) -> bool:
 
 
 def _observed_floor_polygons(
-    grid: PlanGrid, free: np.ndarray, min_area: float
+    grid: PlanGrid,
+    free: np.ndarray,
+    min_area: float,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[object]:
     from shapely.geometry import box
     from shapely.ops import unary_union
@@ -401,6 +498,8 @@ def _observed_floor_polygons(
     for label in range(1, count + 1):
         cells = np.argwhere(labels == label)
         if len(cells) < 3:
+            if diagnostics is not None:
+                diagnostics.record_fallback_rejection("too-few-floor-cells")
             continue
         # Union cell footprints instead of taking a convex hull.  A hull can
         # bridge a doorway-sized unknown gap and thereby manufacture free
@@ -417,6 +516,8 @@ def _observed_floor_polygons(
                 for point in points
             ]
         )
+        if diagnostics is not None:
+            diagnostics.record_fallback_geometry(polygon.geom_type)
         # Room's public schema carries one exterior ring.  Do not discard
         # an interior ring here: doing so would claim an unobserved hole is
         # free space.  A future schema can represent holes explicitly.
@@ -426,6 +527,14 @@ def _observed_floor_polygons(
             and polygon.area >= min_area
         ):
             polygons.append(polygon)
+        elif diagnostics is not None:
+            if polygon.geom_type != "Polygon":
+                reason = "non-polygon-floor-component"
+            elif polygon.interiors:
+                reason = "floor-component-has-holes"
+            else:
+                reason = "below-min-area"
+            diagnostics.record_fallback_rejection(reason)
     return sorted(
         polygons,
         key=lambda face: (round(face.centroid.x, 8), round(face.centroid.y, 8)),
