@@ -37,6 +37,7 @@ second run is offline and free.
 out/<capture>/
   result.json                 # schema/result.schema.json — validated on every run;
                               # TLS-plane measurements + tolerances/confidence
+  planes.json                 # retained metric 3D planes, support, and inlier identities
   floorplan.svg                # dimensioned plan: openings, inferred spans, damage overlay
   scene.glb                    # 3D reconstruction — every wall, plus each room's floor
                                 # and ceiling, as individually named, selectable planes
@@ -74,6 +75,10 @@ out/<capture>/
 | `--pose-source` | `auto` | ARKit for Stray Scanner captures, SLAM for video captures, with explicit fallback metadata |
 | `--slam-poses` | — | Offline SLAM pose table (`CSV`, `JSON`, `NPY`, or `NPZ`) |
 | `--max-depth` | `3.5` | Depth cutoff — the knee where ARKit depth starts reading systematically far |
+| `--plane-threshold` | `0.03` | 3D structural-plane inlier threshold in metres |
+| `--plane-min-inliers` | `30` | Minimum support for a 3D structural plane |
+| `--max-planes` | `80` | Maximum sequential structural planes to retain |
+| `--plane-seed` | `0` | Seed for deterministic structural-plane RANSAC |
 | `--min-confidence 0\|1\|2` | `1` | ARKit depth-confidence floor. The glass/mirror ablation |
 | `--damage-frames N` | `40` | Max keyframes sent to the VLM for damage detection |
 | `--min-views N` | `2` | Independent views required to accept a damage region |
@@ -276,7 +281,7 @@ pipeline/
   poses.py       keyframing, loop closure, pose-graph optimisation
   fuse.py        TSDF fusion
   geometry.py    gravity recovery, plane algebra
-  planes.py      wall extraction, Manhattan frame, corner intersection
+  planes.py      metric 3D planes, wall extraction, Manhattan frame, corner intersection
   rooms.py       watershed room segmentation, adjacency, wall naming
   occupancy.py   per-surface UV grids: openings, occlusion, damage
   openings.py    normalized opening contract and cross-source fusion

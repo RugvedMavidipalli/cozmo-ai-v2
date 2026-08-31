@@ -31,6 +31,9 @@ from .measurements import (
 from .occupancy import build_surface_grid, find_openings, occluded_spans
 from .openings import fuse_openings
 from .planes import (
+    PlaneClassification,
+    StructuralPlane,
+    extract_structural_planes,
     estimate_horizontal_frame,
     extract_walls,
     filter_occluded_walls,
@@ -378,6 +381,16 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("geometry"):
         gravity = estimate_gravity(points, hint=bundle.gravity_up, normals=normals)
         frame = estimate_horizontal_frame(normals, gravity.up)
+        structural_planes = extract_structural_planes(
+            points,
+            normals=normals,
+            up=gravity.up,
+            floor_height=gravity.floor_height,
+            inlier_threshold=getattr(args, "plane_threshold", 0.03),
+            min_inliers=getattr(args, "plane_min_inliers", 30),
+            max_planes=getattr(args, "max_planes", 80),
+            seed=getattr(args, "plane_seed", 0),
+        )
         band = wall_band_mask(points, normals, gravity, gravity.up)
         walls = extract_walls(
             frame.to_plan(points[band]),
@@ -386,6 +399,19 @@ def run(args: argparse.Namespace) -> int:
         )
         walls = snap_to_frame(walls, frame, diagnostics=geometry_diagnostics)
         walls = merge_collinear(walls, diagnostics=geometry_diagnostics)
+        _attach_structural_plane_ids(walls, structural_planes, frame)
+        if not walls:
+            # The established 2D fitter remains authoritative whenever it
+            # has enough wall-band support. The retained 3D wall support is
+            # also a safe fallback for sparse captures.
+            walls = [
+                wall
+                for plane in structural_planes
+                if plane.classification == PlaneClassification.WALL.value
+                and not plane.quarantined
+                for wall in [plane.to_wall_segment(frame, points=points)]
+                if wall is not None
+            ]
         geometry_diagnostics.set_wall_stage("quarantine", walls)
         walls, occluded_out = filter_occluded_walls(
             walls,
@@ -657,6 +683,7 @@ def run(args: argparse.Namespace) -> int:
             geometry_diagnostics=geometry_diagnostics,
             scene_measurements=scene_measurements,
             reference_validation=reference_validation,
+            structural_planes=structural_planes,
         )
         if mast3r_integration is not None:
             alignment = mast3r_integration.alignment
@@ -691,6 +718,11 @@ def run(args: argparse.Namespace) -> int:
             result["reconstruction"]["walls"],
             out_dir / "scene.glb", gravity.floor_height, ceiling,
             rooms=result["rooms"],
+            structural_planes=result["reconstruction"]["structural_planes"],
+        )
+        export.export_plane_metadata(
+            structural_planes, out_dir / "planes.json",
+            frame=frame,
         )
         export.export_scope_csv(result, out_dir)
         export.export_reconstruction(reconstruction, out_dir)
@@ -975,6 +1007,48 @@ def _infer_adjacency_via(
     return best_name
 
 
+def _attach_structural_plane_ids(
+    walls: list,
+    planes: list[StructuralPlane],
+    frame,
+    max_offset: float = 0.20,
+) -> None:
+    """Link legacy 2D wall fits to their metric 3D plane when possible.
+
+    The 2D wall fitter remains the source of truth for wall topology and its
+    established corner/occlusion cleanup.  This small association preserves
+    the structural plane identity and source support on that compatible
+    representation without replacing any of those deterministic operations.
+    """
+    references = []
+    for plane in planes:
+        if plane.classification != PlaneClassification.WALL.value:
+            continue
+        line = plane.to_wall_segment(frame)
+        if line is not None:
+            references.append((plane, line))
+    for wall in walls:
+        candidates = []
+        for plane, line in references:
+            alignment = abs(float(wall.normal @ line.normal))
+            offset_error = abs(float(wall.offset - line.offset))
+            if alignment < np.cos(np.radians(20.0)) or offset_error > max_offset:
+                continue
+            candidates.append(
+                (
+                    1.0 - alignment + offset_error,
+                    -plane.support_count,
+                    plane.id,
+                    plane,
+                )
+            )
+        if not candidates:
+            continue
+        plane = min(candidates, key=lambda item: item[:3])[-1]
+        wall.structural_plane_id = plane.id
+        wall.inlier_indices = plane.inlier_indices.copy()
+
+
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
@@ -982,6 +1056,7 @@ def _assemble(
     geometry_diagnostics=None,
     scene_measurements=None,
     reference_validation=None,
+    structural_planes=None,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -1018,6 +1093,7 @@ def _assemble(
     Returns:
         The full result, shaped exactly as `result.json` expects it.
     """
+    structural_planes = list(structural_planes or [])
     drift_by_wall = {v.wall_index: v.std for v in drift.per_wall}
     wall_docs = []
     exported_walls = (
@@ -1074,6 +1150,7 @@ def _assemble(
                 "occluded_spans": [list(s) for s in spans],
                 "residual_rms_mm": round(wall.residual_rms * 1000, 2),
                 "support_points": wall.inlier_count,
+                "structural_plane_id": wall.structural_plane_id,
                 "tags": wall.tags,
                 "inlier_vertical_extent": vertical_extent_doc,
                 "thickness": thickness_doc,
@@ -1082,6 +1159,35 @@ def _assemble(
                 "opposing_face_id": opposing_face_id,
             }
         )
+
+    structural_plane_docs = []
+    for plane in structural_planes:
+        document = plane.to_dict()
+        wall_line = plane.to_wall_segment(frame)
+        document["wall_line"] = (
+            {
+                "start": wall_line.start.tolist(),
+                "end": wall_line.end.tolist(),
+                "normal": wall_line.normal.tolist(),
+                "offset": round(float(wall_line.offset), 6),
+                "vertical_extent": list(wall_line.height_range),
+            }
+            if wall_line is not None
+            else None
+        )
+        structural_plane_docs.append(document)
+    ceiling_plane_ids = [
+        int(plane.id)
+        for plane in structural_planes
+        if plane.classification == PlaneClassification.CEILING.value
+        and not plane.quarantined
+    ]
+    floor_plane_ids = [
+        int(plane.id)
+        for plane in structural_planes
+        if plane.classification == PlaneClassification.FLOOR.value
+        and not plane.quarantined
+    ]
 
     wall_names = {wall.index: (wall.name or f"wall_{wall.index}") for wall in walls}
     opening_docs = []
@@ -1303,6 +1409,17 @@ def _assemble(
             "manhattan_yaw_deg": round(float(np.degrees(frame.yaw)), 3),
             "manhattan_fraction": round(frame.manhattan_fraction, 4),
             "walls": wall_docs,
+            "structural_planes": structural_plane_docs,
+            "plane_extraction": {
+                "algorithm": "seeded_ransac_region_growing_tls_3d",
+                "refit": "total_least_squares_svd_perpendicular_residual",
+                "plane_count": len(structural_plane_docs),
+                "kept_count": sum(not plane.quarantined for plane in structural_planes),
+                "quarantined_count": sum(plane.quarantined for plane in structural_planes),
+                "floor_plane_ids": floor_plane_ids,
+                "ceiling_plane_ids": ceiling_plane_ids,
+                "multiple_ceiling_planes": len(ceiling_plane_ids) > 1,
+            },
             "openings": opening_docs,
         },
         "rooms": room_docs,
@@ -1407,6 +1524,22 @@ def main(argv: list[str] | None = None) -> int:
         help="TSDF truncation distance in metres (defaults to 4 * --voxel)",
     )
     runner.add_argument("--max-depth", type=float, default=3.5)
+    runner.add_argument(
+        "--plane-threshold", type=float, default=0.03,
+        help="3D structural-plane inlier threshold in metres",
+    )
+    runner.add_argument(
+        "--plane-min-inliers", type=int, default=30,
+        help="minimum support for a 3D structural plane",
+    )
+    runner.add_argument(
+        "--max-planes", type=int, default=80,
+        help="maximum sequential 3D structural planes to extract",
+    )
+    runner.add_argument(
+        "--plane-seed", type=int, default=0,
+        help="deterministic seed for structural-plane RANSAC",
+    )
     runner.add_argument("--min-confidence", type=int, default=1)
     runner.add_argument(
         "--depth-source", choices=("auto", "dense", "raw"), default="auto",

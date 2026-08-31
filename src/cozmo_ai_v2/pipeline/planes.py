@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
@@ -342,6 +343,11 @@ class WallSegment:
     # Off-axis detections are retained for diagnostics, but quarantined from
     # room topology, polygonization, and metric wall output.
     quarantined: bool = False
+    # A wall can be the 2D compatibility view of a fitted 3D structural
+    # plane.  These fields are optional so the older wall-only API remains
+    # source compatible.
+    structural_plane_id: int | None = None
+    inlier_indices: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         normal = np.asarray(self.normal, dtype=float)
@@ -362,6 +368,9 @@ class WallSegment:
         if self.start.shape != (2,) or self.end.shape != (2,):
             raise ValueError("wall endpoints must be 2D vectors")
         self.tags = list(self.tags)
+        if self.inlier_indices is not None:
+            indices = np.asarray(self.inlier_indices, dtype=int).reshape(-1)
+            self.inlier_indices = np.unique(indices)
         if invalid_normal:
             self.quarantined = True
             self.tags.append("invalid-geometry")
@@ -451,6 +460,918 @@ class WallSegment:
             return 0.0
         seen = max(0.0, self.observed_span[1] - self.observed_span[0])
         return float(np.clip(1.0 - seen / self.length, 0.0, 1.0))
+
+
+class PlaneClassification(str, Enum):
+    """Semantic classes assigned to fitted metric planes.
+
+    ``CLUTTER`` deliberately covers both planes with an intermediate
+    orientation and horizontal surfaces that are neither the floor nor a
+    plausible ceiling.  They remain in the output for diagnostics, but are
+    quarantined from room and wall topology.
+    """
+
+    FLOOR = "floor"
+    CEILING = "ceiling"
+    WALL = "wall"
+    CLUTTER = "clutter"
+
+
+PlaneType = PlaneClassification
+
+
+@dataclass
+class StructuralPlane:
+    """A metric 3D plane fitted to a stable set of source points.
+
+    The plane equation is ``normal . x = offset``.  ``inlier_indices`` are
+    indices into the point array passed to :func:`extract_structural_planes`,
+    rather than indices in a sorted or downsampled working array.  This is
+    important: downstream diagnostics can trace every metric surface back to
+    the original fused-cloud points.
+
+    ``extents`` is the axis-aligned world-space size.  ``bounds_min`` and
+    ``bounds_max`` preserve the corresponding corners, while
+    ``in_plane_extents`` stores the two tangent-coordinate ranges used to
+    reconstruct the observed footprint.  Keeping both forms makes the model
+    useful to numerical callers and straightforward to serialize.
+    """
+
+    id: int
+    classification: PlaneClassification | str
+    normal: np.ndarray
+    offset: float
+    centroid: np.ndarray
+    extents: np.ndarray
+    inlier_indices: np.ndarray
+    residual_rms: float
+    residual_mean_abs: float
+    residual_median: float
+    residual_max: float
+    point_density: float
+    confidence: float
+    bounds_min: np.ndarray | None = None
+    bounds_max: np.ndarray | None = None
+    in_plane_extents: np.ndarray | None = None
+    wall_vertical_extent: tuple[float, float] | None = None
+    ceiling_observed: bool = False
+    ceiling_confidence: float = 0.0
+    quarantined: bool = False
+    tags: list[str] = field(default_factory=list)
+    # The horizontal along-wall range in a caller's HorizontalFrame.  It is
+    # optional because a structural plane can be used without a plan frame.
+    _horizontal_tangent: np.ndarray | None = field(default=None, repr=False)
+    _horizontal_extent: tuple[float, float] | None = field(default=None, repr=False)
+    _up: np.ndarray | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        classification = self.classification
+        if isinstance(classification, PlaneClassification):
+            classification = classification.value
+        classification = str(classification).lower()
+        if classification not in {item.value for item in PlaneClassification}:
+            classification = PlaneClassification.CLUTTER.value
+        self.classification = classification
+
+        normal = np.asarray(self.normal, dtype=float).reshape(-1)
+        norm = float(np.linalg.norm(normal))
+        if normal.shape != (3,) or not np.isfinite(norm) or norm <= 1e-9:
+            normal = np.array([0.0, 0.0, 1.0])
+            norm = 1.0
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+        self.normal = normal / norm
+
+        centroid = np.asarray(self.centroid, dtype=float).reshape(-1)
+        if centroid.shape != (3,) or not np.isfinite(centroid).all():
+            centroid = np.zeros(3, dtype=float)
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+        self.centroid = centroid
+
+        valid_offset = bool(np.isfinite(self.offset))
+        self.offset = float(self.offset) if valid_offset else 0.0
+        if not valid_offset:
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+
+        self.extents = _finite_vector(self.extents, 3)
+        if self.bounds_min is None:
+            self.bounds_min = self.centroid - 0.5 * self.extents
+        else:
+            self.bounds_min = _finite_vector(self.bounds_min, 3)
+        if self.bounds_max is None:
+            self.bounds_max = self.centroid + 0.5 * self.extents
+        else:
+            self.bounds_max = _finite_vector(self.bounds_max, 3)
+        self.extents = np.maximum(self.bounds_max - self.bounds_min, 0.0)
+
+        indices = np.asarray(self.inlier_indices, dtype=int).reshape(-1)
+        self.inlier_indices = np.unique(indices[indices >= 0])
+        self.tags = sorted(set(self.tags))
+        self.residual_rms = _finite_nonnegative(self.residual_rms)
+        self.residual_mean_abs = _finite_nonnegative(self.residual_mean_abs)
+        self.residual_median = _finite_nonnegative(self.residual_median)
+        self.residual_max = _finite_nonnegative(self.residual_max)
+        self.point_density = _finite_nonnegative(self.point_density)
+        self.confidence = float(
+            np.clip(self.confidence, 0.0, 1.0)
+            if np.isfinite(self.confidence)
+            else 0.0
+        )
+        self.ceiling_confidence = float(
+            np.clip(self.ceiling_confidence, 0.0, 1.0)
+            if np.isfinite(self.ceiling_confidence)
+            else 0.0
+        )
+        if self.classification == PlaneClassification.CLUTTER.value:
+            self.quarantined = True
+        if self.classification == PlaneClassification.CEILING.value:
+            self.ceiling_observed = True
+        if self.wall_vertical_extent is not None:
+            vertical = np.asarray(self.wall_vertical_extent, dtype=float).reshape(-1)
+            if vertical.shape == (2,) and np.isfinite(vertical).all():
+                self.wall_vertical_extent = (float(vertical.min()), float(vertical.max()))
+            else:
+                self.wall_vertical_extent = None
+        if self.in_plane_extents is not None:
+            in_plane = np.asarray(self.in_plane_extents, dtype=float)
+            if in_plane.shape == (2, 2) and np.isfinite(in_plane).all():
+                self.in_plane_extents = in_plane
+            else:
+                self.in_plane_extents = None
+
+    @property
+    def kind(self) -> str:
+        """Alias for callers that use ``kind`` for semantic plane type."""
+        return str(self.classification)
+
+    @property
+    def orientation(self) -> str:
+        """Return ``horizontal``, ``vertical``, or ``other``."""
+        if "horizontal" in self.tags:
+            return "horizontal"
+        if "vertical" in self.tags:
+            return "vertical"
+        return "other"
+
+    @property
+    def support_count(self) -> int:
+        return int(len(self.inlier_indices))
+
+    @property
+    def inlier_count(self) -> int:
+        return self.support_count
+
+    @property
+    def support(self) -> int:
+        return self.support_count
+
+    @property
+    def support_indices(self) -> np.ndarray:
+        """Alias for the source identities supporting this plane."""
+        return self.inlier_indices
+
+    @property
+    def inlier_ids(self) -> np.ndarray:
+        return self.inlier_indices
+
+    @property
+    def plane_type(self) -> str:
+        return str(self.classification)
+
+    @property
+    def type(self) -> str:
+        return str(self.classification)
+
+    @property
+    def label(self) -> str:
+        return str(self.classification)
+
+    @property
+    def inliers(self) -> np.ndarray:
+        return self.inlier_indices
+
+    @property
+    def residual_statistics(self) -> dict[str, float]:
+        return {
+            "rms": float(self.residual_rms),
+            "mean_abs": float(self.residual_mean_abs),
+            "median": float(self.residual_median),
+            "max": float(self.residual_max),
+        }
+
+    @property
+    def area(self) -> float:
+        """Observed in-plane bounding-box area in square metres."""
+        if self.in_plane_extents is None:
+            return 0.0
+        spans = np.maximum(self.in_plane_extents[:, 1] - self.in_plane_extents[:, 0], 0.0)
+        return float(spans[0] * spans[1])
+
+    @property
+    def vertical_extent(self) -> tuple[float, float] | None:
+        """Alias exposing a wall's height range along the recovered up axis."""
+        return self.wall_vertical_extent
+
+    @property
+    def extent_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return np.asarray(self.bounds_min), np.asarray(self.bounds_max)
+
+    @property
+    def bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.extent_bounds
+
+    @property
+    def equation(self) -> tuple[np.ndarray, float]:
+        """Return the normalized ``(normal, offset)`` plane equation."""
+        return self.normal, float(self.offset)
+
+    def signed_distance(self, points: np.ndarray) -> np.ndarray:
+        """Evaluate signed perpendicular residuals for arbitrary points."""
+        values = np.asarray(points, dtype=float)
+        return values @ self.normal - self.offset
+
+    def residuals(self, points: np.ndarray) -> np.ndarray:
+        return np.abs(self.signed_distance(points))
+
+    @property
+    def is_kept(self) -> bool:
+        return not self.quarantined
+
+    def to_wall_segment(
+        self,
+        frame: "HorizontalFrame",
+        index: int | None = None,
+        points: np.ndarray | None = None,
+    ) -> WallSegment | None:
+        """Convert this vertical 3D plane to the existing 2D wall model.
+
+        A vertical plane has a line as its floor-plan projection.  The
+        projected normal is normalized independently, while the observed
+        along-line range is obtained from the fitted plane footprint.  If
+        ``points`` is supplied, the range is recomputed from the retained
+        source inlier identities; otherwise the stored metric extent is used.
+        No Manhattan snapping occurs here, so slanted walls are represented
+        faithfully and the established ``snap_to_frame`` policy can decide
+        later whether to quarantine them from room topology.
+        """
+        if self.classification != PlaneClassification.WALL.value:
+            return None
+        up = np.asarray(frame.up, dtype=float)
+        up_norm = float(np.linalg.norm(up))
+        up = up / up_norm if up.shape == (3,) and up_norm > 1e-9 else np.array([0.0, 0.0, 1.0])
+        horizontal_normal = np.array(
+            [self.normal @ frame.right, self.normal @ frame.forward], dtype=float
+        )
+        horizontal_norm = float(np.linalg.norm(horizontal_normal))
+        if not np.isfinite(horizontal_norm) or horizontal_norm <= 1e-9:
+            return None
+        horizontal_normal /= horizontal_norm
+        direction = np.array([-horizontal_normal[1], horizontal_normal[0]])
+        centre_plan = np.asarray(frame.to_plan(self.centroid), dtype=float).reshape(2)
+
+        along = None
+        heights = None
+        if points is not None and len(self.inlier_indices):
+            source = np.asarray(points, dtype=float)
+            valid = self.inlier_indices[self.inlier_indices < len(source)]
+            source = source[valid]
+            if len(source):
+                plan = frame.to_plan(source)
+                along = (plan - centre_plan) @ direction
+                heights = source @ up
+        if along is None or not len(along):
+            if self._horizontal_extent is not None:
+                lo, hi = self._horizontal_extent
+            elif self.in_plane_extents is not None:
+                # The major in-plane tangent is normally the horizontal
+                # direction for a wall.  This fallback is only for planes
+                # constructed manually rather than by the detector.
+                lo, hi = tuple(self.in_plane_extents[0])
+            else:
+                lo, hi = (-0.5 * float(self.extents.max()), 0.5 * float(self.extents.max()))
+        else:
+            lo, hi = float(np.min(along)), float(np.max(along))
+        if hi - lo <= 1e-9:
+            return None
+        height_range = self.wall_vertical_extent
+        if heights is not None and len(heights):
+            height_range = (float(np.min(heights)), float(np.max(heights)))
+        wall = WallSegment(
+            index=self.id if index is None else int(index),
+            normal=horizontal_normal,
+            offset=float(horizontal_normal @ centre_plan),
+            start=centre_plan + direction * lo,
+            end=centre_plan + direction * hi,
+            inlier_count=self.support_count,
+            residual_rms=self.residual_rms,
+            observed_span=(0.0, float(hi - lo)),
+            height_range=height_range or (0.0, 0.0),
+            quarantined=self.quarantined,
+            structural_plane_id=self.id,
+            inlier_indices=self.inlier_indices.copy(),
+        )
+        wall.tags = sorted(set(wall.tags) | set(self.tags) - {"horizontal", "vertical"})
+        return wall
+
+    # Readable compatibility aliases used by downstream integrations.
+    to_wall = to_wall_segment
+    to_wall_line = to_wall_segment
+    as_wall_segment = to_wall_segment
+
+    def to_dict(self, include_inliers: bool = True) -> dict:
+        """Return a JSON-ready metric representation of this plane."""
+        extents = {
+            "min": np.asarray(self.bounds_min).tolist(),
+            "max": np.asarray(self.bounds_max).tolist(),
+            "size": np.asarray(self.extents).tolist(),
+            "in_plane": (
+                np.asarray(self.in_plane_extents).tolist()
+                if self.in_plane_extents is not None
+                else []
+            ),
+            "area_m2": round(self.area, 6),
+        }
+        document = {
+            "id": int(self.id),
+            "classification": self.classification,
+            "kind": self.classification,
+            "orientation": self.orientation,
+            "normal": self.normal.tolist(),
+            "offset": round(float(self.offset), 6),
+            "centroid": self.centroid.tolist(),
+            "extents": extents,
+            "support_points": self.support_count,
+            "inlier_count": self.support_count,
+            "residual_rms": round(float(self.residual_rms), 6),
+            "residual_rms_mm": round(float(self.residual_rms * 1000.0), 3),
+            "residual_mean_abs": round(float(self.residual_mean_abs), 6),
+            "residual_median": round(float(self.residual_median), 6),
+            "residual_max": round(float(self.residual_max), 6),
+            "point_density": round(float(self.point_density), 6),
+            "density": round(float(self.point_density), 6),
+            "confidence": round(float(self.confidence), 6),
+            "residual_statistics": {
+                key: round(value, 6)
+                for key, value in self.residual_statistics.items()
+            },
+            "wall_vertical_extent": (
+                list(self.wall_vertical_extent)
+                if self.wall_vertical_extent is not None
+                else None
+            ),
+            "vertical_extent": (
+                list(self.wall_vertical_extent)
+                if self.wall_vertical_extent is not None
+                else None
+            ),
+            "ceiling_observed": bool(self.ceiling_observed),
+            "ceiling_confidence": round(float(self.ceiling_confidence), 6),
+            "quarantined": bool(self.quarantined),
+            "tags": list(self.tags),
+        }
+        if include_inliers:
+            document["inlier_indices"] = self.inlier_indices.tolist()
+        return document
+
+
+# Common names for callers that prefer a shorter model name.
+Plane3D = StructuralPlane
+MetricPlane = StructuralPlane
+Plane = StructuralPlane
+PlaneModel = StructuralPlane
+
+
+def _finite_vector(value: np.ndarray, size: int) -> np.ndarray:
+    result = np.asarray(value, dtype=float).reshape(-1)
+    if result.shape != (size,) or not np.isfinite(result).all():
+        return np.zeros(size, dtype=float)
+    return result
+
+
+def _finite_nonnegative(value: float) -> float:
+    value = float(value)
+    return value if np.isfinite(value) and value >= 0.0 else 0.0
+
+
+def fit_plane_tls(points: np.ndarray) -> tuple[np.ndarray, float]:
+    """Fit a 3D plane by total least squares using an SVD.
+
+    The returned unit normal and offset minimize the perpendicular point-to-
+    plane residual over all finite input points.  The sign is canonicalized
+    by the largest-magnitude normal component, making this helper stable
+    across repeated runs and independent of the SVD sign convention.
+
+    A plane needs three non-collinear points.  Degenerate input returns a
+    safe horizontal plane rather than raising, which keeps batch extraction
+    conservative when a voxel or frame contains too little geometry.
+    """
+    values = np.asarray(points, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    values = values[np.isfinite(values).all(axis=1)]
+    if len(values) == 0:
+        return np.array([0.0, 0.0, 1.0]), 0.0
+    if len(values) == 1:
+        return np.array([0.0, 0.0, 1.0]), float(values[0, 2])
+    centroid = values.mean(axis=0)
+    _, singular_values, vh = np.linalg.svd(values - centroid, full_matrices=False)
+    if len(singular_values) < 3 or singular_values[1] <= 1e-9:
+        # There is no unique plane for a point or a line.  The fallback is
+        # finite and useful to callers that only need a safe equation; the
+        # structural detector rejects this case as degenerate.
+        return np.array([0.0, 0.0, 1.0]), float(centroid[2])
+    normal = _canonical_plane_normal(vh[-1])
+    return normal, float(normal @ centroid)
+
+
+# Explicit name for callers who want to distinguish 3D TLS from the older
+# 2D wall-line refit helper below.
+refit_plane_tls = fit_plane_tls
+
+
+def _canonical_plane_normal(normal: np.ndarray) -> np.ndarray:
+    """Choose one deterministic sign for an unoriented 3D plane normal."""
+    result = np.asarray(normal, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(result))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        return np.array([0.0, 0.0, 1.0])
+    result = result / norm
+    pivot = int(np.argmax(np.abs(result)))
+    if result[pivot] < 0.0:
+        result = -result
+    return result
+
+
+def _plane_from_three(points: np.ndarray) -> tuple[np.ndarray, float] | None:
+    """Return a stable plane hypothesis from three points, if non-collinear."""
+    a, b, c = np.asarray(points, dtype=float)
+    normal = np.cross(b - a, c - a)
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 1e-8:
+        return None
+    normal = _canonical_plane_normal(normal)
+    return normal, float(normal @ a)
+
+
+def _plane_basis(points: np.ndarray, normal: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return two deterministic tangent axes and the SVD normal."""
+    centroid = points.mean(axis=0)
+    _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
+    tangent_a = _canonical_plane_normal(vh[0])
+    # The second singular vector is already orthogonal to the first/normal;
+    # canonicalizing its sign keeps serialized extents stable.
+    tangent_b = _canonical_plane_normal(vh[1])
+    fitted_normal = _canonical_plane_normal(vh[-1])
+    # SVD can choose the opposite normal sign from the caller's fit.  The
+    # tangent span is unaffected, but returning the fitted normal here makes
+    # all downstream residuals use exactly the same TLS equation.
+    if fitted_normal @ normal < 0.0:
+        fitted_normal = -fitted_normal
+    return tangent_a, tangent_b, fitted_normal
+
+
+def _classify_plane(
+    normal: np.ndarray,
+    height: float,
+    floor_height: float,
+    up: np.ndarray,
+    horizontal_cosine: float,
+    vertical_sine: float,
+    min_room_height: float,
+    is_floor_candidate: bool,
+) -> tuple[str, bool, list[str]]:
+    """Classify an unoriented plane without imposing a Manhattan grid."""
+    alignment = abs(float(normal @ up))
+    tags: list[str] = []
+    if alignment >= horizontal_cosine:
+        tags.append("horizontal")
+        if is_floor_candidate:
+            return PlaneClassification.FLOOR.value, False, tags
+        if height - floor_height >= min_room_height:
+            return PlaneClassification.CEILING.value, False, tags
+        tags.append("off-orientation")
+        return PlaneClassification.CLUTTER.value, True, tags
+    if alignment <= vertical_sine:
+        tags.append("vertical")
+        return PlaneClassification.WALL.value, False, tags
+    tags.append("off-orientation")
+    return PlaneClassification.CLUTTER.value, True, tags
+
+
+def extract_structural_planes(
+    points: np.ndarray,
+    normals: np.ndarray | None = None,
+    up: np.ndarray | None = None,
+    *,
+    floor_height: float | None = None,
+    inlier_threshold: float = 0.03,
+    min_inliers: int = 30,
+    max_planes: int = 80,
+    ransac_iterations: int = 400,
+    seed: int = 0,
+    horizontal_tolerance_degrees: float = 25.0,
+    vertical_tolerance_degrees: float = 25.0,
+    min_room_height: float = 1.8,
+    min_plane_span: float = 1e-3,
+    ransac_sample_size: int = 10000,
+    quarantine: bool = True,
+    gravity_up: np.ndarray | None = None,
+    random_seed: int | None = None,
+) -> list[StructuralPlane]:
+    """Extract major metric planes with deterministic seeded RANSAC.
+
+    Candidate planes are proposed from non-collinear triples, grown by a
+    distance-supported region, and refit after every growth pass with 3D
+    total least squares.  The RANSAC hypothesis search may use a bounded,
+    deterministic working sample for large fused clouds, but final support
+    and inlier identities are always evaluated against every source point.
+
+    Horizontal planes are classified relative to ``floor_height`` (normally
+    the robust result from :func:`estimate_gravity`): the lowest coherent
+    plane is the floor, every coherent horizontal plane at least
+    ``min_room_height`` above it is retained as a ceiling, and intermediate
+    horizontal surfaces are quarantined as clutter.  This intentionally
+    allows more than one ceiling plane and accepts modestly sloped/vaulted
+    surfaces within the horizontal orientation tolerance.  Vertical planes
+    are retained without Manhattan snapping; the existing 2D wall stage can
+    decide later whether an individual wall is suitable for room topology.
+
+    Args:
+        points: Source world-space points, shape ``(N, 3)``.
+        normals: Optional source surface normals, aligned with ``points``.
+            They are used for plane quality diagnostics, not as a hard
+            geometric gate, so noisy or missing normals cannot erase a real
+            surface.
+        up: Recovered world-space up direction. Defaults to +Z.
+        floor_height: Existing robust floor offset. If omitted, the lowest
+            extracted horizontal candidate supplies the semantic reference.
+        inlier_threshold: Perpendicular distance in metres for support.
+        min_inliers: Minimum support for a candidate plane.
+        max_planes: Maximum number of sequentially extracted candidates.
+        ransac_iterations: Number of seeded hypotheses per iteration.
+        seed: Seed for the local NumPy generator; no global RNG is touched.
+        horizontal_tolerance_degrees: Maximum tilt from up for horizontal
+            classification.
+        vertical_tolerance_degrees: Maximum tilt from a vertical wall.
+        min_room_height: Minimum floor-to-ceiling separation.
+        min_plane_span: Reject exact/near-collinear supports.
+        ransac_sample_size: Maximum points used to score hypotheses; final
+            support is always evaluated on the full remaining set.
+        quarantine: Whether clutter/off-orientation planes remain in the
+            returned list marked ``quarantined``. If false they are omitted.
+        gravity_up: Compatibility alias for ``up``.
+        random_seed: Compatibility alias for ``seed``.
+
+    Returns:
+        A deterministic list of :class:`StructuralPlane` instances with
+        source inlier identities, TLS metrics, and semantic classification.
+    """
+    values = np.asarray(points, dtype=float)
+    if values.ndim == 1 and values.size == 0:
+        values = values.reshape(0, 3)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if up is None and gravity_up is not None:
+        up = gravity_up
+    if random_seed is not None:
+        seed = int(random_seed)
+    requested_max_planes = int(max_planes)
+    if requested_max_planes <= 0:
+        return []
+    source_indices = np.arange(len(values), dtype=int)
+    finite = np.isfinite(values).all(axis=1)
+    values = values[finite]
+    source_indices = source_indices[finite]
+    if not len(values):
+        return []
+
+    normals_array = None
+    if normals is not None:
+        candidate_normals = np.asarray(normals, dtype=float)
+        if candidate_normals.shape == (len(points), 3):
+            normals_array = candidate_normals[finite]
+
+    # Sorting makes the same point set yield the same sampled hypotheses even
+    # when frames or voxels arrive in a different order.  Original indices
+    # are carried separately so identity preservation still refers to the
+    # caller's point array.
+    order = np.lexsort((source_indices, values[:, 2], values[:, 1], values[:, 0]))
+    values = values[order]
+    source_indices = source_indices[order]
+    if normals_array is not None:
+        normals_array = normals_array[order]
+
+    up_value = np.asarray(up if up is not None else [0.0, 0.0, 1.0], dtype=float).reshape(-1)
+    up_norm = float(np.linalg.norm(up_value))
+    up_value = (
+        up_value / up_norm
+        if up_value.shape == (3,) and np.isfinite(up_norm) and up_norm > 1e-9
+        else np.array([0.0, 0.0, 1.0])
+    )
+    threshold = max(float(inlier_threshold), 1e-6)
+    minimum = max(3, int(min_inliers))
+    iterations = max(1, int(ransac_iterations))
+    remaining = np.arange(len(values), dtype=int)
+    rng = np.random.default_rng(seed)
+    candidates: list[dict] = []
+
+    while len(remaining) >= minimum and len(candidates) < requested_max_planes:
+        subset = values[remaining]
+        if len(subset) < 3:
+            break
+        pool_count = min(len(subset), max(3, int(ransac_sample_size)))
+        if pool_count < len(subset):
+            pool = np.unique(np.linspace(0, len(subset) - 1, pool_count).round().astype(int))
+        else:
+            pool = np.arange(len(subset), dtype=int)
+        pool_points = subset[pool]
+        best: tuple[tuple, np.ndarray, float] | None = None
+        for _ in range(iterations):
+            sample = rng.choice(len(pool_points), size=3, replace=False)
+            hypothesis = _plane_from_three(pool_points[sample])
+            if hypothesis is None:
+                continue
+            normal, offset = hypothesis
+            distances = np.abs(pool_points @ normal - offset)
+            mask = distances <= threshold
+            count = int(mask.sum())
+            if not count:
+                continue
+            residual = float(np.sqrt(np.mean(distances[mask] ** 2)))
+            key = (
+                -count,
+                residual,
+                tuple(np.round(normal, 12)),
+                round(float(offset), 12),
+            )
+            if best is None or key < best[0]:
+                best = (key, normal, float(offset))
+        if best is None:
+            break
+
+        normal, offset = best[1], best[2]
+        support = np.abs(subset @ normal - offset) <= threshold
+        # Region growing and TLS refitting alternate until the support set is
+        # stable.  The final pass always uses the full remaining cloud.
+        for _ in range(5):
+            if int(support.sum()) < 3:
+                break
+            fitted_normal, fitted_offset = fit_plane_tls(subset[support])
+            distances = np.abs(subset @ fitted_normal - fitted_offset)
+            grown = distances <= threshold
+            normal, offset = fitted_normal, fitted_offset
+            if np.array_equal(grown, support):
+                support = grown
+                break
+            support = grown
+        if int(support.sum()) < minimum:
+            # The best hypothesis can be an accidental small patch once the
+            # initial plane is refit.  Remove it and stop rather than emit a
+            # misleading candidate from the same remaining data.
+            break
+        inlier_points = subset[support]
+        normal, offset = fit_plane_tls(inlier_points)
+        residuals = np.abs(inlier_points @ normal - offset)
+        _, singular_values, _ = np.linalg.svd(
+            inlier_points - inlier_points.mean(axis=0), full_matrices=False
+        )
+        if len(singular_values) < 3 or singular_values[1] <= float(min_plane_span):
+            # Collinear support is not a plane.  Consume the points only if
+            # there is another valid hypothesis left; otherwise terminate.
+            remaining = remaining[~support]
+            continue
+        candidates.append(
+            {
+                "points": inlier_points.copy(),
+                "indices": source_indices[remaining[support]].copy(),
+                "normal": normal,
+                "offset": float(offset),
+                "residuals": residuals,
+                "normal_support": normals_array[remaining[support]].copy()
+                if normals_array is not None
+                else None,
+            }
+        )
+        remaining = remaining[~support]
+
+    if not candidates:
+        return []
+
+    horizontal_cosine = float(np.cos(np.radians(max(0.0, horizontal_tolerance_degrees))))
+    vertical_sine = float(np.sin(np.radians(max(0.0, vertical_tolerance_degrees))))
+    candidate_heights = [float(candidate["points"].mean(axis=0) @ up_value) for candidate in candidates]
+    finite_floor = floor_height is not None and np.isfinite(float(floor_height))
+    floor_reference = float(floor_height) if finite_floor else min(candidate_heights)
+    horizontal_indices = [
+        index
+        for index, candidate in enumerate(candidates)
+        if abs(float(candidate["normal"] @ up_value)) >= horizontal_cosine
+    ]
+    if horizontal_indices:
+        if finite_floor:
+            floor_candidates = sorted(
+                horizontal_indices,
+                key=lambda index: (
+                    abs(candidate_heights[index] - floor_reference),
+                    candidate_heights[index],
+                    -len(candidates[index]["indices"]),
+                ),
+            )
+            floor_index = floor_candidates[0]
+            # A supplied floor estimate is intentionally authoritative only
+            # when a candidate is plausibly close; otherwise use the lowest
+            # horizontal support instead of labelling a countertop a floor.
+            if abs(candidate_heights[floor_index] - floor_reference) > 0.5:
+                floor_index = min(
+                    horizontal_indices,
+                    key=lambda index: (candidate_heights[index], -len(candidates[index]["indices"])),
+                )
+        else:
+            floor_index = min(
+                horizontal_indices,
+                key=lambda index: (candidate_heights[index], -len(candidates[index]["indices"])),
+            )
+        floor_reference = candidate_heights[floor_index]
+    else:
+        floor_index = None
+
+    models: list[StructuralPlane] = []
+    for candidate_index, candidate in enumerate(candidates):
+        plane_points = candidate["points"]
+        centroid = plane_points.mean(axis=0)
+        normal = np.asarray(candidate["normal"], dtype=float)
+        height = float(centroid @ up_value)
+        is_floor_candidate = candidate_index == floor_index
+        classification, is_quarantined, tags = _classify_plane(
+            normal,
+            height,
+            floor_reference,
+            up_value,
+            horizontal_cosine,
+            vertical_sine,
+            float(min_room_height),
+            is_floor_candidate,
+        )
+        # Give floor/ceiling normals physically meaningful signs.  Walls are
+        # left with a deterministic sign only; unlike the old wall path,
+        # their orientation is not forced to a Manhattan axis.
+        if classification == PlaneClassification.FLOOR.value and normal @ up_value < 0:
+            normal = -normal
+        elif classification == PlaneClassification.CEILING.value and normal @ up_value > 0:
+            normal = -normal
+        else:
+            normal = _canonical_plane_normal(normal)
+        offset = float(normal @ centroid)
+        residuals = np.abs(plane_points @ normal - offset)
+        bounds_min = plane_points.min(axis=0)
+        bounds_max = plane_points.max(axis=0)
+        tangent_a, tangent_b, _ = _plane_basis(plane_points, normal)
+        tangent_coordinates = np.column_stack(
+            ((plane_points - centroid) @ tangent_a, (plane_points - centroid) @ tangent_b)
+        )
+        in_plane_extents = np.column_stack(
+            (tangent_coordinates.min(axis=0), tangent_coordinates.max(axis=0))
+        )
+        spans = in_plane_extents[:, 1] - in_plane_extents[:, 0]
+        area = float(max(spans[0], 0.0) * max(spans[1], 0.0))
+        density = float(len(plane_points) / area) if area > 1e-9 else 0.0
+        support_score = 1.0 - np.exp(-len(plane_points) / max(float(minimum), 1.0))
+        residual_score = float(np.exp(-float(np.sqrt(np.mean(residuals**2))) / threshold))
+        density_score = density / (density + 25.0) if density > 0 else 0.0
+        extent_score = float(np.clip(np.min(spans) / 0.5, 0.0, 1.0))
+        normal_score = 1.0
+        if candidate["normal_support"] is not None and len(candidate["normal_support"]):
+            source_normals = candidate["normal_support"]
+            lengths = np.linalg.norm(source_normals, axis=1)
+            valid_normals = np.isfinite(source_normals).all(axis=1) & (lengths > 1e-9)
+            if valid_normals.any():
+                source_normals = source_normals[valid_normals]
+                source_normals = source_normals / lengths[valid_normals, None]
+                normal_score = float(np.mean(np.abs(source_normals @ normal)))
+        confidence = float(
+            np.clip(
+                0.40 * support_score
+                + 0.30 * residual_score
+                + 0.15 * density_score
+                + 0.15 * extent_score * normal_score,
+                0.0,
+                1.0,
+            )
+        )
+        vertical_values = plane_points @ up_value
+        vertical_extent = tuple(
+            float(v) for v in (float(vertical_values.min()), float(vertical_values.max()))
+        )
+        horizontal_tangent = np.cross(up_value, normal)
+        tangent_norm = float(np.linalg.norm(horizontal_tangent))
+        horizontal_extent = None
+        if tangent_norm > 1e-9:
+            horizontal_tangent /= tangent_norm
+            horizontal_coordinates = (plane_points - centroid) @ horizontal_tangent
+            horizontal_extent = (
+                float(horizontal_coordinates.min()),
+                float(horizontal_coordinates.max()),
+            )
+        model = StructuralPlane(
+            id=candidate_index,
+            classification=classification,
+            normal=normal,
+            offset=offset,
+            centroid=centroid,
+            extents=bounds_max - bounds_min,
+            inlier_indices=np.sort(candidate["indices"]),
+            residual_rms=float(np.sqrt(np.mean(residuals**2))),
+            residual_mean_abs=float(np.mean(residuals)),
+            residual_median=float(np.median(residuals)),
+            residual_max=float(np.max(residuals)),
+            point_density=density,
+            confidence=confidence,
+            bounds_min=bounds_min,
+            bounds_max=bounds_max,
+            in_plane_extents=in_plane_extents,
+            wall_vertical_extent=vertical_extent if classification == PlaneClassification.WALL.value else None,
+            ceiling_observed=classification == PlaneClassification.CEILING.value,
+            ceiling_confidence=confidence if classification == PlaneClassification.CEILING.value else 0.0,
+            quarantined=bool(is_quarantined and quarantine),
+            tags=tags,
+            _horizontal_tangent=horizontal_tangent if horizontal_extent is not None else None,
+            _horizontal_extent=horizontal_extent,
+            _up=up_value.copy(),
+        )
+        if is_quarantined and not quarantine:
+            continue
+        models.append(model)
+
+    class_order = {
+        PlaneClassification.FLOOR.value: 0,
+        PlaneClassification.CEILING.value: 1,
+        PlaneClassification.WALL.value: 2,
+        PlaneClassification.CLUTTER.value: 3,
+    }
+    models.sort(
+        key=lambda plane: (
+            class_order.get(str(plane.classification), 99),
+            float(plane.centroid @ up_value),
+            -plane.support_count,
+            tuple(np.round(plane.centroid, 9)),
+        )
+    )
+    for index, plane in enumerate(models):
+        plane.id = index
+    return models
+
+
+def detect_major_planes(*args, **kwargs) -> list[StructuralPlane]:
+    """Compatibility alias for :func:`extract_structural_planes`."""
+    return extract_structural_planes(*args, **kwargs)
+
+
+def extract_planes(*args, **kwargs) -> list[StructuralPlane]:
+    """Compatibility alias for :func:`extract_structural_planes`."""
+    return extract_structural_planes(*args, **kwargs)
+
+
+def extract_planes_3d(*args, **kwargs) -> list[StructuralPlane]:
+    """Explicit 3D alias for :func:`extract_structural_planes`."""
+    return extract_structural_planes(*args, **kwargs)
+
+
+def extract_structural_plane_models(*args, **kwargs) -> list[StructuralPlane]:
+    """Descriptive alias for :func:`extract_structural_planes`."""
+    return extract_structural_planes(*args, **kwargs)
+
+
+def detect_planes(*args, **kwargs) -> list[StructuralPlane]:
+    """Short compatibility alias for :func:`extract_structural_planes`."""
+    return extract_structural_planes(*args, **kwargs)
+
+
+fit_plane_3d = fit_plane_tls
+refit_plane_3d = fit_plane_tls
+
+
+def planes_to_wall_segments(
+    planes: list[StructuralPlane],
+    frame: HorizontalFrame,
+    points: np.ndarray | None = None,
+    include_quarantined: bool = False,
+) -> list[WallSegment]:
+    """Convert retained wall planes to the established 2D wall segments."""
+    result = []
+    for plane in planes:
+        if plane.classification != PlaneClassification.WALL.value:
+            continue
+        if plane.quarantined and not include_quarantined:
+            continue
+        wall = plane.to_wall_segment(frame, index=len(result), points=points)
+        if wall is not None:
+            result.append(wall)
+    return result
+
+
+planes_to_walls = planes_to_wall_segments
 
 
 def estimate_horizontal_frame(

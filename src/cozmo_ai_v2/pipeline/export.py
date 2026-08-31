@@ -47,6 +47,35 @@ def write_json(payload: dict, path: str | Path) -> Path:
     return path
 
 
+def export_plane_metadata(planes, path: str | Path, frame=None) -> Path:
+    """Write the retained structural-plane metrics as a standalone export.
+
+    ``result.json`` remains the canonical pipeline result.  This companion
+    file is useful to geometry consumers that need the plane support and
+    inlier identities without loading damage, scope, and room documents. If
+    a ``HorizontalFrame`` is supplied, wall-plane documents also include the
+    converted 2D wall line.
+    """
+    documents = []
+    for plane in planes or []:
+        document = plane.to_dict() if hasattr(plane, "to_dict") else dict(plane)
+        if frame is not None and hasattr(plane, "to_wall_segment"):
+            line = plane.to_wall_segment(frame)
+            document["wall_line"] = (
+                {
+                    "start": line.start.tolist(),
+                    "end": line.end.tolist(),
+                    "normal": line.normal.tolist(),
+                    "offset": float(line.offset),
+                    "vertical_extent": list(line.height_range),
+                }
+                if line is not None
+                else None
+            )
+        documents.append(document)
+    return write_json({"planes": documents}, path)
+
+
 def _default(value):
     """`json.dumps`'s `default` hook: convert one non-JSON-native value.
 
@@ -638,6 +667,7 @@ def export_scene(
     floor_height: float,
     ceiling_height: float | None = None,
     rooms: list[dict] | None = None,
+    structural_planes: list[dict] | None = None,
 ) -> Path:
     """Writes the reconstruction as a 3D GLB file, with every wall, floor, and ceiling as its own named surface.
 
@@ -664,6 +694,9 @@ def export_scene(
         rooms: Room dicts (same shape as `result["rooms"]`) to also export
             floor/ceiling planes for, named `"{room}.floor"` /
             `"{room}.ceiling"`.
+        structural_planes: Optional serialized structural-plane documents to
+            retain in the GLB metadata. Their geometry and source support
+            are also available in `result.json` and `planes.json`.
 
     Returns:
         The `Path` the GLB scene was written to.
@@ -671,6 +704,11 @@ def export_scene(
     import trimesh
 
     scene = trimesh.Scene()
+    # GLB consumers that do not need to render the plane surfaces can still
+    # recover the exact fitted model, including quarantine state and source
+    # support, from the scene metadata.  Keep it JSON-compatible because
+    # trimesh forwards this dictionary to the GLTF exporter.
+    scene.metadata["structural_planes"] = structural_planes or []
     top = ceiling_height if ceiling_height is not None else floor_height + 2.4
     for wall in walls:
         quad = _wall_quad(wall, floor_height, top)
