@@ -41,3 +41,29 @@ def stray_scanner_dataset(tmp_path, synthetic_video):
     (dataset_dir / "rgb.mp4").write_bytes(synthetic_video.read_bytes())
     np.savetxt(dataset_dir / "camera_matrix.csv", CAMERA_MATRIX, delimiter=",")
     return dataset_dir
+
+
+DEPTH_WIDTH = 16
+DEPTH_HEIGHT = 12
+
+# Depth in mm for each of the 2 synthetic video frames (a simple ramp across
+# columns, so there's real spatial structure to fit/fuse against).
+FRAME_DEPTHS_MM = [
+    np.tile(np.linspace(1800, 2200, DEPTH_WIDTH, dtype=np.uint16), (DEPTH_HEIGHT, 1)),
+    np.tile(np.linspace(2300, 2700, DEPTH_WIDTH, dtype=np.uint16), (DEPTH_HEIGHT, 1)),
+]
+
+
+@pytest.fixture
+def lidar_stray_scanner_dataset(stray_scanner_dataset):
+    depth_dir = stray_scanner_dataset / "depth"
+    confidence_dir = stray_scanner_dataset / "confidence"
+    depth_dir.mkdir()
+    confidence_dir.mkdir()
+
+    for index, depth_mm in enumerate(FRAME_DEPTHS_MM):
+        cv2.imwrite(str(depth_dir / f"{index:06d}.png"), depth_mm)
+        confidence = np.full((DEPTH_HEIGHT, DEPTH_WIDTH), 2, dtype=np.uint8)
+        cv2.imwrite(str(confidence_dir / f"{index:06d}.png"), confidence)
+
+    return stray_scanner_dataset

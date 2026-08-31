@@ -1,11 +1,12 @@
 [project]
 name = "cozmo-ai-v2"
 version = "0.1.0"
-description = "Prepares Stray Scanner captures or plain RGB video as MASt3R-SLAM inputs"
+description = "Prepares Stray Scanner captures or plain RGB video as MASt3R-SLAM inputs; fuses monocular depth with LiDAR"
 requires-python = ">=3.10"
 dependencies = [
-    "opencv-python-headless>=4.9",
+    "opencv-contrib-python-headless>=4.9",
     "pyyaml>=6.0",
+    "scipy>=1.10",
 ]
 
 [project.scripts]
@@ -13,6 +14,7 @@ cozmo-ai-v2 = "cozmo_ai_v2.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
+depth = ["torch>=2.0", "torchvision"]
 
 [build-system]
 requires = ["hatchling"]
