@@ -1440,12 +1440,16 @@ def snap_corners(
     """
     from .wall_graph import solve_wall_graph
 
-    tolerance = max(float(max_extension), float(max_trim))
+    # Keep graph clustering local and separate from the legacy extension
+    # budget.  The old wrapper used the larger value as a global node
+    # tolerance, which could silently turn a large gap into a corner.
+    extension = max(float(max_extension), float(max_trim))
     graph = solve_wall_graph(
         walls,
-        node_tolerance=tolerance,
+        node_tolerance=0.12,
         min_length=1e-9,
         min_confidence=0.0,
+        max_endpoint_extension=extension,
     )
     solved_by_index = {wall.index: wall for wall in graph.candidates}
     for wall in walls:

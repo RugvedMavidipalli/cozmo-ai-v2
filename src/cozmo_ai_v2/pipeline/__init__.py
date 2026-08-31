@@ -15,7 +15,14 @@ from .planes import (
     project_vertical_plane,
     vertical_plane_to_line,
 )
-from .wall_graph import WallGraph, WallGraphNode, solve_wall_graph
+from .wall_graph import (
+    ConnectionType,
+    WallGraph,
+    WallGraphConnection,
+    WallGraphDiagnostics,
+    WallGraphNode,
+    solve_wall_graph,
+)
 from .roomformer import (
     TENSOR_CHANNELS,
     RoomFormerCoordinateSpace,
@@ -50,6 +57,9 @@ __all__ = [
     "vertical_plane_to_line",
     "project_vertical_plane",
     "WallGraph",
+    "ConnectionType",
+    "WallGraphDiagnostics",
+    "WallGraphConnection",
     "WallGraphNode",
     "solve_wall_graph",
     "RoomFormerAdapter",

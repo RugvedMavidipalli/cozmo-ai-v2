@@ -335,7 +335,7 @@ def segment_rooms(
     if not accepted:
         accepted = [
             (polygon, *(_face_observation_metrics(polygon, grid, free)),
-             "observed floor component")
+             "fallback observed floor component (low-confidence; no validated wall graph face)")
             for polygon in _observed_floor_polygons(grid, free, min_area)
         ]
     if not accepted:
@@ -343,6 +343,7 @@ def segment_rooms(
 
     rooms: list[Room] = []
     for polygon, coverage, visibility, provenance in accepted:
+        is_fallback = provenance.startswith("fallback")
         centroid = polygon.centroid
         rooms.append(
             Room(
@@ -355,7 +356,11 @@ def segment_rooms(
                 polygon=np.asarray(polygon.exterior.coords)[:-1],
                 observed_coverage=coverage,
                 visibility=visibility,
-                confidence=min(coverage, visibility),
+                confidence=(
+                    min(coverage, visibility, 0.35)
+                    if is_fallback
+                    else min(coverage, visibility)
+                ),
                 provenance=provenance,
             )
         )
@@ -474,7 +479,9 @@ def _observed_floor_polygons(
     from shapely.geometry import box
     from shapely.ops import unary_union
 
-    labels, count = ndimage.label(free, structure=np.ones((3, 3), dtype=int))
+    labels, count = ndimage.label(
+        free, structure=ndimage.generate_binary_structure(2, 1)
+    )
     polygons = []
     for label in range(1, count + 1):
         cells = np.argwhere(labels == label)
@@ -484,7 +491,7 @@ def _observed_floor_polygons(
         # bridge a doorway-sized unknown gap and thereby manufacture free
         # space that was never observed.
         points = grid.to_plan(cells)
-        polygon = unary_union(
+        geometry = unary_union(
             [
                 box(
                     point[0] - grid.resolution / 2,
@@ -495,19 +502,34 @@ def _observed_floor_polygons(
                 for point in points
             ]
         )
-        # Room's public schema carries one exterior ring.  Do not discard
-        # an interior ring here: doing so would claim an unobserved hole is
-        # free space.  A future schema can represent holes explicitly.
-        if (
-            polygon.geom_type == "Polygon"
-            and not polygon.interiors
-            and polygon.area >= min_area
-        ):
+        # A sparse observed-floor component can legitimately union to a
+        # MultiPolygon or GeometryCollection. Keep each independently
+        # observed polygon, but never take a hull or bridge its unknown gaps.
+        for polygon in _polygon_components(geometry):
+            # Room's public schema carries one exterior ring. Reject holes
+            # instead of discarding them, because that would claim unknown
+            # interior space is observed and free.
+            if polygon.interiors or polygon.area < min_area:
+                continue
             polygons.append(polygon)
     return sorted(
         polygons,
         key=lambda face: (round(face.centroid.x, 8), round(face.centroid.y, 8)),
     )
+
+
+def _polygon_components(geometry) -> list[object]:
+    """Extract simple polygon components from Shapely composite geometry."""
+    if geometry is None or geometry.is_empty:
+        return []
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    if geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
+        components: list[object] = []
+        for child in geometry.geoms:
+            components.extend(_polygon_components(child))
+        return components
+    return []
 
 
 def _assign_graph_walls(rooms: list[Room], walls: list[WallSegment]) -> None:

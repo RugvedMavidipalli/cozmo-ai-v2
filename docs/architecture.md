@@ -43,17 +43,21 @@ output feeds the next:
    horizontal frame, and extracts, merges, and occlusion-filters wall segments.
 6. **wall refinement** (`drift.refit_wall_offsets`, `wall_graph.solve_wall_graph`) —
    per-visit offset refitting and drift measurement followed by one global,
-   plane-constrained solve for shared L/T/X nodes. Weak or unintended-crossing
-   candidates remain quarantined for diagnostics rather than being forced into
-   the topology.
+   plane-constrained solve for shared L/T/X nodes. Endpoint closure is only
+   proposed when two wall lines provide a bounded, evidence-supported
+   intersection (the default per-wall extension cap is 0.55 m); there is no
+   global 0.8 m snap. Weak, off-axis, or unintended-crossing candidates remain
+   quarantined for diagnostics rather than being forced into the topology.
 7. **rooms/vectorization** (`projection.project_wall_density`,
    `vectorizer.VectorizerInput`/`VectorizerOutput`, `rooms.segment_rooms`) —
    `projection.project_wall_density` first
    crops the cleaned cloud to the configured wall-height band and produces the
    deterministic NumPy top-down density map carried by `rooms.PlanGrid`; the
    vectorizer then uses that wall evidence alongside observed floor cells for
-   room naming, adjacency, and (this session) a self-consistency check
-   (`rooms.check_no_overlaps`) that flags any polygon overlap as a warning.
+   graph-face validation, room naming, and adjacency. Incomplete graphs use
+   only independently observed free-cell components as a low-confidence
+   fallback; unknown cells are never filled or bridged. A self-consistency
+   check (`rooms.check_no_overlaps`) flags any polygon overlap as a warning.
    The optional `roomformer.RoomFormerAdapter` consumes the same explicit
    `(density, observability)` tensor at this boundary and returns a
    finished-face `WallGraphProposal` with polygons, corners, topology, model

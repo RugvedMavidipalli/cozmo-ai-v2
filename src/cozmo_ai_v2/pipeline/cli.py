@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import shutil
 import sys
 import time
@@ -33,7 +34,12 @@ from .planes import (
     wall_band_mask,
 )
 from .poses import refine_trajectory, select_keyframes
-from .rooms import build_plan_grid, check_no_overlaps, segment_rooms
+from .rooms import (
+    build_plan_grid,
+    check_no_overlaps,
+    polygonize_wall_graph,
+    segment_rooms,
+)
 from .roomformer import RoomFormerAdapter
 from .scope import ScopeEngine
 from .uncertainty import UncertaintyModel
@@ -171,13 +177,19 @@ def run(args: argparse.Namespace) -> int:
         )
 
     # Stage 5: geometry
+    wall_stage_counts = {}
+    wall_drop_counts = {}
     with timings.stage("geometry"):
         gravity = estimate_gravity(points, hint=bundle.gravity_up, normals=normals)
         frame = estimate_horizontal_frame(normals, gravity.up)
         band = wall_band_mask(points, normals, gravity, gravity.up)
         walls = extract_walls(frame.to_plan(points[band]), frame.height(points[band]))
+        wall_stage_counts["raw"] = len(walls)
         walls = merge_collinear(snap_to_frame(walls, frame))
+        wall_stage_counts["merged"] = len(walls)
         walls, occluded_out = filter_occluded_walls(walls, frame, sampled, origins)
+        wall_stage_counts["occlusion"] = len(walls)
+        wall_drop_counts["occlusion"] = occluded_out
     ceiling = gravity.ceiling_height
     print(
         f"  {len(walls)} walls ({occluded_out} occlusion-inconsistent removed), "
@@ -191,8 +203,12 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("wall refinement"):
         refitted = refit_wall_offsets(walls, frame, sampled, times)
         drift = measure_drift(walls, frame, sampled, times)
+        wall_stage_counts["graph_input"] = len(walls)
         wall_graph = solve_wall_graph(walls)
         walls = list(wall_graph.walls)
+        wall_stage_counts["crossing"] = len(wall_graph.candidates)
+        wall_stage_counts["graph_output"] = len(walls)
+        wall_stage_counts["persisted"] = len(walls)
         corners = wall_graph.snapped_endpoint_count
     print(
         f"  {refitted} offsets refitted by visit, {len(walls)} walls after "
@@ -246,6 +262,16 @@ def run(args: argparse.Namespace) -> int:
             warnings.append("ceiling not observed; wall opening heights are unavailable")
         openings = deduplicate_openings(openings)
     print(f"  {len(openings)} openings")
+
+    geometry_diagnostics = _build_geometry_diagnostics(
+        wall_stage_counts=wall_stage_counts,
+        wall_drop_counts=wall_drop_counts,
+        graph=wall_graph,
+        walls=walls,
+        grid=grid,
+        frame=frame,
+        rooms=rooms,
+    )
 
     vectorizer_output = build_vectorizer_output(
         vectorizer_input,
@@ -345,6 +371,7 @@ def run(args: argparse.Namespace) -> int:
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
             line_items, drift, drift_report, surface_grids, uncertainty,
             vectorizer_output,
+            geometry_diagnostics,
             timings, warnings, engine,
         )
         export.write_json(result, out_dir / "result.json")
@@ -633,10 +660,292 @@ def _infer_adjacency_via(
     return best_name
 
 
+def _build_geometry_diagnostics(
+    *,
+    wall_stage_counts: dict[str, int],
+    wall_drop_counts: dict[str, int],
+    graph,
+    walls,
+    grid,
+    frame,
+    rooms,
+) -> dict:
+    """Assemble canonical, non-model geometry explainability metadata."""
+    candidate_walls = list(graph.candidates)
+    quarantine_reasons = Counter()
+    trim_reasons = Counter()
+    for wall in candidate_walls:
+        reasons = set(wall.tags)
+        if wall.quarantined and not reasons:
+            reasons.add(wall.snap_status or "quarantined")
+        for tag in sorted(reasons):
+            if "trim" in tag:
+                trim_reasons[tag] += 1
+        if wall.quarantined:
+            for reason in sorted(reasons):
+                if reason in {
+                    "low-confidence",
+                    "off-axis",
+                    "too-short",
+                    "unintended-crossing",
+                    "rejected-crossing",
+                    "extension-out-of-bounds",
+                    "invalid-geometry",
+                    "degenerate",
+                } or reason.startswith("rejected"):
+                    quarantine_reasons[reason] += 1
+
+    exported_wall_ids = {
+        wall.index for wall in graph.walls if wall.length >= 0.5
+    }
+    wall_records = [
+        {
+            "wall_id": f"wall_{wall.index}",
+            "wall_index": wall.index,
+            "endpoint_ids": [
+                f"wall_{wall.index}:start",
+                f"wall_{wall.index}:end",
+            ],
+            "stage": "quarantine" if wall.quarantined else "final",
+            "action": "quarantine" if wall.quarantined else "persist",
+            "exported": wall.index in exported_wall_ids,
+            "exported_wall_index": wall.index if wall.index in exported_wall_ids else None,
+            "reason": (
+                " | ".join(sorted(set(wall.tags)))
+                if wall.tags
+                else "accepted"
+            ),
+            "provenance": wall.provenance,
+            "start": wall.start.tolist(),
+            "end": wall.end.tolist(),
+            "normal": wall.normal.tolist(),
+            "length_m": round(wall.length, 6),
+            "tags": sorted(set(wall.tags)),
+            "related_wall_ids": [],
+            "related_wall_indices": [],
+        }
+        for wall in candidate_walls
+    ]
+    graph_diagnostics = graph.diagnostics
+    endpoint_gaps = {
+        "endpoint_count": graph_diagnostics.after_endpoint_count,
+        "gap_quantiles_m": _gap_quantiles(
+            graph_diagnostics.after_nearest_endpoint_gap_m
+        ),
+        "component_count": graph_diagnostics.after_endpoint_components,
+        "junction_counts": dict(
+            sorted(Counter(node.kind for node in graph.nodes).items())
+        ),
+        "node_tolerance_m": graph_diagnostics.node_tolerance_m,
+        "before": {
+            "endpoint_count": graph_diagnostics.before_endpoint_count,
+            "gap_quantiles_m": _gap_quantiles(
+                graph_diagnostics.before_nearest_endpoint_gap_m
+            ),
+            "component_count": graph_diagnostics.before_endpoint_components,
+            "incidence_count": graph_diagnostics.before_endpoint_incidence_count,
+        },
+        "after": {
+            "incidence_count": graph_diagnostics.after_endpoint_incidence_count,
+        },
+    }
+
+    candidate_faces = polygonize_wall_graph(walls)
+    accepted_faces = [
+        room
+        for room in rooms
+        if room.polygon is not None and not room.provenance.startswith("fallback")
+    ]
+    from .rooms import _face_observation_metrics
+
+    free_for_rooms = (
+        (np.asarray(grid.free) >= 3) & (np.asarray(grid.occupied) < 6)
+    )
+    accepted_face_geometries = []
+    from shapely.geometry import Polygon
+
+    for room in accepted_faces:
+        if room.polygon is not None and len(room.polygon) >= 3:
+            accepted_face_geometries.append(Polygon(room.polygon))
+    rejected_faces_by_reason = Counter()
+    face_records = []
+    for face_index, face in enumerate(candidate_faces):
+        coverage, visibility = _face_observation_metrics(
+            face, grid, free_for_rooms
+        )
+        accepted = any(
+            face.symmetric_difference(accepted_face).area <= 1e-6
+            for accepted_face in accepted_face_geometries
+        )
+        if not accepted:
+            if coverage < 0.10:
+                rejected_faces_by_reason["observed_coverage"] += 1
+            if visibility < 0.10:
+                rejected_faces_by_reason["visibility"] += 1
+            if coverage >= 0.10 and visibility >= 0.10:
+                rejected_faces_by_reason["not_persisted"] += 1
+        face_records.append(
+            {
+                "face_id": f"face_{face_index}",
+                "polygon": [
+                    [round(float(value), 6) for value in point]
+                    for point in np.asarray(face.exterior.coords)[:-1]
+                ],
+                "area_m2": round(float(face.area), 6),
+                "observed_coverage": round(coverage, 4),
+                "visibility": round(visibility, 4),
+                "accepted": accepted,
+                "reason": None if accepted else "observed coverage/visibility",
+                "provenance": (
+                    "validated wall graph"
+                    if accepted
+                    else "candidate wall graph"
+                ),
+            }
+        )
+    polygonization = {
+        "candidate_face_count": len(candidate_faces),
+        "accepted_face_count": len(accepted_faces),
+        "rejected_faces_by_reason": dict(sorted(rejected_faces_by_reason.items())),
+        "geometry_types": dict(
+            sorted(
+                Counter(face.geom_type for face in candidate_faces).items()
+            )
+        ),
+        "faces": face_records,
+    }
+
+    occupied_mask = np.asarray(grid.occupied) > 0
+    free = (np.asarray(grid.free) > 0) & ~occupied_mask
+    observed_free_evidence = np.asarray(grid.free) > 0
+    occupied_evidence = occupied_mask
+    observed = observed_free_evidence | occupied_evidence
+    from scipy import ndimage
+
+    labels, free_component_count = ndimage.label(
+        free, structure=np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    )
+    del labels
+    grid_metadata = {
+        "resolution_m": grid.resolution,
+        "origin": grid.origin.tolist(),
+        "bounds_plan": {
+            "min": grid.origin.tolist(),
+            "max": (
+                grid.origin + np.asarray(grid.occupied.shape) * grid.resolution
+            ).tolist(),
+        },
+        "shape": list(grid.occupied.shape),
+        "transforms": {
+            "world_to_plan": {
+                "right": frame.right.tolist(),
+                "forward": frame.forward.tolist(),
+            },
+            "world_height_axis": frame.up.tolist(),
+            "yaw_rad": float(frame.yaw),
+        },
+        "occupied_cells": int((np.asarray(grid.occupied) > 0).sum()),
+        "free_cells": int(free.sum()),
+        "unknown_cells": int((~observed).sum()),
+        "free_component_count": int(free_component_count),
+        "occupied_evidence_cells": int(occupied_evidence.sum()),
+        "free_evidence_cells": int(observed_free_evidence.sum()),
+    }
+
+    fallback_used = any(room.provenance.startswith("fallback") for room in rooms)
+    fallback_geometry_types = {}
+    if fallback_used:
+        from .rooms import _observed_floor_polygons
+
+        fallback_polygons = _observed_floor_polygons(
+            grid, free_for_rooms, min_area=1.4
+        )
+        fallback_geometry_types = dict(
+            sorted(Counter(polygon.geom_type for polygon in fallback_polygons).items())
+        )
+    zero_room_reasons = []
+    if not rooms:
+        if not candidate_faces:
+            zero_room_reasons.append("no candidate wall-graph faces")
+        elif not accepted_faces:
+            zero_room_reasons.append(
+                "candidate wall-graph faces rejected by observed coverage/visibility"
+            )
+        if not free_component_count:
+            zero_room_reasons.append("no observed floor components")
+        else:
+            zero_room_reasons.append(
+                "observed floor components are below the configured area or contain unknown gaps"
+            )
+
+    return {
+        "diagnostics_version": 1,
+        "wall_stages": {
+            "stage_counts": {
+                "raw": int(wall_stage_counts.get("raw", 0)),
+                "merged": int(
+                    wall_stage_counts.get(
+                        "merged", wall_stage_counts.get("merge", 0)
+                    )
+                ),
+                "occlusion": int(wall_stage_counts.get("occlusion", 0)),
+                "crossing": int(
+                    wall_stage_counts.get(
+                        "crossing", wall_stage_counts.get("graph_input", 0)
+                    )
+                ),
+                "quarantine": int(
+                    sum(1 for wall in candidate_walls if wall.quarantined)
+                ),
+                # The graph's post-refinement population is the internal
+                # result (recordings-2: 33); export applies the existing
+                # 0.5 m reporting gate (recordings-2: 31).
+                "post_refinement_internal": int(len(graph.walls)),
+                "exported": int(len(exported_wall_ids)),
+                # Compatibility alias for older consumers. New diagnostics
+                # must use post_refinement_internal instead of final alone.
+                "final": int(len(graph.walls)),
+            },
+            "drops_by_reason": dict(wall_drop_counts),
+            "quarantines_by_reason": dict(sorted(quarantine_reasons.items())),
+            "trims_by_reason": dict(sorted(trim_reasons.items())),
+        },
+        "wall_records": wall_records,
+        "endpoint_gaps": endpoint_gaps,
+        "polygonization": polygonization,
+        "grid": grid_metadata,
+        "room_segmentation": {
+            "method": (
+                "wall_graph_faces"
+                if accepted_faces
+                else "observed_floor_components" if fallback_used else "none"
+            ),
+            "fallback_used": fallback_used,
+            "fallback_geometry_types": fallback_geometry_types,
+            "room_count": len(rooms),
+            "zero_room_reason": zero_room_reasons[0] if zero_room_reasons else None,
+        },
+        "zero_room_reasons": zero_room_reasons,
+    }
+
+
+def _gap_quantiles(metrics: dict[str, float | None]) -> dict[str, float | None]:
+    """Map internal endpoint metric names to the published diagnostics keys."""
+    return {
+        "p50": metrics.get("median"),
+        "p75": metrics.get("p75"),
+        "p90": metrics.get("p90"),
+        "p95": metrics.get("p95"),
+        "p99": metrics.get("p99"),
+        "max": metrics.get("max"),
+    }
+
+
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
     vectorizer_output,
+    geometry_diagnostics,
     timings, warnings, engine,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
@@ -666,6 +975,8 @@ def _assemble(
             intervals for this run.
         vectorizer_output: Explicit density, observability, wall candidate,
             junction, opening, adjacency, and validated-face evidence.
+        geometry_diagnostics: Canonical geometry-stage diagnostics. The
+            export wall-length gate appends its own drop records here.
         timings: How long each stage took.
         warnings: Any warnings collected while running.
         engine: The scope engine that was used.
@@ -718,6 +1029,56 @@ def _assemble(
                 "tags": wall.tags,
             }
         )
+
+    # Keep the graph's internal post-refinement count distinct from the
+    # documents exported below.  The existing 0.5 m gate is an export policy,
+    # not a graph-solve decision, so each filtered wall gets an auditable
+    # lifecycle record instead of disappearing from diagnostics.
+    if geometry_diagnostics is not None:
+        stages = geometry_diagnostics.setdefault("wall_stages", {}).setdefault(
+            "stage_counts", {}
+        )
+        internal_count = len(walls)
+        stages["post_refinement_internal"] = internal_count
+        stages["final"] = internal_count  # deprecated compatibility alias
+        stages["exported"] = len(wall_docs)
+        records = geometry_diagnostics.setdefault("wall_records", [])
+        drops = geometry_diagnostics.setdefault("wall_stages", {}).setdefault(
+            "drops_by_reason", {}
+        )
+        known_export_drops = {
+            record.get("wall_index")
+            for record in records
+            if record.get("stage") == "export"
+        }
+        for wall in walls:
+            if wall.length >= 0.5 or wall.index in known_export_drops:
+                continue
+            drops["below_export_min_length"] = (
+                int(drops.get("below_export_min_length", 0)) + 1
+            )
+            records.append(
+                {
+                    "wall_id": f"wall_{wall.index}",
+                    "wall_index": wall.index,
+                    "endpoint_ids": [
+                        f"wall_{wall.index}:start",
+                        f"wall_{wall.index}:end",
+                    ],
+                    "stage": "export",
+                    "action": "drop",
+                    "reason": "below_export_min_length",
+                    "provenance": "cli._assemble.wall_export_gate",
+                    "threshold_m": 0.5,
+                    "start": wall.start.tolist(),
+                    "end": wall.end.tolist(),
+                    "normal": wall.normal.tolist(),
+                    "length_m": round(wall.length, 6),
+                    "tags": sorted(set(wall.tags)),
+                    "related_wall_ids": [],
+                    "related_wall_indices": [],
+                }
+            )
 
     wall_names = {wall.index: (wall.name or f"wall_{wall.index}") for wall in walls}
     opening_docs = []
@@ -848,6 +1209,7 @@ def _assemble(
             "rules_version": engine.rules.get("version"),
         },
         "diagnostics": {
+            "geometry": geometry_diagnostics,
             "timings_s": dict(timings),
             "drift": {
                 "median_mm": round(drift.median_spread * 1000, 2),

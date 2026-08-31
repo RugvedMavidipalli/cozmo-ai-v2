@@ -9,7 +9,7 @@ import numpy as np
 
 from .planes import FINISHED_FACE, WallSegment
 from .projection import DensityMap
-from .wall_graph import WallGraph, WallGraphNode
+from .wall_graph import WallGraph, WallGraphDiagnostics, WallGraphNode
 
 if TYPE_CHECKING:
     from .roomformer import RoomFormerProposal
@@ -116,6 +116,7 @@ class VectorizerOutput:
     rejected_crossings: tuple[tuple[int, int], ...] = ()
     confidence: float = 0.0
     roomformer: RoomFormerProposal | None = None
+    graph_diagnostics: WallGraphDiagnostics | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "accepted_segments", tuple(self.accepted_segments))
@@ -174,6 +175,11 @@ class VectorizerOutput:
                 for wall in self.vector_input.candidate_segments
             ],
             "junctions": [_junction_metadata(node) for node in self.junctions],
+            "wall_graph": (
+                self.graph_diagnostics.to_solver_metadata()
+                if self.graph_diagnostics is not None
+                else None
+            ),
             "rejected_crossings": [list(pair) for pair in self.rejected_crossings],
             "openings": [
                 {
@@ -211,7 +217,6 @@ class VectorizerOutput:
             if self.roomformer is not None
             else None,
         }
-
 
 def build_vectorizer_input(
     density: DensityMap,
@@ -264,6 +269,7 @@ def build_vectorizer_output(
         rejected_crossings=(graph.rejected_crossings if graph is not None else ()),
         confidence=float(min(all_confidence)) if all_confidence else 0.0,
         roomformer=roomformer,
+        graph_diagnostics=(graph.diagnostics if graph is not None else None),
     )
 
 

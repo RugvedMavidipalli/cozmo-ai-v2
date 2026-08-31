@@ -96,30 +96,28 @@ each other — distinguishing a short T-junction overshoot from real clutter cut
 through a wall's middle (the weaker candidate is quarantined). It clusters all L/T/X
 intersections and solves each shared node from every incident finished-face plane line
 at once; endpoints are assigned that one plane-derived coordinate rather than being
-snapped independently. Weak/off-axis candidates retain their original geometry and
-quality metadata but are not forced into Manhattan topology. The legacy
+snapped independently. A missing endpoint may move only to an intersection supported
+by the other fitted wall line and only within the per-wall extension budget (0.55 m by
+default, reduced for weak fits); polygonization's 0.08 m noding tolerance is not a
+fallback for large gaps. Collinear endpoints are never joined, so measured door gaps
+remain gaps, and interior crossings are accepted only as explicit X evidence or the
+weaker candidate is quarantined. Weak/off-axis candidates retain their original
+geometry and quality metadata but are not forced into Manhattan topology. The legacy
 `planes.snap_corners` name is only a compatibility wrapper around this global solver.
 `WallSegment.inferred_fraction` tracks how much of a wall's final length was never
 directly observed (behind furniture, or reconstructed purely from its corners) so
 `result.json` can report those spans as inferred rather than measured.
 
 **Rooms** (`rooms.py::segment_rooms`). Rasterises wall evidence and observed floor into
-a shared grid, then runs watershed segmentation on the free-space distance transform —
-the distance transform's local maxima seed one region per open area, and watershed cuts
-at the narrow necks (doorways), which is exactly where a floor plan should be divided.
-Floor evidence alone under-covers real rooms (a depth sensor held level sees little
-floor, and furniture casts shadows), so `_grow_to_walls` dilates each labelled region
-into unobserved gaps, capped at a small step limit so growth fills a furniture shadow
-but doesn't escape through a doorway into the next room. Room boundaries are then
-rectified from a raw marching-squares staircase into straight, axis-aligned edges
-(`_boundary_polygon`/`_rectify`) — the raw contour's perimeter is meaningless (a real
-14 m² room came out with a 48 m raw perimeter) and both the floor-area interval and
-mold-containment barrier pricing depend on a sane perimeter. Walls are attached to
-rooms by sampling just off each face (`_assign_walls`): an interior partition lands in
-two rooms and becomes shared, an exterior wall lands in one. `check_no_overlaps`
-validates that no two room polygons overlap beyond a small tolerance, and
-`_link_neighbours` builds the room-adjacency graph from raster proximity between room
-masks.
+a shared grid. Validated wall-graph faces are retained only when observed floor
+coverage and non-unknown visibility pass their thresholds. If the graph is fragmented
+or incomplete, the fallback unions the explicitly observed free cells within each
+4-connected component, handling Polygon/MultiPolygon/GeometryCollection results by
+component and rejecting holes or tiny pieces. It never grows through unknown cells or
+uses a convex hull that could bridge a door or an unobserved gap. Fallback rooms are
+marked low-confidence with their evidence provenance. Walls are attached to rooms by
+boundary intersection, `check_no_overlaps` validates the resulting faces, and
+`_link_graph_neighbours` builds adjacency from shared wall IDs.
 
 The vectorizer boundary is explicit: `projection.DensityMap` carries retained
 wall-band counts, points-per-square-metre density, and observed/empty cells;
@@ -135,6 +133,14 @@ Predicted normalized/cell coordinates are mapped through the same raster origin
 and resolution, so RoomFormer cannot silently invent a second coordinate frame.
 SD-TQ opening predictions are an injected extension point and are retained as
 separate evidence until the normal opening/gap validation accepts them.
+General wall-stage, endpoint-gap, polygonization, grid, and room-fallback
+explainability is exported only under `result.diagnostics.geometry` (version 1).
+Solver-only connection proposals and decisions, including stable wall/endpoint IDs,
+movement, evidence score, reason, and before/after coordinates, live under
+`reconstruction.vectorization.wall_graph` so general diagnostics are not duplicated.
+The wall-stage diagnostics distinguish the post-refinement internal graph from the
+short-wall-filtered exported documents (`post_refinement_internal` versus
+`exported`); each wall record carries its `wall_index` and exported mapping.
 
 **Surfaces** (`occupancy.py::build_surface_grid` / `find_openings`, called per wall in
 `cli.py`). Bins each wall's supporting points into a UV grid (along-wall by
