@@ -160,9 +160,9 @@ def build_plan_grid(
             points into flat (x, y) plan coordinates and to measure how
             high above the floor each point is.
         floor_height: The world-space height of the floor, in metres.
-        ceiling_height: The world-space height of the ceiling, in metres,
-            or `None` to fall back to the highest point actually
-            observed.
+        ceiling_height: The observed world-space height of the ceiling, in
+            metres, or `None` when no ceiling plane was fitted.  No height
+            inferred from the point-cloud extent is used.
         resolution: The size of one grid cell, in metres.
         wall_band: The `(low, high)` height range above the floor, in
             metres, that counts as wall evidence.
@@ -183,7 +183,10 @@ def build_plan_grid(
     upper = plan.max(axis=0) + 0.5
     shape = np.ceil((upper - lower) / resolution).astype(int) + 1
 
-    ceiling = ceiling_height if ceiling_height is not None else heights.max()
+    # Missing ceiling evidence must not turn a high wall return or a sensor
+    # outlier into a room boundary.  The fixed wall-band upper bound remains
+    # useful for wall evidence while staying deterministic.
+    ceiling = ceiling_height if ceiling_height is not None else floor_height + wall_band[1]
     wall_mask = (heights > floor_height + wall_band[0]) & (
         heights < min(floor_height + wall_band[1], ceiling - 0.15)
     )
@@ -191,14 +194,11 @@ def build_plan_grid(
 
     free = _accumulate(plan[floor_mask], lower, shape, resolution)
     if trajectory is not None and len(trajectory):
-        # Wherever the camera walked, mark that spot (and a small area
-        # around it) as walkable floor too -- the sensor may not have
-        # gotten a clean floor reading there, but the camera had to be
-        # standing on solid ground to take the shot.
+        # The camera position is direct free-space evidence, but cells around
+        # it are not.  Mark only the visited cells; dilation here used to
+        # grow free space through completely unobserved regions.
         walked = _accumulate(frame.to_plan(trajectory), lower, shape, resolution)
-        free = free + ndimage.grey_dilation(
-            (walked > 0).astype(np.int32) * 10, size=(5, 5)
-        )
+        free = free + (walked > 0).astype(np.int32) * 3
 
     return PlanGrid(
         resolution=resolution,
@@ -249,113 +249,192 @@ def segment_rooms(
     wall_threshold: int = 6,
     floor_threshold: int = 3,
 ) -> list[Room]:
-    """Splits the open floor space into separate rooms, using a technique
-    called watershed segmentation, then figures out which walls belong to
-    each room.
+    """Extract rooms as bounded faces of the fitted wall graph.
 
-    The idea behind watershed segmentation is borrowed from geography:
-    imagine the open floor area as a landscape where the "elevation" at
-    each point is how far it is from the nearest wall or unexplored area
-    (so the middle of a big room is a tall peak, and doorways or narrow
-    thresholds are low valleys). If you slowly flood that landscape with
-    water starting from each peak, the water pools naturally separate at
-    the valleys, and each pool ends up corresponding to one room. This
-    works well here because doorways -- even ones standing open -- tend
-    to be narrow "pinch points" that naturally form valleys between two
-    wider rooms, without needing to detect the doors explicitly first.
-    The fitted wall lines are also drawn onto the grid as extra barriers,
-    since the raw point evidence alone sometimes leaves small gaps where
-    a wall should completely close off a doorway.
-
-    Args:
-        grid: The rasterised wall and floor evidence to segment, built by
-            `build_plan_grid`.
-        walls: The fitted wall segments; these are drawn onto the grid as
-            additional barriers, to help close up gaps in the raw point
-            evidence around doorways.
-        frame: The building's horizontal reference frame.
-        floor_height: The world-space floor height, in metres, recorded
-            on every resulting `Room`.
-        ceiling_height: The world-space ceiling height, in metres, or
-            `None`; also recorded on every resulting `Room`.
-        min_area: The smallest floor area, in square metres, a candidate
-            room needs to have in order to be kept. Smaller regions are
-            treated as noise and discarded.
-        wall_threshold: The minimum number of wall-evidence hits a grid
-            cell needs before it's treated as a solid wall barrier.
-        floor_threshold: The minimum number of floor-evidence hits a grid
-            cell needs before it's treated as observed, walkable floor.
-
-    Returns:
-        One `Room` per surviving region, each already filled in with its
-        outline polygon, area, the walls that bound it, and which other
-        rooms it neighbours.
+    Room topology comes from measured wall segments rather than raster
+    watershed labels.  This keeps boundaries on the wall geometry, makes
+    output ordering deterministic, and never grows a room through cells for
+    which no free-space evidence exists.  A bounded face is retained only
+    when it contains observed floor evidence; an incomplete capture falls
+    back to connected observed floor components without filling unknown
+    cells.
     """
-    from skimage.segmentation import watershed
+    # Occupied points are evidence of a wall, not evidence of walkable floor.
+    # The graph itself supplies the face barriers; this mask only validates
+    # that a proposed face was actually observed at floor height.
+    free = (grid.free >= floor_threshold) & (grid.occupied < wall_threshold)
+    polygons = polygonize_wall_graph(walls, min_area=min_area)
+    accepted = [
+        polygon for polygon in polygons if _has_observed_floor(polygon, grid, free)
+    ]
 
-    barrier = grid.occupied >= wall_threshold
-    barrier |= _rasterise_walls(grid, walls)
-    free = (grid.free >= floor_threshold) & ~barrier
-    free = ndimage.binary_opening(free, np.ones((3, 3)))
-    free = ndimage.binary_closing(free, np.ones((3, 3)))
-
-    # The "distance transform" gives every free cell its distance to the
-    # nearest barrier -- this is the "elevation" the flood fill below
-    # works from. Seeding only from the tallest peaks (the most open
-    # parts of each room) keeps the flood from accidentally starting a
-    # new room right next to a wall or in a noisy sliver of floor.
-    distance = ndimage.distance_transform_edt(free) * grid.resolution
-    seeds, _ = ndimage.label(distance > 0.55)
-    if seeds.max() == 0:
-        # No point was far enough from a wall to seed a room on its own
-        # (this can happen in a small or narrow space) -- fall back to
-        # treating each disconnected blob of free floor as its own seed.
-        seeds, _ = ndimage.label(free)
-    labels = watershed(-distance, seeds, mask=free)
-    labels = _grow_to_walls(labels, barrier)
+    if not accepted:
+        accepted = _observed_floor_polygons(grid, free, min_area)
+    if not accepted:
+        return []
 
     rooms: list[Room] = []
-    for label in range(1, labels.max() + 1):
-        cells = labels == label
-        cell_area = float(cells.sum() * grid.cell_area)
-        if cell_area < min_area:
-            continue
-        indices = np.argwhere(cells)
-        centroid = grid.to_plan(indices.mean(axis=0))
-        area, polygon = _polygon_area(_boundary_polygon(cells, grid), cell_area)
-        room = Room(
-            id=len(rooms),
-            name=f"room_{len(rooms) + 1}",
-            area=area,
-            centroid=centroid,
-            floor_height=floor_height,
-            ceiling_height=ceiling_height,
-            polygon=polygon,
+    for polygon in accepted:
+        centroid = polygon.centroid
+        rooms.append(
+            Room(
+                id=len(rooms),
+                name=f"room_{len(rooms) + 1}",
+                area=float(polygon.area),
+                centroid=np.array([centroid.x, centroid.y], dtype=float),
+                floor_height=floor_height,
+                ceiling_height=ceiling_height,
+                polygon=np.asarray(polygon.exterior.coords)[:-1],
+            )
         )
-        rooms.append(room)
-        # Re-label this room's cells with a negative number, so they can
-        # be told apart from "not yet assigned" (0) and from every other
-        # room's positive watershed label later on.
-        labels[cells] = -(room.id + 1)
 
-    _assign_walls(rooms, walls, grid, labels)
-    _link_neighbours(rooms, labels, grid)
+    _assign_graph_walls(rooms, walls)
+    _link_graph_neighbours(rooms, walls)
     return rooms
 
 
-def _grow_to_walls(
-    labels: np.ndarray, barrier: np.ndarray, max_steps: int = 14
-) -> np.ndarray:
-    """Fills in the gaps between a room's watershed region and the walls
-    around it.
+def polygonize_wall_graph(
+    walls: list[WallSegment],
+    *,
+    min_area: float = 1.4,
+    node_tolerance: float = 0.08,
+) -> list[object]:
+    """Return bounded Shapely faces formed by the usable wall graph.
 
-    The watershed step above only labels cells where the floor was
-    actually observed, which can leave a thin ring of unlabelled cells
-    between a room and its bounding walls in spots the sensor didn't
-    fully cover. This repeatedly grows each labelled region outward, one
-    cell at a time, into any neighbouring unlabelled-but-free cell, so a
-    room's boundary reaches all the way to the walls around it instead of
-    stopping short.
+    Wall intersections are noded before polygonization, so crossing wall
+    segments become graph vertices.  ``node_tolerance`` snaps tiny endpoint
+    gaps at graph nodes; it is deliberately small relative to a wall and is
+    not applied across the interior of a wall.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import polygonize, snap, unary_union
+
+    lines = [
+        LineString([wall.start, wall.end])
+        for wall in walls
+        if not wall.quarantined and wall.length > 1e-6
+    ]
+    if len(lines) < 3:
+        return []
+    network = unary_union(lines)
+    if node_tolerance > 0:
+        network = snap(network, network, node_tolerance)
+        network = unary_union(network)
+    faces = [face for face in polygonize(network) if face.area >= min_area]
+    return sorted(
+        faces,
+        key=lambda face: (
+            round(float(face.centroid.x), 8),
+            round(float(face.centroid.y), 8),
+            round(float(face.area), 8),
+            tuple(
+                round(value, 8)
+                for point in face.exterior.coords
+                for value in point
+            ),
+        ),
+    )
+
+
+# Private alias retained for callers that used the geometry-stage naming.
+_polygonize_wall_graph = polygonize_wall_graph
+
+
+def _has_observed_floor(polygon, grid: PlanGrid, free: np.ndarray) -> bool:
+    from shapely.geometry import Point
+    from shapely.prepared import prep
+
+    cells = np.argwhere(free)
+    if not len(cells):
+        return False
+    shape = prep(polygon)
+    return any(shape.covers(Point(x, y)) for x, y in grid.to_plan(cells))
+
+
+def _observed_floor_polygons(
+    grid: PlanGrid, free: np.ndarray, min_area: float
+) -> list[object]:
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    labels, count = ndimage.label(free, structure=np.ones((3, 3), dtype=int))
+    polygons = []
+    for label in range(1, count + 1):
+        cells = np.argwhere(labels == label)
+        if len(cells) < 3:
+            continue
+        # Union cell footprints instead of taking a convex hull.  A hull can
+        # bridge a doorway-sized unknown gap and thereby manufacture free
+        # space that was never observed.
+        points = grid.to_plan(cells)
+        polygon = unary_union(
+            [
+                box(
+                    point[0] - grid.resolution / 2,
+                    point[1] - grid.resolution / 2,
+                    point[0] + grid.resolution / 2,
+                    point[1] + grid.resolution / 2,
+                )
+                for point in points
+            ]
+        )
+        if polygon.geom_type == "Polygon" and polygon.area >= min_area:
+            polygons.append(polygon)
+    return sorted(
+        polygons,
+        key=lambda face: (round(face.centroid.x, 8), round(face.centroid.y, 8)),
+    )
+
+
+def _assign_graph_walls(rooms: list[Room], walls: list[WallSegment]) -> None:
+    from shapely.geometry import LineString
+
+    for wall in walls:
+        if wall.quarantined or wall.length <= 1e-6:
+            continue
+        line = LineString([wall.start, wall.end])
+        for room in rooms:
+            boundary = LineString(
+                np.vstack([room.polygon, room.polygon[:1]])
+            )
+            shared = line.intersection(boundary).length
+            if shared >= min(0.15, 0.35 * wall.length):
+                room.wall_indices.append(wall.index)
+                if wall.room_id is None:
+                    wall.room_id = room.id
+    for room in rooms:
+        room.wall_indices = sorted(set(room.wall_indices))
+        _name_walls(room, walls)
+
+
+def _link_graph_neighbours(rooms: list[Room], walls: list[WallSegment]) -> None:
+    membership: dict[int, list[int]] = {}
+    for room in rooms:
+        room.neighbours = []
+        for wall_index in room.wall_indices:
+            membership.setdefault(wall_index, []).append(room.id)
+    for ids in membership.values():
+        unique = sorted(set(ids))
+        for index, first in enumerate(unique):
+            for second in unique[index + 1 :]:
+                rooms[first].neighbours.append(second)
+                rooms[second].neighbours.append(first)
+    for room in rooms:
+        room.neighbours = sorted(set(room.neighbours))
+
+
+def _grow_to_walls(
+    labels: np.ndarray,
+    barrier: np.ndarray,
+    max_steps: int = 14,
+    allowed: np.ndarray | None = None,
+) -> np.ndarray:
+    """Optionally grow labels through explicitly observed free cells.
+
+    This compatibility helper is no longer part of room extraction.  When
+    used by a caller, ``allowed`` must explicitly identify observed free
+    cells.  With no allow-mask, no unassigned cells are eligible, preventing
+    the old behaviour of growing through unknown space.
 
     Args:
         labels: The integer label grid from the watershed step, where 0
@@ -367,12 +446,12 @@ def _grow_to_walls(
             caps how big a gap can be filled.
 
     Returns:
-        A copy of `labels` with previously-unassigned free cells filled
-        in by growth from their nearest labelled neighbour, up to
-        `max_steps` cells away.
+        A copy of `labels` with only explicitly allowed cells filled in by
+        growth from their nearest labelled neighbour, up to `max_steps`
+        cells away.
     """
     grown = labels.copy()
-    free = ~barrier
+    free = (~barrier) & (np.asarray(allowed, dtype=bool) if allowed is not None else False)
     cross = ndimage.generate_binary_structure(2, 1)
 
     for _ in range(max_steps):
@@ -409,6 +488,8 @@ def _rasterise_walls(grid: PlanGrid, walls: list[WallSegment]) -> np.ndarray:
     """
     barrier = np.zeros(grid.occupied.shape, bool)
     for wall in walls:
+        if wall.quarantined:
+            continue
         steps = max(int(wall.length / grid.resolution) * 2, 2)
         samples = wall.start + np.linspace(0, 1, steps)[:, None] * (
             wall.end - wall.start

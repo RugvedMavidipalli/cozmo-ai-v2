@@ -204,19 +204,22 @@ def run(args: argparse.Namespace) -> int:
             )
     print(f"  {len(rooms)} rooms")
 
-    # Stage 8: surfaces
+    # Stage 8: surfaces.  Surface dimensions are metric geometry, so do not
+    # fabricate a wall grid height when the ceiling was not observed.
     with timings.stage("surfaces"):
         surface_grids = {}
         openings = []
-        for wall in walls:
-            if wall.length < 0.6:
-                continue
-            surface = build_surface_grid(
-                wall, frame, points, gravity.floor_height,
-                ceiling if ceiling is not None else gravity.floor_height + 2.4,
-            )
-            surface_grids[wall.index] = surface
-            openings.extend(find_openings(surface))
+        if gravity.ceiling_observed and ceiling is not None:
+            for wall in walls:
+                if wall.length < 0.6:
+                    continue
+                surface = build_surface_grid(
+                    wall, frame, points, gravity.floor_height, ceiling
+                )
+                surface_grids[wall.index] = surface
+                openings.extend(find_openings(surface))
+        else:
+            warnings.append("ceiling not observed; wall opening heights are unavailable")
     print(f"  {len(openings)} openings")
 
     # Stage 9: damage
@@ -625,10 +628,14 @@ def _assemble(
                 "end": wall.end.tolist(),
                 "normal": wall.normal.tolist(),
                 "length": length.to_dict(),
-                "height": uncertainty.ceiling_height(
-                    (gravity.room_height or 0.0), wall.residual_rms, wall.residual_rms,
-                    wall.inlier_count, wall.inlier_count,
-                ).to_dict(),
+                "height": (
+                    uncertainty.ceiling_height(
+                        gravity.room_height, wall.residual_rms, wall.residual_rms,
+                        wall.inlier_count, wall.inlier_count,
+                    ).to_dict()
+                    if gravity.ceiling_observed and gravity.room_height is not None
+                    else None
+                ),
                 "inferred_fraction": round(wall.inferred_fraction, 3),
                 "occluded_spans": [list(s) for s in spans],
                 "residual_rms_mm": round(wall.residual_rms * 1000, 2),
@@ -670,9 +677,13 @@ def _assemble(
                 "area": uncertainty.floor_area(
                     room.area, room.perimeter, drift.median_spread or 0.02
                 ).to_dict(),
-                "ceiling_height": uncertainty.ceiling_height(
-                    room.height or 0.0, 0.01, 0.01, 5000, 5000
-                ).to_dict(),
+                "ceiling_height": (
+                    uncertainty.ceiling_height(
+                        room.height, 0.01, 0.01, 5000, 5000
+                    ).to_dict()
+                    if room.height is not None and gravity.ceiling_observed
+                    else None
+                ),
                 "perimeter": round(room.perimeter, 3),
                 "centroid": room.centroid.tolist(),
                 "polygon": room.polygon.tolist() if room.polygon is not None else [],
@@ -737,6 +748,9 @@ def _assemble(
                 if gravity.ceiling_height is not None
                 else None
             ),
+            "ceiling_observed": bool(gravity.ceiling_observed),
+            "ceiling_confidence": round(float(gravity.ceiling_confidence), 4),
+            "floor_confidence": round(float(gravity.floor_confidence), 4),
             "manhattan_yaw_deg": round(float(np.degrees(frame.yaw)), 3),
             "manhattan_fraction": round(frame.manhattan_fraction, 4),
             "walls": wall_docs,

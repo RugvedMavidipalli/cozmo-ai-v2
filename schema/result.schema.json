@@ -28,6 +28,9 @@
         "gravity_consistency": { "type": "number" },
         "floor_height": { "type": "number" },
         "ceiling_height": { "type": ["number", "null"] },
+        "ceiling_observed": { "type": "boolean" },
+        "ceiling_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "floor_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
         "manhattan_yaw_deg": { "type": "number" },
         "manhattan_fraction": { "type": "number" },
         "walls": { "type": "array", "items": { "$ref": "#/$defs/wall" } },
@@ -121,7 +124,7 @@
         "end": { "$ref": "#/$defs/point2" },
         "normal": { "$ref": "#/$defs/point2" },
         "length": { "$ref": "#/$defs/measurement" },
-        "height": { "$ref": "#/$defs/measurement" },
+        "height": { "type": ["object", "null"], "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
         "inferred_fraction": {
           "type": "number",
           "description": "Share of the wall reconstructed behind furniture rather than directly observed."
@@ -161,7 +164,7 @@
         "id": { "type": "integer" },
         "name": { "type": "string" },
         "area": { "$ref": "#/$defs/measurement" },
-        "ceiling_height": { "$ref": "#/$defs/measurement" },
+        "ceiling_height": { "type": ["object", "null"], "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
         "perimeter": { "type": "number" },
         "centroid": { "$ref": "#/$defs/point2" },
         "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },

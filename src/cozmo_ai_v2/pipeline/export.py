@@ -369,7 +369,8 @@ def _room_label(drawing, room: dict, project, placer: _LabelPlacer) -> None:
         )
     )
     detail = f"{area['value']:.2f} m² ±{area.get('half_width', 0):.2f}"
-    height = room.get("ceiling_height", {}).get("value")
+    ceiling = room.get("ceiling_height")
+    height = ceiling.get("value") if isinstance(ceiling, dict) else None
     if height:
         detail += f" · h {height:.2f} m"
     drawing.add(

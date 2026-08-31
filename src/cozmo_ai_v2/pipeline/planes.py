@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -159,6 +160,20 @@ class WallSegment:
     room_id: int | None = None
     name: str | None = None
     tags: list[str] = field(default_factory=list)
+    # Off-axis detections are retained for diagnostics, but quarantined from
+    # room topology, polygonization, and metric wall output.
+    quarantined: bool = False
+
+    def __post_init__(self) -> None:
+        normal = np.asarray(self.normal, dtype=float)
+        norm = float(np.linalg.norm(normal))
+        if normal.shape != (2,) or norm <= 1e-9:
+            raise ValueError("wall normal must be a non-zero 2D vector")
+        normal /= norm
+        canonical = _canonical_normal(normal)
+        if not np.allclose(canonical, normal):
+            self.offset = -float(self.offset)
+        self.normal = canonical
 
     @property
     def length(self) -> float:
@@ -270,22 +285,46 @@ def estimate_horizontal_frame(
     # Keep only normals that point mostly sideways -- these are the ones
     # that could plausibly belong to a vertical wall, as opposed to a floor
     # or ceiling.
+    normals = np.asarray(normals, dtype=float)
+    up = np.asarray(up, dtype=float)
+    up /= max(float(np.linalg.norm(up)), 1e-9)
+    if normals.ndim != 2 or normals.shape[1] != 3:
+        normals = np.empty((0, 3), dtype=float)
     horizontal = normals - np.outer(normals @ up, up)
     magnitude = np.linalg.norm(horizontal, axis=1)
     vertical_enough = magnitude > 0.85
     horizontal = horizontal[vertical_enough] / magnitude[vertical_enough, None]
     if weights is not None:
-        weights = weights[vertical_enough]
+        weights = np.asarray(weights, dtype=float).reshape(-1)
+        if len(weights) == len(normals):
+            weights = weights[vertical_enough]
+        else:
+            weights = None
 
     right, forward = _orthonormal_basis(up)
+    if not len(horizontal):
+        return HorizontalFrame(
+            up=up,
+            right=right,
+            forward=forward,
+            yaw=0.0,
+            manhattan_fraction=0.0,
+        )
+
     angles = np.arctan2(horizontal @ forward, horizontal @ right)
     # Multiplying each angle by 4 folds the four right-angle directions
     # (0, 90, 180, 270 degrees) on top of each other, so a plain average
     # of the resulting angles doesn't cancel out to zero.
-    resultant = np.exp(4j * angles)
     if weights is not None:
-        resultant = resultant * weights
-    mean = resultant.mean()
+        weights = np.maximum(np.asarray(weights, dtype=float), 0.0)
+        if len(weights) != len(angles) or weights.sum() <= 0:
+            weights = None
+    resultant = np.exp(4j * angles)
+    mean = (
+        np.average(resultant, weights=weights)
+        if weights is not None
+        else resultant.mean()
+    )
     yaw = float(np.angle(mean) / 4.0)
 
     axis_a = np.cos(yaw) * right + np.sin(yaw) * forward
@@ -358,14 +397,43 @@ def wall_band_mask(
         sideways-pointing) normal.
     """
     heights = points @ up
-    ceiling = (
-        gravity.ceiling_height
-        if gravity.ceiling_height is not None
-        else heights.max()
-    )
-    in_band = (heights > gravity.floor_height + margin) & (heights < ceiling - margin)
+    # Never use the observed point-cloud extent as a ceiling.  Without an
+    # observed ceiling, the configured upper wall-band bound is the only
+    # deterministic safe limit available.
+    if gravity.ceiling_observed and gravity.ceiling_height is not None:
+        upper = gravity.ceiling_height - margin
+    else:
+        upper = gravity.floor_height + 1.9
+    in_band = (heights > gravity.floor_height + margin) & (heights < upper)
     vertical = np.abs(normals @ up) < 0.35
     return in_band & vertical
+
+
+def _axis_deviation_degrees(normal: np.ndarray) -> float:
+    """Return distance to the nearest Manhattan normal, in degrees."""
+    angle = float(np.degrees(np.arctan2(normal[1], normal[0])))
+    nearest = round(angle / 90.0) * 90.0
+    return abs(angle - nearest)
+
+
+def _nearest_manhattan_normal(normal: np.ndarray) -> np.ndarray:
+    """Canonicalize a normal to the nearest one of the two plan axes."""
+    angle = float(np.arctan2(normal[1], normal[0]))
+    quarter = round(angle / (np.pi / 2.0)) % 4
+    result = np.array(
+        ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))[quarter],
+        dtype=float,
+    )
+    return _canonical_normal(result)
+
+
+def _canonical_normal(normal: np.ndarray) -> np.ndarray:
+    """Choose one sign for a line normal so geometry ordering is stable."""
+    result = np.asarray(normal, dtype=float)
+    result = result / max(float(np.linalg.norm(result)), 1e-12)
+    if result[0] < -1e-9 or (abs(result[0]) <= 1e-9 and result[1] < 0):
+        result = -result
+    return result
 
 
 def extract_walls(
@@ -378,6 +446,7 @@ def extract_walls(
     angle_tolerance_degrees: float = 8.0,
     point_spacing: float = 0.02,
     min_coverage: float = 0.06,
+    quarantine_off_axis: bool = True,
 ) -> list[WallSegment]:
     """Finds straight wall lines in a cloud of plan-space points, one wall at a time.
 
@@ -423,6 +492,19 @@ def extract_walls(
         The detected wall segments, sorted from longest to shortest, with
         `index` reassigned to match that order.
     """
+    plan_points = np.asarray(plan_points, dtype=float)
+    heights = np.asarray(heights, dtype=float).reshape(-1)
+    if len(plan_points) != len(heights):
+        raise ValueError("plan_points and heights must contain the same number of rows")
+    if not len(plan_points):
+        return []
+    finite = np.isfinite(plan_points).all(axis=1) & np.isfinite(heights)
+    plan_points, heights = plan_points[finite], heights[finite]
+    # RANSAC has a seeded generator, but its tie behaviour still depends on
+    # input order.  Canonical ordering makes the complete wall result stable
+    # when frames/voxels are presented in a different order.
+    order = np.lexsort((heights, plan_points[:, 1], plan_points[:, 0]))
+    plan_points, heights = plan_points[order], heights[order]
     band_height = float(np.ptp(heights)) if len(heights) else 1.0
     remaining = np.arange(len(plan_points))
     walls: list[WallSegment] = []
@@ -440,6 +522,13 @@ def extract_walls(
         # refit it properly now using every point it found.
         inlier_points = subset[inlier_mask]
         normal, offset = _refit_line(inlier_points)
+        axis_deviation = _axis_deviation_degrees(normal)
+        is_off_axis = axis_deviation > angle_tolerance_degrees
+        if not is_off_axis:
+            # Manhattan fitting is exact once a candidate is within the
+            # angular gate: fit the offset against the quantized normal.
+            normal = _nearest_manhattan_normal(normal)
+            offset = float(np.median(inlier_points @ normal))
         residual = inlier_points @ normal - offset
         direction = np.array([-normal[1], normal[0]])
         projection = inlier_points @ direction
@@ -455,8 +544,7 @@ def extract_walls(
             if count < min_coverage * expected:
                 continue
             base = normal * offset
-            walls.append(
-                WallSegment(
+            wall = WallSegment(
                     index=len(walls),
                     normal=normal,
                     offset=float(offset),
@@ -469,11 +557,14 @@ def extract_walls(
                         float(heights[remaining][inlier_mask].min()),
                         float(heights[remaining][inlier_mask].max()),
                     ),
+                    quarantined=bool(quarantine_off_axis and is_off_axis),
                 )
-            )
+            if is_off_axis:
+                wall.tags.append("off-axis")
+            walls.append(wall)
         remaining = remaining[~inlier_mask]
 
-    walls.sort(key=lambda wall: -wall.length)
+    walls.sort(key=_wall_output_rank)
     for position, wall in enumerate(walls):
         wall.index = position
     return walls
@@ -559,7 +650,7 @@ def _refit_line(points: np.ndarray) -> tuple[np.ndarray, float]:
     """
     centroid = points.mean(axis=0)
     _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
-    normal = vh[-1] / np.linalg.norm(vh[-1])
+    normal = _canonical_normal(vh[-1])
     return normal, float(normal @ centroid)
 
 
@@ -656,12 +747,22 @@ def merge_collinear(
     # Process the most strongly-supported, longest walls first, so that
     # weaker duplicate fragments get folded into a solid "target" wall
     # rather than the other way around.
-    ordered = sorted(walls, key=lambda w: (-w.inlier_count, -w.length))
+    # Work on copies so calling this routine twice with a different input
+    # ordering cannot observe the first call's absorbed offsets/counts.
+    ordered = sorted((deepcopy(wall) for wall in walls), key=_wall_rank)
     kept: list[WallSegment] = []
 
     for wall in ordered:
+        if wall.quarantined:
+            # Keep the diagnostic object out of the topology candidates.  A
+            # non-Manhattan line must never win a duplicate merge and move a
+            # valid wall off its building axis.
+            kept.append(wall)
+            continue
         for target in kept:
-            if target.normal @ wall.normal < cosine_limit:
+            if target.quarantined:
+                continue
+            if abs(float(target.normal @ wall.normal)) < cosine_limit:
                 continue
 
             separation = max(
@@ -692,11 +793,27 @@ def merge_collinear(
         else:
             kept.append(wall)
 
-    kept.sort(key=lambda w: -w.length)
+    kept.sort(key=_wall_output_rank)
     for position, wall in enumerate(kept):
         wall.index = position
         wall.tags = sorted(set(wall.tags))
     return kept
+
+
+def _wall_geometry_key(wall: WallSegment) -> tuple[float, ...]:
+    """Canonical geometry key used for deterministic wall ordering."""
+    start = tuple(np.round(np.asarray(wall.start, dtype=float), 8))
+    end = tuple(np.round(np.asarray(wall.end, dtype=float), 8))
+    normal = tuple(np.round(_canonical_normal(wall.normal), 8))
+    return (*normal, round(float(wall.offset), 8), *start, *end)
+
+
+def _wall_rank(wall: WallSegment) -> tuple:
+    return (-int(wall.inlier_count), -round(wall.length, 8), round(wall.residual_rms, 8), _wall_geometry_key(wall))
+
+
+def _wall_output_rank(wall: WallSegment) -> tuple:
+    return (-round(wall.length, 8), -int(wall.inlier_count), _wall_geometry_key(wall))
 
 
 def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> None:
@@ -717,6 +834,12 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
             along-the-wall coordinates (via `target.along(...)`).
         hi: The farther endpoint of `other`, in the same coordinates.
     """
+    old_length = target.length
+    old_observed = target.observed_span
+    other_start = float(target.along(other.start[None])[0])
+    other_end = float(target.along(other.end[None])[0])
+    other_lo, other_hi = sorted((other_start, other_end))
+
     total = target.inlier_count + other.inlier_count
     target.offset = (
         target.offset * target.inlier_count + other.offset * other.inlier_count
@@ -729,17 +852,20 @@ def _absorb(target: WallSegment, other: WallSegment, lo: float, hi: float) -> No
     direction = target.direction
     base = target.normal * target.offset
     origin = base + direction * (direction @ target.start)
-    new_lo, new_hi = min(0.0, lo), max(target.length, hi)
+    new_lo, new_hi = min(0.0, lo), max(old_length, hi)
     target.start = origin + direction * new_lo
     target.end = origin + direction * new_hi
 
-    seen = (
-        target.observed_span[1]
-        - target.observed_span[0]
-        + other.observed_span[1]
-        - other.observed_span[0]
+    observed_intervals = [
+        (old_observed[0], old_observed[1]),
+        (other_lo + other.observed_span[0], other_lo + other.observed_span[1]),
+    ]
+    observed_lo = min(interval[0] for interval in observed_intervals) - new_lo
+    observed_hi = max(interval[1] for interval in observed_intervals) - new_lo
+    target.observed_span = (
+        float(np.clip(observed_lo, 0.0, new_hi - new_lo)),
+        float(np.clip(observed_hi, 0.0, new_hi - new_lo)),
     )
-    target.observed_span = (0.0, min(seen, new_hi - new_lo))
     target.inlier_count = total
     target.height_range = (
         min(target.height_range[0], other.height_range[0]),
@@ -872,9 +998,9 @@ def filter_occluded_walls(
     """
     plan = frame.to_plan(points)
     camera = frame.to_plan(origins)
-    ordered = sorted(walls, key=lambda w: -w.inlier_count)
+    ordered = sorted((w for w in walls if not w.quarantined), key=_wall_rank)
+    dropped = sum(1 for wall in walls if wall.quarantined)
     kept: list[WallSegment] = []
-    dropped = 0
 
     for wall in ordered:
         # Only stronger, longer walls are trusted enough to act as
@@ -917,7 +1043,7 @@ def filter_occluded_walls(
             continue
         kept.append(wall)
 
-    kept.sort(key=lambda w: -w.length)
+    kept.sort(key=_wall_output_rank)
     for position, wall in enumerate(kept):
         wall.index = position
     return kept, dropped
@@ -1005,7 +1131,7 @@ def resolve_crossings(
         order and length of the returned list may differ from `walls`,
         since walls can be removed.
     """
-    walls = list(walls)
+    walls = [wall for wall in walls if not wall.quarantined]
     changed = True
     while changed:
         changed = False
@@ -1089,8 +1215,9 @@ def snap_corners(
         How many endpoints were actually moved onto a snapped corner.
     """
     proposals: list[tuple[float, int, str, np.ndarray]] = []
-    for i, wall in enumerate(walls):
-        for other in walls:
+    active_walls = [wall for wall in walls if not wall.quarantined]
+    for i, wall in enumerate(active_walls):
+        for other in active_walls:
             if other is wall:
                 continue
             hit = _segment_intersection(wall, other)
@@ -1116,7 +1243,7 @@ def snap_corners(
         key = (index, end_name)
         if key in taken:
             continue
-        wall = walls[index]
+        wall = active_walls[index]
         remaining = (
             float(np.linalg.norm(wall.end - point))
             if end_name == "start"
@@ -1144,7 +1271,7 @@ def snap_corners(
 
 
 def snap_to_frame(
-    walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 6.0
+    walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 8.0
 ) -> list[WallSegment]:
     """Straightens out walls that are already close to square with the building, so they're exactly square.
 
@@ -1172,12 +1299,16 @@ def snap_to_frame(
         calls can be chained together.
     """
     for wall in walls:
+        if wall.quarantined:
+            continue
         angle = np.arctan2(wall.normal[1], wall.normal[0])
-        snapped = np.round(angle / (np.pi / 2)) * (np.pi / 2)
+        quarter = round(angle / (np.pi / 2)) % 4
+        snapped = quarter * (np.pi / 2)
         if abs(np.degrees(angle - snapped)) > tolerance_degrees:
             wall.tags.append("off-axis")
+            wall.quarantined = True
             continue
-        normal = np.array([np.cos(snapped), np.sin(snapped)])
+        normal = _nearest_manhattan_normal(wall.normal)
         offset = float(normal @ wall.midpoint)
         direction = np.array([-normal[1], normal[0]])
         half = 0.5 * wall.length
