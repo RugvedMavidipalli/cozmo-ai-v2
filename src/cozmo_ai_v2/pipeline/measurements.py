@@ -1,9 +1,10 @@
 """Metric measurements derived from the structured TLS plane model.
 
-This module is intentionally independent of the raster room grid.  A wall is
-an observed plane line, a corner is the intersection of two such lines, and a
-room boundary is a bounded face of those lines.  The small adapters at the
-top of the module accept both the Phase 1 ``WallSegment`` objects and the
+This module is intentionally independent of the raster room grid.  It
+consumes finite wall extents, plane intersections, and bounded room faces
+provided by the geometry stages.  Stage 9 does not close a graph, polygonize
+wall lines, or infer a face from raster corners.  The small adapters at the
+top of the module accept both Phase 1 ``WallSegment`` objects and the
 structured 3D plane records used by the next geometry stage.
 """
 
@@ -46,6 +47,20 @@ def _finite_float(value: object, default: float = 0.0) -> float:
 def _normalise_status(value: object) -> str:
     status = str(value or "unknown").strip().lower().replace(" ", "_")
     return status or "unknown"
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        status = _normalise_status(value)
+        if status in {"false", "0", "no", "none", "unknown", "unobserved", "missing"}:
+            return False
+        if status in {"true", "1", "yes", "observed", "measured", "validated"}:
+            return True
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _as_items(value: object | None) -> list[object]:
@@ -93,6 +108,7 @@ class MeasurementContext:
         has_depth: bool = True,
         pose_provenance: str = "unknown",
         default_wall_thickness_m: float = 0.15,
+        pose_uncertainty_m: float = 0.0,
     ) -> "MeasurementContext":
         """Bridge the existing interval model into this measurement layer."""
         if uncertainty is None:
@@ -101,6 +117,7 @@ class MeasurementContext:
                 pose_provenance=pose_provenance,
                 depth_provenance="tls_lidar" if has_depth else "estimated_depth",
                 default_wall_thickness_m=default_wall_thickness_m,
+                pose_uncertainty_m=pose_uncertainty_m,
             )
         return cls(
             coverage=_finite_float(getattr(uncertainty, "coverage", 0.90), 0.90),
@@ -113,6 +130,7 @@ class MeasurementContext:
             depth_provenance="tls_lidar" if has_depth else "estimated_depth",
             has_depth=has_depth,
             default_wall_thickness_m=default_wall_thickness_m,
+            pose_uncertainty_m=pose_uncertainty_m,
         )
 
 
@@ -235,7 +253,6 @@ class WallMeasurement:
     inlier_vertical_extent: Measurement
     thickness: Measurement
     geometry_source: str
-    corner_intersections: list[list[float]] = field(default_factory=list)
     opposing_face_id: str | int | None = None
 
     def to_dict(self) -> dict:
@@ -246,7 +263,6 @@ class WallMeasurement:
             "thickness": self.thickness.to_dict(),
             "wall_thickness": self.thickness.to_dict(),
             "geometry_source": self.geometry_source,
-            "corner_intersections": self.corner_intersections,
             "opposing_face_id": self.opposing_face_id,
         }
 
@@ -310,26 +326,34 @@ class _WallRecord:
     id: str | int
     normal: np.ndarray
     offset: float
-    start: np.ndarray
-    end: np.ndarray
+    start: np.ndarray | None
+    end: np.ndarray | None
     source: object
     evidence: MeasurementEvidence
     observed: bool = True
     inferred_fraction: float = 0.0
     tags: list[str] = field(default_factory=list)
+    geometry_source: str = "unmeasured"
+    intersection_points: list[np.ndarray] = field(default_factory=list)
 
     @property
     def length(self) -> float:
+        if self.start is None or self.end is None:
+            return 0.0
         return float(np.linalg.norm(self.end - self.start))
 
     @property
     def direction(self) -> np.ndarray:
-        delta = self.end - self.start
-        norm = float(np.linalg.norm(delta))
-        return delta / norm if norm > 1e-9 else np.array([1.0, 0.0])
+        if self.start is not None and self.end is not None:
+            delta = self.end - self.start
+            norm = float(np.linalg.norm(delta))
+            if norm > 1e-9:
+                return delta / norm
+        return np.array([-self.normal[1], self.normal[0]])
 
     def along(self, point: np.ndarray) -> float:
-        return float((np.asarray(point) - self.start) @ self.direction)
+        origin = self.start if self.start is not None else self.normal * self.offset
+        return float((np.asarray(point) - origin) @ self.direction)
 
 
 def _evidence_for(
@@ -519,9 +543,21 @@ def _coerce_wall_records(
         start_raw = _field(source, "start", "endpoint_a")
         end_raw = _field(source, "end", "endpoint_b")
         inlier_points = _field(source, "inlier_points", "inliers")
-        intersection_points = list(
-            (explicit_intersections or {}).get(wall_id, [])
+        intersection_points = list((explicit_intersections or {}).get(wall_id, []))
+        source_intersections = _field(
+            source,
+            "intersection_points",
+            "intersections",
+            "corner_intersections",
+            "endpoint_intersections",
+            default=[],
         )
+        if isinstance(source_intersections, Mapping):
+            if _field(source_intersections, "point", "position", "xyz", default=None) is not None:
+                source_intersections = [source_intersections]
+            else:
+                source_intersections = source_intersections.get(wall_id, [])
+        intersection_points.extend(list(source_intersections or []))
 
         if normal_raw.shape == (3,):
             if frame is None:
@@ -560,33 +596,34 @@ def _coerce_wall_records(
 
         start = project_endpoint(start_raw)
         end = project_endpoint(end_raw)
-        if (start is None or end is None) and intersection_points:
-            projected_intersections = [
-                point
-                for point in (project_endpoint(value) for value in intersection_points)
-                if point is not None
-            ]
-            if len(projected_intersections) >= 2:
-                tangent = np.array([-normal[1], normal[0]])
-                projected_intersections.sort(key=lambda point: float(point @ tangent))
-                start = start or projected_intersections[0]
-                end = end or projected_intersections[-1]
-        if (start is None or end is None) and inlier_points is not None and frame is not None:
-            points = np.asarray(inlier_points, dtype=float)
-            if points.ndim == 2 and points.shape[1] == 3 and len(points):
-                plan_points = frame.to_plan(points)
-                tangent = np.array([-normal[1], normal[0]])
-                centre = normal * offset
-                projections = plan_points @ tangent
-                if start is None:
-                    start = centre + tangent * float(projections.min())
-                if end is None:
-                    end = centre + tangent * float(projections.max())
-        if start is None or end is None:
-            continue
-        if np.linalg.norm(end - start) <= 1e-8:
-            continue
-        length = float(np.linalg.norm(end - start))
+        projected_intersections = [
+            point
+            for point in (project_endpoint(value) for value in intersection_points)
+            if point is not None
+        ]
+        geometry_source = "unmeasured"
+        if len(projected_intersections) >= 2:
+            # The closure stage owns the intersection graph.  Stage 9 only
+            # consumes the finite points it supplied; it never intersects
+            # the fitted wall lines itself.
+            tangent = np.array([-normal[1], normal[0]])
+            projected_intersections.sort(key=lambda point: float(point @ tangent))
+            start = projected_intersections[0]
+            end = projected_intersections[-1]
+            geometry_source = "supplied_plane_intersections"
+        elif start is not None and end is not None and np.linalg.norm(end - start) > 1e-8:
+            # Phase 1 already produced finite plane-segment endpoints.  Keep
+            # this compatibility path until the structured extent contract
+            # lands, but mark it as endpoint geometry for uncertainty/review.
+            geometry_source = "phase1_plane_endpoints"
+        else:
+            start = None
+            end = None
+        length = (
+            float(np.linalg.norm(end - start))
+            if start is not None and end is not None
+            else 0.0
+        )
         height_range = _field(source, "height_range", "vertical_extent")
         vertical_extent = 0.0
         if height_range is not None:
@@ -602,7 +639,7 @@ def _coerce_wall_records(
         # Phase 1 WallSegment stores the vertical extent but not an explicit
         # density.  Derive it from observed inliers so confidence remains
         # evidence-based rather than a generic constant.
-        if evidence.support_density_per_m2 is None and vertical_extent > 1e-6:
+        if evidence.support_density_per_m2 is None and length > 1e-6 and vertical_extent > 1e-6:
             evidence.support_density_per_m2 = evidence.support_points / area
         records.append(
             _WallRecord(
@@ -613,98 +650,161 @@ def _coerce_wall_records(
                 end=end,
                 source=source,
                 evidence=evidence,
-                observed=bool(_field(source, "observed", "is_observed", default=True)),
+                observed=_as_bool(_field(source, "observed", "is_observed", default=True), True),
                 inferred_fraction=float(
                     np.clip(_finite_float(_field(source, "inferred_fraction", default=0.0)), 0.0, 1.0)
                 ),
                 tags=list(_field(source, "tags", default=[]) or []),
+                geometry_source=geometry_source,
+                intersection_points=projected_intersections,
             )
         )
     return records
 
 
-def _segment_contains(record: _WallRecord, point: np.ndarray, tolerance: float = 0.12) -> bool:
-    along = record.along(point)
-    return -tolerance <= along <= record.length + tolerance
+def _room_boundary(
+    room: object,
+    frame: HorizontalFrame | None,
+    *,
+    allow_phase1_polygon: bool = False,
+) -> tuple[np.ndarray | None, str]:
+    """Read a bounded face supplied by the geometry/closure stages.
 
-
-def _line_intersection(first: _WallRecord, second: _WallRecord) -> np.ndarray | None:
-    matrix = np.vstack([first.normal, second.normal])
-    determinant = float(np.linalg.det(matrix))
-    if abs(determinant) <= 1e-7:
-        return None
-    try:
-        point = np.linalg.solve(matrix, np.array([first.offset, second.offset]))
-    except np.linalg.LinAlgError:
-        return None
-    return point if np.isfinite(point).all() else None
-
-
-def _wall_intersections(record: _WallRecord, records: Sequence[_WallRecord]) -> list[np.ndarray]:
-    points: list[np.ndarray] = []
-    for other in records:
-        if other is record or not other.observed:
-            continue
-        point = _line_intersection(record, other)
-        if point is not None and _segment_contains(record, point) and _segment_contains(other, point):
-            if not any(np.linalg.norm(point - previous) < 0.03 for previous in points):
-                points.append(point)
-    points.sort(key=record.along)
-    return points
-
-
-def _intersection_ended_length(
-    record: _WallRecord, records: Sequence[_WallRecord]
-) -> tuple[float, list[np.ndarray], bool]:
-    intersections = _wall_intersections(record, records)
-    corrected = [record.start.copy(), record.end.copy()]
-    used = 0
-    for index, endpoint in enumerate(corrected):
-        candidates = [point for point in intersections if np.linalg.norm(point - endpoint) <= 0.30]
-        if candidates:
-            corrected[index] = min(candidates, key=lambda point: np.linalg.norm(point - endpoint))
-            used += 1
-    corrected.sort(key=record.along)
-    length = float(np.linalg.norm(corrected[1] - corrected[0]))
-    return length, intersections, used == 2
-
-
-def _polygon_from_lines(records: Sequence[_WallRecord], room: object) -> np.ndarray | None:
-    if len(records) < 3:
-        return None
-    try:
-        from shapely.geometry import LineString, Point
-        from shapely.ops import polygonize, unary_union
-    except ImportError:
-        return None
-    network = unary_union(
-        [LineString([record.start, record.end]) for record in records if record.length > 1e-6]
+    A room centroid, raster polygon, or scalar area is not enough evidence to
+    create a Stage 9 area.  The legacy ``polygon`` field is opt-in because
+    Phase 1 used it for both graph and raster fallbacks; a structured caller
+    should provide ``boundary`` (or an equivalent bounded-face field).
+    """
+    boundary_document = _field(
+        room,
+        "boundary",
+        "boundary_polygon",
+        "room_boundary",
+        "interior_boundary",
+        "bounded_face",
+        "face",
+        "geometry_boundary",
+        "geometry",
+        "boundary_vertices",
+        "face_vertices",
+        "vertices",
+        default=None,
     )
-    faces = [face for face in polygonize(network) if face.area > 1e-8]
-    if not faces:
-        return None
-    centroid_raw = _field(room, "centroid")
-    centroid = None
-    if centroid_raw is not None:
-        array = np.asarray(centroid_raw, dtype=float).reshape(-1)
-        if array.shape == (2,) and np.isfinite(array).all():
-            centroid = Point(array)
-    target_area = _finite_float(_field(room, "area", default=0.0), 0.0)
-    if isinstance(_field(room, "area", default=None), Mapping):
-        target_area = _finite_float(_field(_field(room, "area"), "value", default=0.0), 0.0)
-    containing = [face for face in faces if centroid is not None and face.buffer(1e-7).contains(centroid)]
-    candidates = containing or faces
-    face = min(
-        candidates,
-        key=lambda item: (
-            abs(item.area - target_area) if target_area > 0 else 0.0,
-            -item.area,
+    document_status = (
+        _field(boundary_document, "status", "geometry_status", default=None)
+        if isinstance(boundary_document, Mapping)
+        else None
+    )
+    status = _normalise_status(
+        _field(
+            room,
+            "geometry_status",
+            "boundary_status",
+            "polygon_status",
+            "status",
+            default=document_status or "unknown",
+        )
+    )
+    if status in {"unmeasured", "invalid", "rejected", "unknown", "low_confidence"}:
+        # An absent status is represented as unknown.  A supplied boundary is
+        # still allowed for Phase 1 compatibility below, unless the producer
+        # explicitly says the geometry is unavailable.
+        explicit_status = _field(
+            room,
+            "geometry_status",
+            "boundary_status",
+            "polygon_status",
+            "status",
+            default=None,
+        )
+        if explicit_status is not None:
+            return None, "unmeasured"
+
+    source = str(
+        _field(
+            room,
+            "geometry_source",
+            "boundary_source",
+            "polygon_source",
+            default=(
+                _field(
+                    boundary_document,
+                    "geometry_source",
+                    "boundary_source",
+                    "source",
+                    default="",
+                )
+                if isinstance(boundary_document, Mapping)
+                else ""
+            ),
+        )
+        or ""
+    ).strip().lower().replace(" ", "_")
+    if any(token in source for token in ("raster", "occupancy", "grid", "flood", "watershed")):
+        return None, "raster_rejected"
+
+    confidence_raw = _field(
+        room,
+        "geometry_confidence",
+        "boundary_confidence",
+        "polygon_confidence",
+        "confidence",
+        default=(
+            _field(boundary_document, "confidence", "geometry_confidence", default=None)
+            if isinstance(boundary_document, Mapping)
+            else None
         ),
     )
-    coords = np.asarray(face.exterior.coords[:-1], dtype=float)
-    if len(coords) < 3:
-        return None
-    return coords
+    if isinstance(confidence_raw, Mapping):
+        confidence_raw = _field(confidence_raw, "confidence", "value", default=None)
+    if confidence_raw is not None and _finite_float(confidence_raw, 0.0) < 0.50:
+        return None, "low_confidence"
+
+    boundary = boundary_document
+    legacy_polygon = False
+    if boundary is None and allow_phase1_polygon:
+        boundary = _field(room, "polygon", default=None)
+        legacy_polygon = boundary is not None
+    if isinstance(boundary, Mapping):
+        boundary = _field(
+            boundary,
+            "vertices",
+            "points",
+            "coordinates",
+            "polygon",
+            "boundary",
+            default=None,
+        )
+    if isinstance(boundary, (list, tuple)) and boundary and all(
+        isinstance(item, Mapping) for item in boundary
+    ):
+        points = [
+            _field(item, "point", "position", "xyz", "vertex", default=None)
+            for item in boundary
+        ]
+        if all(point is not None for point in points):
+            boundary = points
+    if boundary is None:
+        return None, "unmeasured"
+    try:
+        values = np.asarray(boundary, dtype=float)
+    except (TypeError, ValueError):
+        return None, "invalid"
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    if values.ndim != 2 or values.shape[0] < 3 or values.shape[1] not in (2, 3):
+        return None, "invalid"
+    if values.shape[1] == 3:
+        if frame is None:
+            return None, "invalid"
+        values = frame.to_plan(values)
+    if not np.isfinite(values).all() or _area(values) <= 1e-8:
+        return None, "invalid"
+    # Keep the source explicit for provenance, while retaining a stable name
+    # for Phase 1 callers whose polygon predates the structured contract.
+    return values, source or (
+        "phase1_room_polygon_compatibility" if legacy_polygon else "supplied_bounded_face"
+    )
 
 
 def _signed_area(polygon: np.ndarray) -> float:
@@ -719,6 +819,21 @@ def _signed_area(polygon: np.ndarray) -> float:
 
 def _area(polygon: np.ndarray) -> float:
     return abs(_signed_area(polygon))
+
+
+def _point_in_polygon(point: np.ndarray, polygon: np.ndarray) -> bool:
+    """Small deterministic point-in-face test for selecting TLS samples."""
+    x, y = float(point[0]), float(point[1])
+    inside = False
+    for first, second in zip(polygon, np.roll(polygon, -1, axis=0)):
+        x1, y1 = float(first[0]), float(first[1])
+        x2, y2 = float(second[0]), float(second[1])
+        crosses = (y1 > y) != (y2 > y)
+        if crosses:
+            x_at_y = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < x_at_y:
+                inside = not inside
+    return inside
 
 
 def _line_for_edge(a: np.ndarray, b: np.ndarray, outward_distance: float) -> tuple[np.ndarray, float]:
@@ -1020,29 +1135,30 @@ def _height_statistics(
         "ceiling_not_observed",
         context=context,
     )
-    if polygon is None or floor_plane is None or not ceilings or frame is None:
+    if (
+        polygon is None
+        or floor_plane is None
+        or not _as_bool(_field(floor_plane, "observed", "is_observed", default=True), True)
+        or not ceilings
+        or frame is None
+    ):
         return HeightStatistics(empty, empty, empty)
     centroid = polygon.mean(axis=0)
     samples = [centroid, *list(polygon)]
     values: list[float] = []
     evidence_values: list[MeasurementEvidence] = []
     for ceiling in ceilings:
+        if not _as_bool(_field(ceiling, "observed", "is_observed", default=True), True):
+            continue
         points = _field(ceiling, "inlier_points", "inliers")
         candidate_points = None
         if points is not None and not isinstance(points, (int, float, np.integer, np.floating)):
             array = np.asarray(points, dtype=float)
             if array.ndim == 2 and array.shape[1] == 3 and len(array):
                 plan_points = frame.to_plan(array)
-                try:
-                    from shapely.geometry import Point, Polygon
-                    shape = Polygon(polygon)
-                    candidate_points = [
-                        plan
-                        for plan in plan_points
-                        if shape.buffer(1e-6).contains(Point(plan))
-                    ]
-                except ImportError:
-                    candidate_points = list(plan_points)
+                candidate_points = [
+                    plan for plan in plan_points if _point_in_polygon(plan, polygon)
+                ]
                 # A dense TLS ceiling can contain hundreds of thousands of
                 # inliers.  A deterministic sample is sufficient for the
                 # min/mean/max height statistics and keeps Stage 9 bounded.
@@ -1115,13 +1231,13 @@ def measure_scene(
     context: MeasurementContext | None = None,
     default_wall_thickness_m: float = 0.15,
 ) -> SceneMeasurements:
-    """Measure a TLS scene using plane intersections and explicit offsets.
+    """Measure a TLS scene using supplied plane geometry and explicit offsets.
 
     ``walls``/``rooms`` are retained as positional compatibility inputs for
     Phase 1.  A Stage 6 caller may instead pass ``tls_model`` containing
-    ``wall_planes``, ``floor_plane`` and ``ceiling_planes``.  Room polygons
-    from a raster fallback are never used for an area measurement: if no
-    bounded plane face can be reconstructed, the area is explicitly
+    ``wall_planes``, ``floor_plane`` and ``ceiling_planes``.  Stage 9 does
+    not reconstruct intersections or polygonize wall lines.  If the geometry
+    stages do not supply a bounded room face, the area is explicitly
     ``unmeasured``.
     """
     context = context or MeasurementContext(default_wall_thickness_m=default_wall_thickness_m)
@@ -1138,6 +1254,17 @@ def measure_scene(
     ) = _model_parts(
         tls_model, walls, floor_plane, ceiling_planes
     )
+    if rooms is None and tls_model is not None:
+        rooms = _as_items(
+            _field(
+                tls_model,
+                "rooms",
+                "room_faces",
+                "bounded_faces",
+                "room_boundaries",
+                default=[],
+            )
+        )
     if tls_model is not None:
         if context.pose_provenance == "unknown" and model_pose != "unknown":
             context.pose_provenance = model_pose
@@ -1158,22 +1285,31 @@ def measure_scene(
 
     wall_results: dict[str | int, WallMeasurement] = {}
     for record in records:
-        length, intersections, exact_corners = _intersection_ended_length(record, records)
-        length_basis = (
-            "distance between finite intersections of observed TLS wall planes"
-            if exact_corners
-            else "distance between observed TLS wall endpoints; open corner review required"
-        )
-        length_evidence = record.evidence
-        length_measurement = _make_measurement(
-            length,
-            length_evidence,
-            context,
-            sigma_m=max(record.evidence.tls_residual_rms_m, 0.002) * (1.0 if exact_corners else 1.75),
-            basis=length_basis,
-            inferred=not exact_corners,
-            extra_flags=("open_ended_geometry",) if not exact_corners else (),
-        )
+        if record.start is not None and record.end is not None and record.length > 1e-8:
+            from_intersections = record.geometry_source == "supplied_plane_intersections"
+            length_basis = (
+                "distance between supplied finite intersections of observed TLS wall planes"
+                if from_intersections
+                else "distance between Phase 1 observed TLS wall endpoints; structured intersection extent pending"
+            )
+            length_measurement = _make_measurement(
+                record.length,
+                record.evidence,
+                context,
+                sigma_m=max(record.evidence.tls_residual_rms_m, 0.002)
+                * (1.0 if from_intersections else 1.75),
+                basis=length_basis,
+                inferred=not from_intersections,
+                extra_flags=("open_ended_geometry",) if not from_intersections else (),
+            )
+        else:
+            length_measurement = _unmeasured(
+                "finite wall extent/intersections not supplied by TLS geometry stage",
+                record.evidence,
+                "wall_length_unmeasured",
+                "plane_extent_missing",
+                context=context,
+            )
         height_range = _field(record.source, "height_range", "vertical_extent")
         extent = None
         if height_range is not None:
@@ -1224,8 +1360,7 @@ def measure_scene(
             length=length_measurement,
             inlier_vertical_extent=vertical_measurement,
             thickness=thickness_measurement,
-            geometry_source="plane_intersections" if exact_corners else "plane_endpoints",
-            corner_intersections=[point.tolist() for point in intersections],
+            geometry_source=record.geometry_source,
             opposing_face_id=opposing_face_id,
         )
 
@@ -1235,16 +1370,15 @@ def measure_scene(
         room_wall_ids = _field(room, "wall_indices", "wall_ids", default=None)
         if room_wall_ids is not None:
             selected = [record for record in records if record.id in set(room_wall_ids)]
-            if len(selected) < 3:
-                selected = records
         else:
             selected = records
-        polygon = _polygon_from_lines(selected, room)
+        polygon, boundary_source = _room_boundary(room, frame)
         if polygon is None:
             empty = _unmeasured(
-                "no bounded room face from observed TLS plane intersections",
-                MeasurementEvidence(),
+                "bounded room face not supplied by TLS geometry/closure stage",
+                _evidence_for(room, context),
                 "room_boundary_unmeasured",
+                "geometry_not_supplied",
                 context=context,
             )
             empty_height = HeightStatistics(empty, empty, empty)
@@ -1254,7 +1388,7 @@ def measure_scene(
                 empty,
                 empty,
                 empty_height,
-                {str(record.id): wall_results[record.id].thickness for record in selected if record.id in wall_results},
+                {},
                 [],
                 _area_convention(context),
             )
@@ -1264,7 +1398,9 @@ def measure_scene(
             for i in range(len(polygon))
         ]
         edge_records = [record for record in edge_records if record is not None]
-        boundary_evidence = _combine_evidence([record.evidence for record in edge_records])
+        boundary_evidence = _combine_evidence(
+            [_evidence_for(room, context), *[record.evidence for record in edge_records]]
+        )
         perimeter = float(
             np.linalg.norm(np.roll(polygon, -1, axis=0) - polygon, axis=1).sum()
         )
@@ -1274,7 +1410,7 @@ def measure_scene(
             boundary_evidence,
             context,
             sigma_m=max(perimeter * edge_sigma / 2.0, 0.002),
-            basis="PRIMARY: area enclosed by observed interior TLS wall-face intersections",
+            basis=f"PRIMARY: supplied bounded interior TLS wall-face area ({boundary_source})",
         )
         distances: list[float] = []
         thickness_docs: dict[str, Measurement] = {}
@@ -1344,7 +1480,7 @@ def _area_convention(context: MeasurementContext) -> dict[str, Any]:
         "outer_footprint_area": "offset each interior face outward by measured thickness; assumed default when thickness is unmeasured",
         "default_wall_thickness_m": context.default_wall_thickness_m,
         "thickness_measurement_rule": "report measured only when two opposing faces are both observed and overlap",
-        "geometry_rule": "all corners are intersections of plane lines; raster corners are not used",
+        "geometry_rule": "consume only supplied plane intersections and bounded faces; no Stage 9 graph closure or raster corners",
     }
 
 

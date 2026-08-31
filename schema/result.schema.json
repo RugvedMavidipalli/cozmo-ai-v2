@@ -370,7 +370,6 @@
           "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }]
         },
         "geometry_source": { "type": "string" },
-        "corner_intersections": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
         "opposing_face_id": { "type": ["string", "integer", "null"] },
         "inferred_fraction": {
           "type": "number",

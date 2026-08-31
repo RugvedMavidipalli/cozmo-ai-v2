@@ -41,27 +41,37 @@ def _wall(index, start, end, normal, *, support=600, residual=0.004):
 
 
 def _room():
-    # The polygon is deliberately wrong: Stage 9 must use the plane graph.
-    return Room(
-        id=0,
-        name="room_1",
-        area=999.0,
-        centroid=np.array([2.0, 1.5]),
-        floor_height=0.0,
-        ceiling_height=2.4,
-        wall_indices=[0, 1, 2, 3],
-        polygon=np.array([[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]]),
-    )
+    return {
+        "id": 0,
+        "name": "room_1",
+        "area": 999.0,
+        "centroid": [2.0, 1.5],
+        "floor_height": 0.0,
+        "ceiling_height": 2.4,
+        "wall_ids": [0, 1, 2, 3],
+        "boundary": [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]],
+        "geometry_source": "supplied_plane_intersections",
+        "geometry_confidence": 1.0,
+    }
 
 
 def _rectangle_walls():
-    # Endpoints run past the corners.  The measured extent must be the
-    # intersections at x/y = 0 and 4/3, not the observed endpoint span.
+    # Endpoints run past the corners.  Stage 9 must consume the explicit
+    # intersections supplied by the closure contract, not intersect lines.
     return [
         _wall(0, [-0.2, 0.0], [4.2, 0.0], [0.0, 1.0]),
         _wall(1, [4.0, -0.2], [4.0, 3.2], [1.0, 0.0]),
         _wall(2, [4.2, 3.0], [-0.2, 3.0], [0.0, 1.0]),
         _wall(3, [0.0, 3.2], [0.0, -0.2], [1.0, 0.0]),
+    ]
+
+
+def _rectangle_intersections():
+    return [
+        {"planes": [0, 1], "point": [4.0, 0.0]},
+        {"planes": [1, 2], "point": [4.0, 3.0]},
+        {"planes": [2, 3], "point": [0.0, 3.0]},
+        {"planes": [3, 0], "point": [0.0, 0.0]},
     ]
 
 
@@ -72,6 +82,7 @@ def test_measurements_use_plane_intersections_and_primary_interior_area():
     result = measure_scene(
         _rectangle_walls(),
         [_room()],
+        tls_model={"intersections": _rectangle_intersections()},
         frame=FRAME,
         gravity=gravity,
         context=MeasurementContext(
@@ -80,7 +91,7 @@ def test_measurements_use_plane_intersections_and_primary_interior_area():
     )
 
     assert result.walls[0].length.value == 4.0
-    assert result.walls[0].geometry_source == "plane_intersections"
+    assert result.walls[0].geometry_source == "supplied_plane_intersections"
     assert result.rooms[0].interior_face_area.value == 12.0
     assert result.rooms[0].interior_face_area.basis.startswith("PRIMARY:")
     assert result.rooms[0].wall_centerline_area.status == "estimated"
@@ -153,12 +164,25 @@ def test_structured_tls_3d_plane_model_is_accepted_without_phase1_shims():
     ]
     model = TLSPlaneModel(
         planes=planes,
+        intersections=[
+            {"planes": ["wall_0", "wall_1"], "point": [4, 0]},
+            {"planes": ["wall_1", "wall_2"], "point": [4, 3]},
+            {"planes": ["wall_2", "wall_3"], "point": [0, 3]},
+            {"planes": ["wall_3", "wall_0"], "point": [0, 0]},
+        ],
         floor_plane=TLSPlane("floor", [0, 0, 1], 0, role="floor", inlier_count=500, residual_rms=0.005),
         ceiling_planes=[TLSPlane("ceiling", [0, 0, 1], 2.4, role="ceiling", inlier_count=500, residual_rms=0.005)],
     )
     result = measure_scene(
         tls_model=model,
-        rooms=[{"id": 0, "centroid": [2, 1.5], "wall_ids": ["wall_0", "wall_1", "wall_2", "wall_3"]}],
+        rooms=[{
+            "id": 0,
+            "centroid": [2, 1.5],
+            "wall_ids": ["wall_0", "wall_1", "wall_2", "wall_3"],
+            "boundary": [[0, 0], [4, 0], [4, 3], [0, 3]],
+            "geometry_source": "supplied_plane_intersections",
+            "geometry_confidence": 1.0,
+        }],
         frame=FRAME,
         context=MeasurementContext(pose_provenance="refined", calibration_status="calibrated"),
     )
@@ -188,7 +212,14 @@ def test_structured_model_can_supply_plane_intersections_when_extents_are_separa
     )
     result = measure_scene(
         tls_model=model,
-        rooms=[{"id": 0, "centroid": [2, 1.5], "wall_ids": ["bottom", "right", "top", "left"]}],
+        rooms=[{
+            "id": 0,
+            "centroid": [2, 1.5],
+            "wall_ids": ["bottom", "right", "top", "left"],
+            "boundary": [[0, 0], [4, 0], [4, 3], [0, 3]],
+            "geometry_source": "supplied_plane_intersections",
+            "geometry_confidence": 1.0,
+        }],
         frame=FRAME,
     )
     assert result.walls["bottom"].length.value == 4.0
@@ -227,3 +258,66 @@ def test_known_reference_validation_is_explicit_and_door_is_advisory():
     invalid = validate_reference_scale(None, 1.0, reference_type="marker")
     assert invalid.status == "unmeasured"
     assert invalid.scale_factor is None
+
+
+def test_zero_or_low_confidence_room_never_invents_area_or_height():
+    result = measure_scene(
+        _rectangle_walls(),
+        [{
+            "id": 0,
+            "wall_ids": [0, 1, 2, 3],
+            "boundary": [[0, 0], [40, 0], [40, 30], [0, 30]],
+            "geometry_source": "raster_fallback",
+            "geometry_confidence": 0.0,
+        }],
+        frame=FRAME,
+    )
+    room = result.rooms[0]
+    assert room.interior_face_area.value is None
+    assert room.wall_centerline_area.value is None
+    assert room.outer_footprint_area.value is None
+    assert room.floor_to_ceiling_height.mean.value is None
+    assert "manual_review" in room.interior_face_area.flags
+
+
+def test_room_area_stays_unmeasured_when_only_wall_lines_are_available():
+    result = measure_scene(
+        _rectangle_walls(),
+        [{"id": 0, "wall_ids": [0, 1, 2, 3], "centroid": [2, 1.5]}],
+        frame=FRAME,
+        tls_model={"intersections": _rectangle_intersections()},
+    )
+    room = result.rooms[0]
+    assert room.boundary == []
+    assert room.interior_face_area.status == "unmeasured"
+    assert room.interior_face_area.value is None
+
+
+def test_wall_length_is_unmeasured_when_plane_extent_is_missing():
+    wall = {
+        "id": "wall_without_extent",
+        "normal": [0.0, 1.0, 0.0],
+        "offset": 0.0,
+        "inlier_count": 800,
+        "residual_rms": 0.004,
+        "height_range": [0.0, 2.4],
+    }
+    result = measure_scene([wall], [], frame=FRAME)
+    assert result.walls["wall_without_extent"].length.value is None
+    assert result.walls["wall_without_extent"].length.status == "unmeasured"
+    assert result.walls["wall_without_extent"].inlier_vertical_extent.value == 2.4
+
+
+def test_phase1_raster_polygon_is_not_a_stage9_area_boundary():
+    phase1_room = Room(
+        id=0,
+        name="room_1",
+        area=12.0,
+        centroid=np.array([2.0, 1.5]),
+        floor_height=0.0,
+        ceiling_height=2.4,
+        wall_indices=[0, 1, 2, 3],
+        polygon=np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]]),
+    )
+    result = measure_scene(_rectangle_walls(), [phase1_room], frame=FRAME)
+    assert result.rooms[0].interior_face_area.value is None

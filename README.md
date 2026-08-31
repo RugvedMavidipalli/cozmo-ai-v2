@@ -182,13 +182,15 @@ each wall's offset is re-placed at the median of its per-visit offsets so the
 visit that lingered longest does not decide where the wall is. Result: drift
 median 9.9 mm (rec-1) / 10.3 mm (rec-2), inside the 2 cm gate's budget.
 
-**Measurements stay on the plane graph.** Stage 9 computes wall lengths and
-room boundaries from plane intersections, reports observed interior-face area
-as primary, and exposes centerline/outer areas only through documented
-thickness offsets. Opposing-face thickness is `unmeasured` unless both faces
-are observed; a configured default thickness is marked as an assumption for
-derived areas. Every Stage 9 quantity carries TLS residual/support/provenance
-evidence, tolerance, confidence, and manual-review flags.
+**Measurements stay on supplied plane geometry.** Stage 9 consumes finite wall
+extents, plane intersections, and bounded room faces supplied by the geometry
+stages; it does not close the graph or polygonize raster/occupancy corners.
+Observed interior-face area is primary, while centerline/outer areas use
+documented thickness offsets. Opposing-face thickness is `unmeasured` unless
+both faces are observed; a configured default thickness is marked as an
+assumption for derived areas. Every Stage 9 quantity carries TLS
+residual/support/provenance evidence, tolerance, confidence, and manual-review
+flags. Missing or low-confidence room faces remain explicitly unmeasured.
 
 **Drift is measured by revisit spread, not by point scatter.** RMS scatter about
 a fitted wall is mostly depth noise, and a plane fit averages it away — it is

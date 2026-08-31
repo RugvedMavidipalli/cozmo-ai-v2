@@ -425,9 +425,11 @@ def run(args: argparse.Namespace) -> int:
         else:
             warnings.append("known reference scale could not be validated")
 
-    # Stage 9: measurements.  This pass consumes the finalized plane graph,
-    # not the room raster.  Its primary room area is the observed interior
-    # wall-face area; centerline and outer areas are explicit offsets.
+    # Stage 9: measurements.  This pass consumes structured plane geometry,
+    # not the room raster or a locally reconstructed wall graph.  Its primary
+    # room area is the observed interior wall-face area; centerline and outer
+    # areas are explicit offsets.  Phase 1 rooms remain compatible but are
+    # explicitly unmeasured until a bounded face is supplied.
     with timings.stage("measurements"):
         measurement_context = MeasurementContext.from_uncertainty(
             uncertainty,
@@ -875,7 +877,6 @@ def _assemble(
             vertical_extent_doc = measured_wall.inlier_vertical_extent.to_dict()
             thickness_doc = measured_wall.thickness.to_dict()
             geometry_source = measured_wall.geometry_source
-            corner_intersections = measured_wall.corner_intersections
             opposing_face_id = measured_wall.opposing_face_id
         else:
             length = uncertainty.wall_length(
@@ -887,7 +888,6 @@ def _assemble(
             vertical_extent_doc = None
             thickness_doc = None
             geometry_source = "phase1_wall_segment"
-            corner_intersections = []
             opposing_face_id = None
         wall_docs.append(
             {
@@ -915,7 +915,6 @@ def _assemble(
                 "thickness": thickness_doc,
                 "wall_thickness": thickness_doc,
                 "geometry_source": geometry_source,
-                "corner_intersections": corner_intersections,
                 "opposing_face_id": opposing_face_id,
             }
         )
