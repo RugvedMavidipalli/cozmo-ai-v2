@@ -85,6 +85,11 @@ def _wall_snapshot(wall: Any) -> dict[str, Any]:
         "wall_id": wall_id(wall),
         "wall_index": int(getattr(wall, "index", -1)),
     }
+    if snapshot["wall_id"] is not None:
+        snapshot["endpoint_ids"] = [
+            f"{snapshot['wall_id']}:start",
+            f"{snapshot['wall_id']}:end",
+        ]
     for name in ("start", "end", "normal"):
         value = _point(getattr(wall, name, None))
         if value is not None:
@@ -118,6 +123,11 @@ class GeometryDiagnostics:
             "occlusion": 0,
             "crossing": 0,
             "quarantine": 0,
+            "post_refinement_internal": 0,
+            "exported": 0,
+            # Compatibility alias for diagnostics produced by the first
+            # Phase 1 implementation.  New callers should use the explicit
+            # post_refinement_internal/exported names above.
             "final": 0,
         }
     )
@@ -150,14 +160,56 @@ class GeometryDiagnostics:
     _pending_polygon_indices: list[int] = field(default_factory=list, repr=False)
 
     def set_wall_stage(self, stage: str, walls: list[Any]) -> None:
-        """Persist the number of wall objects present after one stage."""
+        """Persist the number of wall objects present after one stage.
+
+        ``final`` is retained as a backward-compatible key and means the
+        post-refinement internal wall list.  The separately named
+        ``exported`` stage is the public result list after the export length
+        gate, so the two counts may legitimately differ.
+        """
         if stage not in self.stage_counts:
             raise ValueError(f"unknown wall diagnostic stage: {stage}")
-        self.stage_counts[stage] = int(len(walls))
+        count = int(len(walls))
         if stage == "quarantine":
-            self.stage_counts[stage] = int(
-                sum(bool(getattr(wall, "quarantined", False)) for wall in walls)
-            )
+            count = int(sum(bool(getattr(wall, "quarantined", False)) for wall in walls))
+        self.stage_counts[stage] = count
+        if stage == "post_refinement_internal":
+            self.stage_counts["final"] = count
+        elif stage == "final":
+            self.stage_counts["post_refinement_internal"] = count
+
+    def record_export_filter(
+        self, walls: list[Any], *, min_length_m: float = 0.5
+    ) -> list[Any]:
+        """Record the public wall export gate and return exported walls.
+
+        The result schema intentionally omits very short wall fragments, but
+        those fragments remain useful when explaining why internal and
+        exported counts differ.  This records each omission with its stable
+        diagnostic wall id and the exact threshold used by ``_assemble``.
+        """
+        threshold = float(min_length_m)
+        if not np.isfinite(threshold) or threshold < 0:
+            threshold = 0.5
+        exported: list[Any] = []
+        for wall in walls:
+            try:
+                length = float(getattr(wall, "length", np.nan))
+            except (TypeError, ValueError):
+                length = float("nan")
+            if not np.isfinite(length) or length < threshold:
+                self.record_wall_event(
+                    wall,
+                    stage="export",
+                    action="drop",
+                    reason="below_export_min_length",
+                    provenance="cli._assemble.wall_export_gate",
+                    extra={"threshold_m": round(threshold, 6)},
+                )
+                continue
+            exported.append(wall)
+        self.set_wall_stage("exported", exported)
+        return exported
 
     def record_wall_event(
         self,

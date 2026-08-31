@@ -81,6 +81,7 @@ def test_geometry_diagnostics_has_stable_contract_and_endpoint_summary():
         "zero_room_reasons",
     }
     assert payload["wall_stages"]["stage_counts"]["raw"] == 4
+    assert payload["wall_stages"]["stage_counts"]["post_refinement_internal"] == 0
     assert payload["endpoint_gaps"]["endpoint_count"] == 8
     assert payload["endpoint_gaps"]["component_count"] == 4
     assert payload["endpoint_gaps"]["gap_quantiles_m"]["p50"] == 0.0
@@ -162,3 +163,32 @@ def test_wall_lifecycle_records_quarantine_drop_and_provenance():
     assert events
     assert all(event["provenance"] for event in events)
     assert all("wall_id" in event for event in events)
+
+
+def test_internal_final_and_exported_wall_counts_are_explicitly_distinct():
+    diagnostics = GeometryDiagnostics()
+    walls = [
+        _wall(0, [0, 0], [4, 0], [0, 1]),
+        _wall(1, [0, 1], [0.4, 1], [0, 1]),
+    ]
+    diagnostics.set_wall_stage("post_refinement_internal", walls)
+    exported = diagnostics.record_export_filter(walls)
+
+    payload = diagnostics.to_dict()
+    assert len(exported) == 1
+    assert payload["wall_stages"]["stage_counts"]["post_refinement_internal"] == 2
+    assert payload["wall_stages"]["stage_counts"]["final"] == 2
+    assert payload["wall_stages"]["stage_counts"]["exported"] == 1
+    assert payload["wall_stages"]["drops_by_reason"]["below_export_min_length"] == 1
+    dropped = [
+        event
+        for event in payload["wall_records"]
+        if event.get("reason") == "below_export_min_length"
+    ]
+    assert len(dropped) == 1
+    assert dropped[0]["threshold_m"] == 0.5
+    assert dropped[0]["wall_id"]
+    assert dropped[0]["endpoint_ids"] == [
+        f"{dropped[0]['wall_id']}:start",
+        f"{dropped[0]['wall_id']}:end",
+    ]

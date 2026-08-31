@@ -271,7 +271,7 @@ def run(args: argparse.Namespace) -> int:
             trajectory=poses[:, :3, 3],
         )
         geometry_diagnostics.set_wall_stage("crossing", walls)
-        geometry_diagnostics.set_wall_stage("final", walls)
+        geometry_diagnostics.set_wall_stage("post_refinement_internal", walls)
         geometry_diagnostics.record_endpoint_gaps(walls)
         rooms = segment_rooms(
             grid,
@@ -786,9 +786,12 @@ def _assemble(
     """
     drift_by_wall = {v.wall_index: v.std for v in drift.per_wall}
     wall_docs = []
-    for wall in walls:
-        if wall.length < 0.5:
-            continue
+    exported_walls = (
+        geometry_diagnostics.record_export_filter(walls)
+        if geometry_diagnostics is not None
+        else [wall for wall in walls if wall.length >= 0.5]
+    )
+    for wall in exported_walls:
         spans = (
             occluded_spans(surface_grids[wall.index])
             if wall.index in surface_grids
