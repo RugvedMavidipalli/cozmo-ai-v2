@@ -94,6 +94,12 @@
             "pose_path": { "type": ["string", "null"] },
             "requested_indices": { "type": "array", "items": { "type": "integer" } },
             "integrated_indices": { "type": "array", "items": { "type": "integer" } },
+            "video_availability": {
+              "oneOf": [
+                { "$ref": "#/$defs/video_availability" },
+                { "type": "null" }
+              ]
+            },
             "frame_provenance": { "type": "array", "items": { "$ref": "#/$defs/frame_provenance" } },
             "rejected_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
             "fallback_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
@@ -139,6 +145,27 @@
         "qc_path": { "type": ["string", "null"] },
         "pose_source": { "type": "string" },
         "pose_path": { "type": ["string", "null"] }
+      }
+    },
+    "video_availability": {
+      "type": "object",
+      "required": [
+        "expected_frame_count", "sidecar_frame_count", "reported_frame_count",
+        "decoded_frame_count", "missing_indices", "reported_shortfall",
+        "terminal_decode_missing", "decode_complete"
+      ],
+      "properties": {
+        "expected_frame_count": { "type": "integer", "minimum": 0 },
+        "sidecar_frame_count": { "type": "integer", "minimum": 0 },
+        "reported_frame_count": { "type": ["integer", "null"], "minimum": 0 },
+        "decoded_frame_count": { "type": "integer", "minimum": 0 },
+        "missing_indices": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "reported_shortfall": { "type": "integer", "minimum": 0 },
+        "terminal_decode_missing": { "type": "boolean" },
+        "decode_complete": { "type": "boolean" }
       }
     },
     "point2": {

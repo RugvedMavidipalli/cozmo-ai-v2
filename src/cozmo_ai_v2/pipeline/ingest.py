@@ -74,6 +74,50 @@ class Frame:
 
 
 @dataclass
+class VideoAvailability:
+    """Deterministic availability evidence for a sequential video walk.
+
+    The pose/timestamp table defines the sidecar index space. OpenCV's
+    reported frame count is useful evidence, but successful sequential
+    decodes are the availability decision used by the frame contract. A
+    failed read ends the walk; no later sidecar index is ever shifted onto an
+    earlier decoded frame.
+    """
+
+    expected_frame_count: int
+    reported_frame_count: int | None = None
+    decoded_frame_count: int = 0
+    missing_indices: tuple[int, ...] = ()
+    terminal_decode_missing: bool = False
+    decode_complete: bool = False
+
+    @property
+    def sidecar_frame_count(self) -> int:
+        """The sidecar count used as the expected frame-index space."""
+        return self.expected_frame_count
+
+    @property
+    def reported_shortfall(self) -> int:
+        """How many reported video frames failed sequential decode."""
+        if self.reported_frame_count is None:
+            return 0
+        return max(self.reported_frame_count - self.decoded_frame_count, 0)
+
+    def to_dict(self) -> dict:
+        """Return JSON-compatible availability evidence."""
+        return {
+            "expected_frame_count": self.expected_frame_count,
+            "sidecar_frame_count": self.sidecar_frame_count,
+            "reported_frame_count": self.reported_frame_count,
+            "decoded_frame_count": self.decoded_frame_count,
+            "missing_indices": list(self.missing_indices),
+            "reported_shortfall": self.reported_shortfall,
+            "terminal_decode_missing": self.terminal_decode_missing,
+            "decode_complete": self.decode_complete,
+        }
+
+
+@dataclass
 class CaptureBundle:
     """Everything the rest of the pipeline needs to know about one capture,
     plus enough information to go back and re-read its individual frames on
@@ -693,6 +737,7 @@ def _video_width(path: Path) -> float:
 def iter_raw_frames(
     root: Path,
     indices: list[int] | np.ndarray | None = None,
+    availability: VideoAvailability | None = None,
 ):
     """Walks a capture's colour video alongside its per-frame depth and
     confidence images, handing back whatever came off disk without
@@ -708,6 +753,10 @@ def iter_raw_frames(
         root: The capture directory.
         indices: Which frame numbers to yield; if `None`, every frame in
             the video is yielded.
+        availability: Optional mutable record to populate with the reported
+            video count, successful decode count, and terminal sidecar gaps.
+            When supplied, the walk drains the video after the last requested
+            frame so short videos are detected even for strided requests.
 
     Yields:
         Tuples of `(index, bgr, depth_raw, confidence)`, in ascending
@@ -724,15 +773,24 @@ def iter_raw_frames(
     if indices is not None:
         wanted = sorted(int(i) for i in indices)
         if not wanted:
-            return
-        wanted_set = set(wanted)
-        last = wanted[-1]
+            if availability is None:
+                return
+            wanted_set = set()
+            last = -1
+        else:
+            wanted_set = set(wanted)
+            last = wanted[-1]
 
     video = cv2.VideoCapture(str(root / "rgb.mp4"))
     if not video.isOpened():
         raise FileNotFoundError(f"cannot open {root / 'rgb.mp4'}")
 
     try:
+        if availability is not None:
+            reported = video.get(cv2.CAP_PROP_FRAME_COUNT)
+            if np.isfinite(reported) and reported > 0:
+                availability.reported_frame_count = int(round(reported))
+
         index = 0
         # Stop as soon as the last requested frame is behind us, rather
         # than decoding the rest of the video for nothing.
@@ -753,6 +811,25 @@ def iter_raw_frames(
                     ),
                 )
             index += 1
+
+        # A strided consumer normally stops after its final requested index.
+        # Drain only when evidence was requested, so the report still records
+        # a terminal decoder shortfall that lies beyond that stride.
+        if availability is not None and not availability.decode_complete:
+            while True:
+                ok, _ = video.read()
+                if not ok:
+                    break
+                index += 1
+
+            availability.decoded_frame_count = index
+            availability.missing_indices = tuple(
+                range(index, availability.expected_frame_count)
+            )
+            availability.terminal_decode_missing = bool(
+                availability.missing_indices or availability.reported_shortfall
+            )
+            availability.decode_complete = True
     finally:
         video.release()
 

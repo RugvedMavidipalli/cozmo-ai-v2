@@ -8,6 +8,7 @@ from .frame_contract import (
     ReconstructionFrame,
     build_frame_contract,
 )
+from .ingest import VideoAvailability
 
 __all__ = [
     "FrameContract",
@@ -16,4 +17,5 @@ __all__ = [
     "PipelineFrame",
     "ReconstructionFrame",
     "build_frame_contract",
+    "VideoAvailability",
 ]

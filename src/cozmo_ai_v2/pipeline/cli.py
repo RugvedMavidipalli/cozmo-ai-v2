@@ -180,10 +180,22 @@ def run(args: argparse.Namespace) -> int:
     contract_report = reconstruction.contract_report or {}
     rejected_count = len(contract_report.get("rejected_frames", []))
     fallback_count = len(contract_report.get("fallback_frames", []))
+    availability = contract_report.get("video_availability") or {}
     if rejected_count:
         warnings.append(f"{rejected_count} requested frame(s) rejected by the depth/pose contract")
     if fallback_count:
         print(f"  {fallback_count} frame(s) used raw LiDAR fallback after dense-depth QC")
+    if availability.get("terminal_decode_missing"):
+        decoded = availability.get("decoded_frame_count", 0)
+        expected = availability.get("expected_frame_count", 0)
+        reported = availability.get("reported_frame_count")
+        reported_note = f", OpenCV reported {reported}" if reported is not None else ""
+        decode_end = f"after index {decoded - 1}" if decoded else "before index 0"
+        warnings.append(
+            f"RGB video decode ended {decode_end}; "
+            f"{len(availability.get('missing_indices', []))} terminal sidecar "
+            f"frame(s) unavailable (expected {expected}{reported_note})"
+        )
 
     if len(cloud.points):
         cloud.estimate_normals(

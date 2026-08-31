@@ -22,7 +22,7 @@ from typing import Iterator
 import cv2
 import numpy as np
 
-from .ingest import CaptureBundle, iter_raw_frames
+from .ingest import CaptureBundle, VideoAvailability, iter_raw_frames
 
 DEPTH_SCALE_MM_TO_M = 1000.0
 DENSE_DEPTH_SOURCE = "metric3d_v2_scale_shift_lidar_residual"
@@ -251,10 +251,13 @@ class FrameContract:
     fallback_frames: dict[int, FrameRejection] = field(default_factory=dict)
     depth_sources: dict[int, str] = field(default_factory=dict)
     provenance_by_index: dict[int, FrameProvenance] = field(default_factory=dict)
+    video_availability: VideoAvailability | None = None
 
     def iter_frames(self, indices: list[int] | np.ndarray | None = None) -> Iterator[ReconstructionFrame]:
         requested = _normalise_indices(indices, len(self.poses)) if indices is not None else self.requested_indices
-        for index, bgr, raw_depth, raw_confidence in iter_raw_frames(self.bundle.root, requested):
+        for index, bgr, raw_depth, raw_confidence in iter_raw_frames(
+            self.bundle.root, requested, availability=self.video_availability
+        ):
             frame = self._build_frame(index, bgr, raw_depth, raw_confidence)
             if frame is None:
                 continue
@@ -271,7 +274,10 @@ class FrameContract:
         seen = {index for index in self.yielded_indices} | set(self.rejected_frames)
         for index in requested:
             if index not in seen:
-                self._reject(index, "frame is not present in the RGB video", "unknown")
+                reason = "frame is not present in the RGB video"
+                if self.video_availability is not None and index in self.video_availability.missing_indices:
+                    reason += "; terminal decode ended before this sidecar index"
+                self._reject(index, reason, "unknown")
 
     def _reject(self, index: int, reason: str, source: str) -> None:
         self.rejected_frames[index] = FrameRejection(index, reason, source)
@@ -457,6 +463,11 @@ class FrameContract:
             "pose_path": self.pose_path,
             "requested_indices": list(self.requested_indices),
             "integrated_indices": sorted(self.integrated_indices),
+            "video_availability": (
+                self.video_availability.to_dict()
+                if self.video_availability is not None
+                else None
+            ),
             "frame_provenance": [
                 {"index": index, **self.provenance_by_index[index].to_dict()}
                 for index in sorted(self.provenance_by_index)
@@ -507,4 +518,5 @@ def build_frame_contract(
         min_confidence=min_confidence,
         max_depth=max_depth,
         _dense_entries=entries,
+        video_availability=VideoAvailability(expected_frame_count=len(pose_table)),
     )

@@ -159,8 +159,11 @@ dense artifact for this path; model execution remains an explicit offline Stage 
 no raw `depth/*.png` when a QC-approved Stage 4 dense directory, calibration, and pose
 table are supplied. A Stray Scanner frame with an unapproved/malformed dense raster falls
 back to its same-index raw LiDAR, while a video-only frame without either source is
-rejected and reported. The Metric3D adapter deliberately requires an explicit local
-checkpoint/repository so CI and production ingestion never download weights implicitly.
+rejected and reported. The frame contract also records OpenCV's reported and successfully
+decoded video counts; a terminal decode shortfall is reported with the missing sidecar
+indices, and sidecar indices are never shifted. The Metric3D adapter deliberately requires
+an explicit local checkpoint/repository so CI and production ingestion never download
+weights implicitly.
 
 **Confidence intervals are structurally correct but never calibrated against real data**
 — every run reports the honest "uncalibrated" warning rather than silently claiming a

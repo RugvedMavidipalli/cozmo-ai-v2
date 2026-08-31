@@ -41,7 +41,7 @@ out/<capture>/
                                 # and ceiling, as individually named, selectable planes
   cloud.ply                    # fused point cloud
   mesh.ply                     # triangle mesh extracted from the same TSDF volume
-  fusion_manifest.json         # depth/pose provenance and frame fallback decisions
+  fusion_manifest.json         # depth/pose provenance, frame decisions, and video availability
   scope_sketch.csv             # room/wall geometry table (Xactimate-sketch-style export)
   scope_line_items.csv         # scope-of-work line items (action/material/qty/rule/source)
   damage_overlays/             # per-frame detection box + mask + label, full video

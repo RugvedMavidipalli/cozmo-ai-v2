@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pytest
 
 from cozmo_ai_v2.pipeline import export
 from cozmo_ai_v2.pipeline.frame_contract import build_frame_contract
@@ -89,6 +90,36 @@ def test_contract_falls_back_per_index_to_raw_lidar(stray_capture, tmp_path):
     assert report["fallback_frames"][0]["index"] == 0
     assert report["rejected_frames"] == []
     assert [item["index"] for item in report["frame_provenance"]] == [0, 1]
+
+
+def test_contract_reports_one_frame_short_video_without_shifting_sidecars(
+    stray_capture,
+):
+    video_path = stray_capture / "rgb.mp4"
+    writer = cv2.VideoWriter(
+        str(video_path), cv2.VideoWriter_fourcc(*"avc1"), 30, (64, 48)
+    )
+    assert writer.isOpened()
+    writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    writer.release()
+
+    bundle = load_capture(stray_capture)
+    contract = build_frame_contract(bundle, indices=[0], max_depth=4.0)
+    frames = list(contract.iter_frames())
+
+    # The only decoded frame remains sidecar index 0. In particular, its
+    # depth is not silently replaced with frame 1's 2.3--2.7 m raster.
+    assert [frame.index for frame in frames] == [0]
+    assert frames[0].depth.max() == pytest.approx(2.2, abs=1e-3)
+
+    availability = contract.report()["video_availability"]
+    assert availability["expected_frame_count"] == 2
+    assert availability["sidecar_frame_count"] == 2
+    assert availability["reported_frame_count"] is not None
+    assert availability["decoded_frame_count"] == 1
+    assert availability["missing_indices"] == [1]
+    assert availability["terminal_decode_missing"] is True
+    assert availability["decode_complete"] is True
 
 
 def test_contract_rejects_dense_without_qc_when_raw_is_missing(stray_capture, tmp_path):
