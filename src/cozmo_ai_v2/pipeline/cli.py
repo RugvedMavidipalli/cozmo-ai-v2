@@ -428,6 +428,11 @@ def run(args: argparse.Namespace) -> int:
     )
     if gravity.room_height is None:
         warnings.append("no ceiling plane found; heights are unavailable")
+        if gravity.ceiling_fit is not None and gravity.ceiling_fit.rejection_reasons:
+            warnings.append(
+                "ceiling fit not accepted: "
+                + ", ".join(gravity.ceiling_fit.rejection_reasons)
+            )
     if gravity.floor_low_confidence:
         warnings.append(
             "floor plane is low confidence: "
@@ -436,7 +441,12 @@ def run(args: argparse.Namespace) -> int:
             f"(adaptive limit {gravity.floor_adaptive_residual_limit * 1000.0:.1f} mm)"
         )
     elif not gravity.floor_observed:
-        warnings.append("floor plane was not observed with sufficient support")
+        reasons = (
+            ", ".join(gravity.floor_fit.rejection_reasons)
+            if gravity.floor_fit is not None
+            else "support_below_threshold"
+        )
+        warnings.append(f"floor plane was not observed: {reasons}")
 
     # Stage 6: wall refinement
     with timings.stage("wall refinement"):
@@ -1414,6 +1424,12 @@ def _assemble(
             ),
             "ceiling_observed": bool(gravity.ceiling_observed),
             "ceiling_confidence": round(float(gravity.ceiling_confidence), 4),
+            "ceiling_inlier_count": int(gravity.ceiling_inlier_count),
+            "ceiling_residual_rms_mm": (
+                round(float(gravity.ceiling_residual_rms * 1000.0), 3)
+                if gravity.ceiling_residual_rms is not None
+                else None
+            ),
             "floor_confidence": round(float(gravity.floor_confidence), 4),
             "floor_observed": bool(gravity.floor_observed),
             "floor_quality_status": gravity.floor_quality_status,
@@ -1424,6 +1440,14 @@ def _assemble(
             ),
             "floor_inlier_count": int(gravity.floor_inlier_count),
             "floor_residual_rms_mm": round(float(gravity.floor_residual_rms * 1000.0), 3),
+            "floor_fit": (
+                gravity.floor_fit.to_dict() if gravity.floor_fit is not None else None
+            ),
+            "ceiling_fit": (
+                gravity.ceiling_fit.to_dict()
+                if gravity.ceiling_fit is not None
+                else None
+            ),
             "manhattan_yaw_deg": round(float(np.degrees(frame.yaw)), 3),
             "manhattan_fraction": round(frame.manhattan_fraction, 4),
             "walls": wall_docs,
@@ -1431,9 +1455,26 @@ def _assemble(
             "plane_extraction": {
                 "algorithm": "seeded_ransac_region_growing_tls_3d",
                 "refit": "total_least_squares_svd_perpendicular_residual",
+                "candidate_threshold": float(
+                    getattr(args, "plane_threshold", 0.03)
+                ),
+                "support_threshold": int(getattr(args, "plane_min_inliers", 30)),
+                "residual_threshold": float(
+                    getattr(args, "plane_threshold", 0.03)
+                ),
                 "plane_count": len(structural_plane_docs),
                 "kept_count": sum(not plane.quarantined for plane in structural_planes),
                 "quarantined_count": sum(plane.quarantined for plane in structural_planes),
+                "rejection_reasons": {
+                    reason: sum(reason in plane.rejection_reasons for plane in structural_planes)
+                    for reason in sorted(
+                        {
+                            reason
+                            for plane in structural_planes
+                            for reason in plane.rejection_reasons
+                        }
+                    )
+                },
                 "floor_plane_ids": floor_plane_ids,
                 "ceiling_plane_ids": ceiling_plane_ids,
                 "multiple_ceiling_planes": len(ceiling_plane_ids) > 1,

@@ -510,6 +510,17 @@ class StructuralPlane:
     residual_max: float
     point_density: float
     confidence: float
+    # Acceptance evidence is kept with every retained candidate.  The
+    # distance threshold is both the RANSAC support threshold and the strict
+    # residual target; the adaptive threshold records the robust quality
+    # allowance used for reporting noisy support.
+    candidate_threshold: float = 0.0
+    support_threshold: int = 0
+    residual_threshold: float = 0.0
+    adaptive_residual_threshold: float = 0.0
+    quality_status: str = "high_confidence"
+    low_confidence: bool = False
+    rejection_reasons: tuple[str, ...] = ()
     bounds_min: np.ndarray | None = None
     bounds_max: np.ndarray | None = None
     in_plane_extents: np.ndarray | None = None
@@ -579,6 +590,19 @@ class StructuralPlane:
             if np.isfinite(self.confidence)
             else 0.0
         )
+        self.candidate_threshold = _finite_nonnegative(self.candidate_threshold)
+        self.support_threshold = max(0, int(self.support_threshold))
+        self.residual_threshold = _finite_nonnegative(self.residual_threshold)
+        self.adaptive_residual_threshold = _finite_nonnegative(
+            self.adaptive_residual_threshold
+        )
+        self.quality_status = str(self.quality_status or "unknown")
+        self.low_confidence = bool(
+            self.low_confidence or self.quality_status == "low_confidence"
+        )
+        self.rejection_reasons = tuple(
+            sorted({str(reason) for reason in self.rejection_reasons if str(reason)})
+        )
         self.ceiling_confidence = float(
             np.clip(self.ceiling_confidence, 0.0, 1.0)
             if np.isfinite(self.ceiling_confidence)
@@ -586,6 +610,15 @@ class StructuralPlane:
         )
         if self.classification == PlaneClassification.CLUTTER.value:
             self.quarantined = True
+            if "off-orientation" in self.tags:
+                self.rejection_reasons = tuple(
+                    sorted(
+                        set(self.rejection_reasons)
+                        | {"orientation_not_horizontal_or_vertical"}
+                    )
+                )
+            elif not self.rejection_reasons:
+                self.rejection_reasons = ("not_floor_or_ceiling_height",)
         if self.classification == PlaneClassification.CEILING.value:
             self.ceiling_observed = True
         if self.wall_vertical_extent is not None:
@@ -812,6 +845,15 @@ class StructuralPlane:
             "point_density": round(float(self.point_density), 6),
             "density": round(float(self.point_density), 6),
             "confidence": round(float(self.confidence), 6),
+            "candidate_threshold": round(float(self.candidate_threshold), 6),
+            "support_threshold": int(self.support_threshold),
+            "residual_threshold": round(float(self.residual_threshold), 6),
+            "adaptive_residual_threshold": round(
+                float(self.adaptive_residual_threshold), 6
+            ),
+            "quality_status": self.quality_status,
+            "low_confidence": bool(self.low_confidence),
+            "rejection_reasons": list(self.rejection_reasons),
             "residual_statistics": {
                 key: round(value, 6)
                 for key, value in self.residual_statistics.items()
@@ -1237,6 +1279,15 @@ def extract_structural_planes(
         spans = in_plane_extents[:, 1] - in_plane_extents[:, 0]
         area = float(max(spans[0], 0.0) * max(spans[1], 0.0))
         density = float(len(plane_points) / area) if area > 1e-9 else 0.0
+        robust_mad = float(
+            np.median(np.abs(residuals - np.median(residuals)))
+            if len(residuals)
+            else 0.0
+        )
+        adaptive_threshold = float(
+            np.clip(max(threshold, 2.5 * max(0.005, 1.4826 * robust_mad) + 0.01),
+                    threshold, max(3.0 * threshold, 0.12))
+        )
         support_score = 1.0 - np.exp(-len(plane_points) / max(float(minimum), 1.0))
         residual_score = float(np.exp(-float(np.sqrt(np.mean(residuals**2))) / threshold))
         density_score = density / (density + 25.0) if density > 0 else 0.0
@@ -1260,6 +1311,16 @@ def extract_structural_planes(
                 1.0,
             )
         )
+        if is_quarantined:
+            rejection_reasons = (
+                ("orientation_not_horizontal_or_vertical",)
+                if "off-orientation" in tags
+                else ("not_floor_or_ceiling_height",)
+            )
+            quality_status = "quarantined"
+        else:
+            rejection_reasons = ()
+            quality_status = "high_confidence"
         vertical_values = plane_points @ up_value
         vertical_extent = tuple(
             float(v) for v in (float(vertical_values.min()), float(vertical_values.max()))
@@ -1288,6 +1349,13 @@ def extract_structural_planes(
             residual_max=float(np.max(residuals)),
             point_density=density,
             confidence=confidence,
+            candidate_threshold=threshold,
+            support_threshold=minimum,
+            residual_threshold=threshold,
+            adaptive_residual_threshold=adaptive_threshold,
+            quality_status=quality_status,
+            low_confidence=False,
+            rejection_reasons=rejection_reasons,
             bounds_min=bounds_min,
             bounds_max=bounds_max,
             in_plane_extents=in_plane_extents,

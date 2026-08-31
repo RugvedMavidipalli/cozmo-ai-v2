@@ -5,6 +5,7 @@ import pytest
 
 from cozmo_ai_v2.pipeline.geometry import (
     GravityEstimate,
+    _fit_horizontal_planes,
     _plane_fit_from_candidate,
     estimate_gravity,
 )
@@ -127,11 +128,63 @@ def test_floor_quality_boundary_changes_status_not_plane_presence():
     )
 
     assert at_target.observed is True
+    assert at_target.accepted is True
     assert at_target.quality_status == "high_confidence"
     assert over_target.observed is True
+    assert over_target.accepted is True
     assert over_target.quality_status == "low_confidence"
     assert over_target.low_confidence is True
     assert over_target.confidence > 0.0
+    assert over_target.candidate_observed is True
+    assert over_target.candidate_threshold == 0.08
+    assert over_target.support_threshold == 20
+    assert over_target.residual_threshold == 0.04
+    assert "residual_above_strict_threshold" in over_target.rejection_reasons
+    assert "residual_above_adaptive_threshold" not in over_target.rejection_reasons
+
+
+def test_ceiling_fit_keeps_candidate_evidence_when_acceptance_fails():
+    rng = np.random.default_rng(808)
+    fit = _fit_horizontal_planes(
+        np.concatenate(
+            (
+                np.zeros(300),
+                rng.normal(2.40, 0.06, 300),
+            )
+        ),
+        normal_alignment=np.ones(600),
+    )
+
+    assert fit.ceiling.height is None
+    assert fit.ceiling.observed is False
+    assert fit.ceiling.candidate_observed is True
+    assert fit.ceiling.candidate_height is not None
+    assert fit.ceiling.inlier_count >= 150
+    assert fit.ceiling.support_fraction > 0.0
+    assert fit.ceiling.confidence > 0.0
+    assert fit.ceiling.low_confidence is True
+    assert fit.ceiling.accepted is False
+    assert "residual_above_strict_threshold" in fit.ceiling.rejection_reasons
+    assert fit.ceiling.support_threshold == 20
+
+
+def test_fit_rejection_reasons_distinguish_support_and_adaptive_residual():
+    unsupported = _plane_fit_from_candidate(
+        (0.0, 19, 0.01, 1.0, 0.005), minimum_support=20, total_count=200
+    )
+    too_noisy = _plane_fit_from_candidate(
+        (0.0, 100, 0.13, 1.0, 0.005), minimum_support=20, total_count=200
+    )
+
+    assert unsupported.candidate_observed is True
+    assert unsupported.observed is False
+    assert unsupported.quality_status == "rejected"
+    assert unsupported.confidence == 0.0
+    assert "support_below_threshold" in unsupported.rejection_reasons
+    assert too_noisy.observed is True
+    assert too_noisy.low_confidence is True
+    assert too_noisy.accepted is False
+    assert "residual_above_adaptive_threshold" in too_noisy.rejection_reasons
 
 
 def test_missing_ceiling_does_not_block_room_polygonization():
@@ -169,6 +222,10 @@ def test_geometry_degenerate_inputs_are_finite_and_conservative():
     assert gravity.ceiling_height is None
     assert gravity.ceiling_observed is False
     assert gravity.room_height is None
+    assert gravity.floor_fit is not None
+    assert gravity.ceiling_fit is not None
+    assert "no_finite_height_candidate" in gravity.floor_fit.rejection_reasons
+    assert "no_finite_height_candidate" in gravity.ceiling_fit.rejection_reasons
     assert np.isfinite(gravity.floor_height)
     assert np.isfinite(gravity.inlier_fraction)
 

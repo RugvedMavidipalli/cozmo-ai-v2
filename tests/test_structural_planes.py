@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from cozmo_ai_v2.pipeline.export import export_plane_metadata
+from cozmo_ai_v2.pipeline.geometry import PlaneFit
 from cozmo_ai_v2.pipeline.planes import (
     HorizontalFrame,
     PlaneClassification,
@@ -79,6 +80,11 @@ def test_structural_planes_are_deterministic_and_retain_source_support():
         assert np.isclose(np.linalg.norm(plane.normal), 1.0)
         assert np.isfinite(plane.offset)
         assert plane.residual_rms < 0.04
+        assert plane.candidate_threshold == 0.03
+        assert plane.support_threshold == 40
+        assert plane.residual_threshold == 0.03
+        assert plane.adaptive_residual_threshold >= plane.residual_threshold
+        assert isinstance(plane.rejection_reasons, tuple)
         assert plane.point_density > 0.0
         assert plane.confidence > 0.4
 
@@ -149,6 +155,12 @@ def test_clutter_and_off_orientation_planes_are_quarantined():
     assert len(clutter) >= 2
     assert all(plane.quarantined for plane in clutter)
     assert all("off-orientation" in plane.tags for plane in clutter)
+    assert all(plane.rejection_reasons for plane in clutter)
+    assert all(
+        "orientation_not_horizontal_or_vertical" in plane.rejection_reasons
+        or "not_floor_or_ceiling_height" in plane.rejection_reasons
+        for plane in clutter
+    )
 
 
 def test_tls_and_wall_conversion_are_safe_for_degenerate_and_metric_inputs():
@@ -232,8 +244,40 @@ def test_plane_metadata_export_and_schema_shape(tmp_path):
             "floor_adaptive_residual_limit_mm": 40.0,
             "floor_inlier_count": 100,
             "floor_residual_rms_mm": 5.0,
+            "floor_fit": PlaneFit(
+                height=0.0,
+                inlier_count=100,
+                residual_rms=0.005,
+                confidence=0.8,
+                observed=True,
+                quality_status="high_confidence",
+                support_fraction=1.0,
+                adaptive_residual_limit=0.04,
+                candidate_observed=True,
+                candidate_height=0.0,
+                candidate_threshold=0.08,
+                support_threshold=20,
+                residual_threshold=0.04,
+            ).to_dict(),
+            "ceiling_fit": PlaneFit(
+                height=2.4,
+                inlier_count=100,
+                residual_rms=0.005,
+                confidence=0.8,
+                observed=True,
+                quality_status="high_confidence",
+                support_fraction=1.0,
+                adaptive_residual_limit=0.04,
+                candidate_observed=True,
+                candidate_height=2.4,
+                candidate_threshold=0.08,
+                support_threshold=20,
+                residual_threshold=0.04,
+            ).to_dict(),
             "ceiling_observed": True,
             "ceiling_confidence": 0.8,
+            "ceiling_inlier_count": 100,
+            "ceiling_residual_rms_mm": 5.0,
             "walls": [],
             **reconstruction,
         },
