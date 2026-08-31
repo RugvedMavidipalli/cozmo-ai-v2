@@ -2,10 +2,54 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
 from .geometry import GravityEstimate
+
+WallCoordinateConvention = Literal["finished_face", "centerline", "room_side"]
+FINISHED_FACE: WallCoordinateConvention = "finished_face"
+
+
+@dataclass(frozen=True)
+class ProjectedWallLine:
+    """A gravity-aligned 2D line obtained from a 3D vertical plane.
+
+    The source plane is represented by ``normal_3d · world = offset_3d``.
+    For a genuinely vertical plane, its horizontal component is already the
+    same finished-face line used by :class:`WallSegment`.  Small tilt is
+    reported in ``tilt_degrees`` rather than silently changing the frame.
+    """
+
+    normal: np.ndarray
+    offset: float
+    tilt_degrees: float
+    confidence: float
+    coordinate_convention: WallCoordinateConvention = FINISHED_FACE
+
+    def __post_init__(self) -> None:
+        normal = np.asarray(self.normal, dtype=float)
+        norm = float(np.linalg.norm(normal))
+        if normal.shape != (2,) or not np.isfinite(norm) or norm <= 1e-9:
+            raise ValueError("projected wall line normal must be finite and non-zero")
+        normal = normal / norm
+        canonical = _canonical_normal(normal)
+        offset = float(self.offset)
+        if not np.isfinite(offset):
+            raise ValueError("projected wall line offset must be finite")
+        if self.coordinate_convention not in ("finished_face", "centerline", "room_side"):
+            raise ValueError("unsupported wall coordinate convention")
+        confidence = float(self.confidence)
+        confidence = confidence if np.isfinite(confidence) else 0.0
+        if not np.allclose(canonical, normal):
+            offset = -offset
+        object.__setattr__(self, "normal", canonical)
+        object.__setattr__(self, "offset", offset)
+        object.__setattr__(self, "tilt_degrees", float(self.tilt_degrees))
+        object.__setattr__(
+            self, "confidence", float(np.clip(confidence, 0.0, 1.0))
+        )
 
 
 @dataclass
@@ -105,6 +149,88 @@ class HorizontalFrame:
         )
 
 
+def _derive_wall_confidence(inlier_count: int, residual_rms: float) -> float:
+    """Turn support and line residual into a conservative [0, 1] score."""
+    support = 1.0 - np.exp(-max(int(inlier_count), 0) / 100.0)
+    residual = (
+        np.exp(-max(float(residual_rms), 0.0) / 0.05)
+        if np.isfinite(residual_rms)
+        else 0.0
+    )
+    return float(np.clip(support * residual, 0.0, 1.0))
+
+
+def vertical_plane_to_line(
+    normal: np.ndarray,
+    offset: float,
+    frame: HorizontalFrame,
+    *,
+    max_tilt_degrees: float = 20.0,
+    confidence: float = 1.0,
+    coordinate_convention: WallCoordinateConvention = FINISHED_FACE,
+) -> ProjectedWallLine:
+    """Project a world-space vertical plane into the building plan frame.
+
+    The plane follows the explicit finished-face convention used throughout
+    the reconstruction: ``normal · world = offset`` describes the measured
+    visible wall face. Its component along gravity is removed, and the
+    remaining normal is converted to ``(right, forward)`` coordinates. A
+    plane with more than ``max_tilt_degrees`` from vertical is rejected rather
+    than being forced into a wall line.
+    """
+    normal = np.asarray(normal, dtype=float).reshape(-1)
+    if normal.shape != (3,):
+        raise ValueError("plane normal must have shape (3,)")
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 1e-9:
+        raise ValueError("plane normal must be finite and non-zero")
+    offset = float(offset)
+    if not np.isfinite(offset):
+        raise ValueError("plane offset must be finite")
+    if (
+        not np.isfinite(max_tilt_degrees)
+        or max_tilt_degrees < 0
+        or max_tilt_degrees >= 90
+    ):
+        raise ValueError("max_tilt_degrees must be in [0, 90)")
+    up = np.asarray(frame.up, dtype=float).reshape(-1)
+    up_norm = float(np.linalg.norm(up))
+    if up.shape != (3,) or not np.isfinite(up_norm) or up_norm <= 1e-9:
+        raise ValueError("frame.up must be a finite non-zero vector")
+    up = up / up_norm
+    normal = normal / norm
+    horizontal = normal - float(normal @ up) * up
+    horizontal_norm = float(np.linalg.norm(horizontal))
+    tilt = float(np.degrees(np.arcsin(np.clip(abs(normal @ up), 0.0, 1.0))))
+    if horizontal_norm <= 1e-9 or tilt > max_tilt_degrees:
+        raise ValueError(
+            f"plane is not vertical enough for a wall line (tilt={tilt:.2f}°)"
+        )
+
+    plan_normal = np.array(
+        [normal @ frame.right, normal @ frame.forward], dtype=float
+    )
+    plan_normal /= float(np.linalg.norm(plan_normal))
+    canonical_plan_normal = _canonical_normal(plan_normal)
+    # A slightly tilted plane is represented at the gravity-zero plan slice;
+    # tilt remains visible in the returned quality metadata.
+    projected_offset = offset / horizontal_norm
+    if not np.allclose(canonical_plan_normal, plan_normal):
+        projected_offset = -projected_offset
+    verticality = float(np.cos(np.radians(tilt)))
+    return ProjectedWallLine(
+        normal=canonical_plan_normal,
+        offset=float(projected_offset),
+        tilt_degrees=tilt,
+        confidence=float(confidence) * verticality,
+        coordinate_convention=coordinate_convention,
+    )
+
+
+# Descriptive alias for callers that use "project" for all frame transforms.
+project_vertical_plane = vertical_plane_to_line
+
+
 @dataclass
 class WallSegment:
     """One flat, vertical wall surface, described in the building's own floor-plan coordinates.
@@ -146,6 +272,17 @@ class WallSegment:
         tags: Free-form text labels this module and later stages attach to
             record notable things about the wall, such as `"clutter-in-front"`
             or `"trimmed-at-junction"`.
+        confidence: Fit confidence in [0, 1], derived from support and
+            residual when omitted by a caller.
+        fit_quality: Quality of the fitted line, kept separate from later
+            topology acceptance decisions.
+        coordinate_convention: Explicit line convention. The integrated
+            pipeline uses `"finished_face"`; it never treats a measured
+            surface as a centerline implicitly.
+        provenance: Source label for audit and vectorizer metadata.
+        snap_status: `"unsnapped"`, `"snapped"`, or a rejection reason.
+        snap_residual: RMS distance in metres from the pre-snap line to the
+            accepted snapped line, or zero when no snap was attempted.
     """
 
     index: int
@@ -163,6 +300,12 @@ class WallSegment:
     # Off-axis detections are retained for diagnostics, but quarantined from
     # room topology, polygonization, and metric wall output.
     quarantined: bool = False
+    confidence: float = -1.0
+    fit_quality: float = -1.0
+    coordinate_convention: WallCoordinateConvention = FINISHED_FACE
+    provenance: str = "point-cloud"
+    snap_status: str = "unsnapped"
+    snap_residual: float = 0.0
 
     def __post_init__(self) -> None:
         normal = np.asarray(self.normal, dtype=float)
@@ -183,6 +326,31 @@ class WallSegment:
         if self.start.shape != (2,) or self.end.shape != (2,):
             raise ValueError("wall endpoints must be 2D vectors")
         self.tags = list(self.tags)
+        self.inlier_count = max(int(self.inlier_count), 0)
+        self.residual_rms = (
+            float(self.residual_rms)
+            if np.isfinite(self.residual_rms)
+            else float("inf")
+        )
+        if self.coordinate_convention not in ("finished_face", "centerline", "room_side"):
+            raise ValueError("unsupported wall coordinate convention")
+        if not np.isfinite(self.confidence) or self.confidence < 0:
+            self.confidence = _derive_wall_confidence(
+                self.inlier_count, self.residual_rms
+            )
+        else:
+            self.confidence = float(np.clip(self.confidence, 0.0, 1.0))
+        if not np.isfinite(self.fit_quality) or self.fit_quality < 0:
+            self.fit_quality = self.confidence
+        else:
+            self.fit_quality = float(np.clip(self.fit_quality, 0.0, 1.0))
+        self.provenance = str(self.provenance)
+        self.snap_status = str(self.snap_status)
+        self.snap_residual = (
+            float(self.snap_residual)
+            if np.isfinite(self.snap_residual) and self.snap_residual >= 0
+            else 0.0
+        )
         if invalid_normal:
             self.quarantined = True
             self.tags.append("invalid-geometry")
@@ -201,6 +369,21 @@ class WallSegment:
     def off_axis(self) -> bool:
         """Whether this wall was quarantined as a non-Manhattan line."""
         return "off-axis" in self.tags
+
+    @property
+    def topology_eligible(self) -> bool:
+        """Whether later graph stages may use this candidate as a wall."""
+        return not self.quarantined and self.length > 1e-6
+
+    @property
+    def quality(self) -> float:
+        """Short alias for the fitted-line quality score."""
+        return self.fit_quality
+
+    @property
+    def plane_confidence(self) -> float:
+        """Alias exposing the confidence of the supporting wall plane."""
+        return self.confidence
 
     @property
     def length(self) -> float:
@@ -606,6 +789,9 @@ def extract_walls(
                         float(heights[remaining][inlier_mask].max()),
                     ),
                     quarantined=bool(quarantine_off_axis and is_off_axis),
+                    confidence=_derive_wall_confidence(int(count), float(np.sqrt((residual**2).mean()))),
+                    fit_quality=_derive_wall_confidence(int(count), float(np.sqrt((residual**2).mean()))),
+                    provenance="wall-band point cloud",
                 )
             if is_off_axis:
                 wall.tags.append("off-axis")
@@ -1245,89 +1431,41 @@ def snap_corners(
     max_extension: float = 0.45,
     max_trim: float = 0.30,
 ) -> int:
-    """Nudges wall endpoints so that walls meeting at a corner actually touch at a clean point.
+    """Compatibility wrapper around the global wall-graph node solver.
 
-    Detected walls almost never end exactly where they should -- one wall's
-    endpoint might stop just short of, or run just past, the neighbouring
-    wall it's supposed to meet. This function finds those nearby corners
-    (where two walls' lines would cross) and, for each wall endpoint, moves
-    it onto whichever nearby corner would require the smallest adjustment,
-    as long as that corner is also plausibly close to where the other wall
-    actually ends. Every possible endpoint-to-corner adjustment is
-    collected first and then applied smallest-adjustment-first, so that
-    endpoints compete fairly for the best-fitting corner rather than each
-    wall grabbing the first candidate it happens to consider. An endpoint
-    with no good nearby corner is simply left where it was.
-
-    Args:
-        walls: Wall segments to snap into corners; mutated in place for any
-            endpoint that ends up getting moved.
-        max_extension: The furthest an endpoint may be pushed outward, in
-            metres, to reach a candidate corner.
-        max_trim: The furthest an endpoint may be pulled inward, in metres,
-            to reach a candidate corner.
-
-    Returns:
-        How many endpoints were actually moved onto a snapped corner.
+    New pipeline code must call :func:`wall_graph.solve_wall_graph` directly.
+    This name remains for callers of the Phase 1 API, but no longer performs
+    independent endpoint proposals: every shared corner is solved jointly
+    from the incident wall lines.
     """
-    proposals: list[tuple[float, int, str, np.ndarray]] = []
-    active_walls = [wall for wall in walls if not wall.quarantined]
-    for i, wall in enumerate(active_walls):
-        for other in active_walls:
-            if other is wall:
-                continue
-            hit = _segment_intersection(wall, other)
-            if hit is None:
-                continue
-            point, u_self, u_other = hit
-            if not (-max_extension <= u_other <= other.length + max_extension):
-                continue
-            for end_name, adjustment in (
-                ("start", -u_self),
-                ("end", u_self - wall.length),
-            ):
-                if -max_trim <= adjustment <= max_extension:
-                    proposals.append((abs(adjustment), i, end_name, point))
+    from .wall_graph import solve_wall_graph
 
-    # Apply the smallest adjustments first, so each endpoint gets matched
-    # to its best-fitting corner rather than whichever candidate happened
-    # to be considered first.
-    proposals.sort(key=lambda entry: entry[0])
-    taken: set[tuple[int, str]] = set()
-    snapped = 0
-    for _, index, end_name, point in proposals:
-        key = (index, end_name)
-        if key in taken:
+    tolerance = max(float(max_extension), float(max_trim))
+    graph = solve_wall_graph(
+        walls,
+        node_tolerance=tolerance,
+        min_length=1e-9,
+        min_confidence=0.0,
+    )
+    solved_by_index = {wall.index: wall for wall in graph.candidates}
+    for wall in walls:
+        solved = solved_by_index.get(wall.index)
+        if solved is None:
             continue
-        wall = active_walls[index]
-        remaining = (
-            float(np.linalg.norm(wall.end - point))
-            if end_name == "start"
-            else float(np.linalg.norm(point - wall.start))
-        )
-        if remaining < 0.3:
-            continue
-        taken.add(key)
-        if end_name == "start":
-            shift = float(wall.along(point[None])[0])
-            wall.start = point.copy()
-            wall.observed_span = (
-                max(0.0, wall.observed_span[0] - shift),
-                max(0.0, wall.observed_span[1] - shift),
-            )
-        else:
-            wall.end = point.copy()
-            wall.observed_span = (
-                min(wall.observed_span[0], wall.length),
-                min(wall.observed_span[1], wall.length),
-            )
-        wall.tags = sorted(set(wall.tags) | {f"corner-{end_name}"})
-        snapped += 1
-    return snapped
+        wall.start = solved.start.copy()
+        wall.end = solved.end.copy()
+        wall.tags = list(solved.tags)
+        wall.quarantined = solved.quarantined
+        wall.snap_status = solved.snap_status
+    return graph.snapped_endpoint_count
 
 
 def snap_to_frame(
-    walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 8.0
+    walls: list[WallSegment],
+    frame: HorizontalFrame,
+    tolerance_degrees: float = 8.0,
+    min_confidence: float = 0.25,
+    quarantine_weak: bool = True,
 ) -> list[WallSegment]:
     """Straightens out walls that are already close to square with the building, so they're exactly square.
 
@@ -1349,19 +1487,34 @@ def snap_to_frame(
         tolerance_degrees: The largest angle, in degrees, a wall's normal
             may be away from the nearest axis-aligned direction and still
             be snapped onto it.
+        min_confidence: Minimum fit confidence required before a candidate is
+            allowed to snap. Weak candidates are retained for diagnostics but
+            are not forced onto a Manhattan axis.
+        quarantine_weak: If true, weak unsnapped candidates are excluded from
+            graph topology while remaining in the returned candidate list.
 
     Returns:
         The same `walls` list, mutated in place and also returned, so
         calls can be chained together.
     """
+    if not np.isfinite(min_confidence) or not 0.0 <= min_confidence <= 1.0:
+        raise ValueError("min_confidence must be in [0, 1]")
     for wall in walls:
         if wall.quarantined:
             continue
+        if wall.confidence < min_confidence:
+            wall.tags.append("low-confidence")
+            wall.snap_status = "rejected-low-confidence"
+            if quarantine_weak:
+                wall.quarantined = True
+            continue
+        old_endpoints = np.vstack([wall.start, wall.end])
         angle = np.arctan2(wall.normal[1], wall.normal[0])
         quarter = round(angle / (np.pi / 2)) % 4
         snapped = quarter * (np.pi / 2)
         if abs(np.degrees(angle - snapped)) > tolerance_degrees:
             wall.tags.append("off-axis")
+            wall.snap_status = "rejected-off-axis"
             wall.quarantined = True
             continue
         normal = _nearest_manhattan_normal(wall.normal)
@@ -1371,4 +1524,8 @@ def snap_to_frame(
         centre = normal * offset + direction * (direction @ wall.midpoint)
         wall.normal, wall.offset = normal, offset
         wall.start, wall.end = centre - direction * half, centre + direction * half
+        wall.snap_residual = float(
+            np.sqrt(np.mean((old_endpoints @ normal - offset) ** 2))
+        )
+        wall.snap_status = "snapped"
     return walls

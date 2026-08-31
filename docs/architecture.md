@@ -41,16 +41,27 @@ output feeds the next:
 5. **geometry** (`geometry.estimate_gravity`, `planes.extract_walls` and friends) —
    recovers the up axis and floor/ceiling heights, fits the building's dominant
    horizontal frame, and extracts, merges, and occlusion-filters wall segments.
-6. **wall refinement** (`drift.refit_wall_offsets`, `planes.resolve_crossings`,
-   `planes.snap_corners`) — per-visit offset refitting, drift measurement, crossing
-   resolution, and corner snapping, in that specific order (drift has to be measured
-   before extents change).
-7. **rooms** (`rooms.segment_rooms`) — `projection.project_wall_density` first
+6. **wall refinement** (`drift.refit_wall_offsets`, `wall_graph.solve_wall_graph`) —
+   per-visit offset refitting and drift measurement followed by one global,
+   plane-constrained solve for shared L/T/X nodes. Weak or unintended-crossing
+   candidates remain quarantined for diagnostics rather than being forced into
+   the topology.
+7. **rooms/vectorization** (`projection.project_wall_density`,
+   `vectorizer.VectorizerInput`/`VectorizerOutput`, `rooms.segment_rooms`) —
+   `projection.project_wall_density` first
    crops the cleaned cloud to the configured wall-height band and produces the
    deterministic NumPy top-down density map carried by `rooms.PlanGrid`; the
    vectorizer then uses that wall evidence alongside observed floor cells for
    room naming, adjacency, and (this session) a self-consistency check
    (`rooms.check_no_overlaps`) that flags any polygon overlap as a warning.
+   The optional `roomformer.RoomFormerAdapter` consumes the same explicit
+   `(density, observability)` tensor at this boundary and returns a
+   finished-face `WallGraphProposal` with polygons, corners, topology, model
+   provenance, and confidence. It is lazy and local-checkpoint-only: the
+   default path records a deterministic point-cloud-graph fallback without
+   importing RoomFormer or running GPU inference. SD-TQ opening predictions
+   have an injected predictor hook and remain separate opening evidence until
+   validated by the existing gap-preserving occupancy stage.
 8. **surfaces** (`occupancy.build_surface_grid`, `occupancy.find_openings`) — per-wall
    UV occupancy grids and door/window detection from silhouette holes in them.
 9. **damage** (`cli._damage_pass`, skippable with `--no-damage`) — Track B in full:

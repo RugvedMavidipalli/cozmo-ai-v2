@@ -151,6 +151,8 @@ class Opening:
             by actual hole cells, from 0 to 1. A lower value usually
             means the opening's edges were only partly captured by the
             sensor.
+        evidence_cells: Number of hole cells supporting this opening.
+        provenance: Evidence source used to classify the opening.
     """
 
     wall_index: int
@@ -158,6 +160,8 @@ class Opening:
     u_range: tuple[float, float]
     v_range: tuple[float, float]
     confidence: float
+    evidence_cells: int = 0
+    provenance: str = "surface occupancy"
 
     @property
     def width(self) -> float:
@@ -366,9 +370,76 @@ def find_openings(
                 u_range=(float(u_lo), float(u_hi)),
                 v_range=(float(v_lo), float(v_hi)),
                 confidence=float(min(1.0, fill)),
+                evidence_cells=int(len(cells)),
             )
         )
-    return openings
+    return sorted(
+        openings,
+        key=lambda opening: (
+            opening.wall_index,
+            opening.u_range[0],
+            opening.v_range[0],
+            opening.kind,
+        ),
+    )
+
+
+def deduplicate_openings(
+    openings: list[Opening], *, range_tolerance: float = 0.10
+) -> list[Opening]:
+    """Suppress repeated detections of one physical opening.
+
+    Only openings on the same wall and with the same class are merged, and
+    their U/V ranges must overlap or touch within ``range_tolerance``. Door,
+    window, and pass-through gaps that are actually separate remain separate.
+    """
+    if not np.isfinite(range_tolerance) or range_tolerance < 0:
+        raise ValueError("range_tolerance must be finite and non-negative")
+    result: list[Opening] = []
+    for opening in sorted(
+        openings,
+        key=lambda item: (
+            item.wall_index,
+            item.kind,
+            item.u_range,
+            item.v_range,
+        ),
+    ):
+        match = next(
+            (
+                candidate
+                for candidate in result
+                if candidate.wall_index == opening.wall_index
+                and candidate.kind == opening.kind
+                and _ranges_touch(candidate.u_range, opening.u_range, range_tolerance)
+                and _ranges_touch(candidate.v_range, opening.v_range, range_tolerance)
+            ),
+            None,
+        )
+        if match is None:
+            result.append(opening)
+            continue
+        match.u_range = (
+            min(match.u_range[0], opening.u_range[0]),
+            max(match.u_range[1], opening.u_range[1]),
+        )
+        match.v_range = (
+            min(match.v_range[0], opening.v_range[0]),
+            max(match.v_range[1], opening.v_range[1]),
+        )
+        match.confidence = max(match.confidence, opening.confidence)
+        match.evidence_cells += opening.evidence_cells
+        match.provenance = f"{match.provenance}; duplicate-suppressed"
+    return sorted(
+        result,
+        key=lambda item: (item.wall_index, item.u_range, item.v_range, item.kind),
+    )
+
+
+def _ranges_touch(
+    first: tuple[float, float], second: tuple[float, float], tolerance: float
+) -> bool:
+    return first[0] <= second[1] + tolerance and second[0] <= first[1] + tolerance
 
 
 def occluded_mask(grid: SurfaceGrid, min_near: int = 3) -> np.ndarray:

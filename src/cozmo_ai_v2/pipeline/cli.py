@@ -18,21 +18,33 @@ from .fuse import fuse
 from .geometry import estimate_gravity
 from .ingest import display_rotation, load_capture, iter_frames
 from .keyframes import select_damage_keyframes
-from .occupancy import build_surface_grid, find_openings, occluded_spans
+from .occupancy import (
+    build_surface_grid,
+    deduplicate_openings,
+    find_openings,
+    occluded_spans,
+)
 from .planes import (
     estimate_horizontal_frame,
     extract_walls,
     filter_occluded_walls,
     merge_collinear,
-    resolve_crossings,
-    snap_corners,
     snap_to_frame,
     wall_band_mask,
 )
 from .poses import refine_trajectory, select_keyframes
 from .rooms import build_plan_grid, check_no_overlaps, segment_rooms
+from .roomformer import RoomFormerAdapter
 from .scope import ScopeEngine
 from .uncertainty import UncertaintyModel
+from .vectorizer import (
+    AdjacencyEvidence,
+    FaceEvidence,
+    OpeningEvidence,
+    build_vectorizer_input,
+    build_vectorizer_output,
+)
+from .wall_graph import solve_wall_graph
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -179,8 +191,9 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("wall refinement"):
         refitted = refit_wall_offsets(walls, frame, sampled, times)
         drift = measure_drift(walls, frame, sampled, times)
-        walls = resolve_crossings(walls)
-        corners = snap_corners(walls)
+        wall_graph = solve_wall_graph(walls)
+        walls = list(wall_graph.walls)
+        corners = wall_graph.snapped_endpoint_count
     print(
         f"  {refitted} offsets refitted by visit, {len(walls)} walls after "
         f"crossing resolution, {corners} endpoints snapped to corners"
@@ -202,6 +215,17 @@ def run(args: argparse.Namespace) -> int:
                     f"room_{a}/room_{b} {frac:.1%}" for a, b, frac in overlaps
                 )
             )
+        vectorizer_input = build_vectorizer_input(
+            grid.wall_density,
+            wall_graph.candidates,
+            wall_graph.nodes,
+        )
+        # RoomFormer is an optional proposal source at the vectorizer
+        # boundary.  The default adapter has no checkpoint configured, so it
+        # records a deterministic fallback without importing a model or
+        # running GPU inference; an application can inject a local adapter
+        # implementation without changing the result contract.
+        roomformer_proposal = RoomFormerAdapter().propose(vectorizer_input)
     print(f"  {len(rooms)} rooms")
 
     # Stage 8: surfaces.  Surface dimensions are metric geometry, so do not
@@ -220,7 +244,48 @@ def run(args: argparse.Namespace) -> int:
                 openings.extend(find_openings(surface))
         else:
             warnings.append("ceiling not observed; wall opening heights are unavailable")
+        openings = deduplicate_openings(openings)
     print(f"  {len(openings)} openings")
+
+    vectorizer_output = build_vectorizer_output(
+        vectorizer_input,
+        graph=wall_graph,
+        faces=(
+            FaceEvidence(
+                polygon=room.polygon,
+                area=room.area,
+                observed_coverage=room.observed_coverage,
+                visibility=room.visibility,
+                confidence=room.confidence,
+                provenance=room.provenance,
+            )
+            for room in rooms
+            if room.polygon is not None
+        ),
+        openings=(
+            OpeningEvidence(
+                wall_index=opening.wall_index,
+                kind=opening.kind,
+                u_range=opening.u_range,
+                v_range=opening.v_range,
+                confidence=opening.confidence,
+                source=opening.provenance,
+            )
+            for opening in openings
+        ),
+        adjacency=(
+            AdjacencyEvidence(
+                room_a=room.id,
+                room_b=neighbour,
+                via=None,
+                confidence=min(room.confidence, rooms[neighbour].confidence),
+            )
+            for room in rooms
+            for neighbour in room.neighbours
+            if neighbour > room.id
+        ),
+        roomformer=roomformer_proposal,
+    )
 
     # Stage 9: damage
     regions = []
@@ -279,6 +344,7 @@ def run(args: argparse.Namespace) -> int:
         result = _assemble(
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
             line_items, drift, drift_report, surface_grids, uncertainty,
+            vectorizer_output,
             timings, warnings, engine,
         )
         export.write_json(result, out_dir / "result.json")
@@ -570,6 +636,7 @@ def _infer_adjacency_via(
 def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
+    vectorizer_output,
     timings, warnings, engine,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
@@ -597,6 +664,8 @@ def _assemble(
         surface_grids: Each wall's surface grid.
         uncertainty: The uncertainty model used to build confidence
             intervals for this run.
+        vectorizer_output: Explicit density, observability, wall candidate,
+            junction, opening, adjacency, and validated-face evidence.
         timings: How long each stage took.
         warnings: Any warnings collected while running.
         engine: The scope engine that was used.
@@ -640,6 +709,12 @@ def _assemble(
                 "occluded_spans": [list(s) for s in spans],
                 "residual_rms_mm": round(wall.residual_rms * 1000, 2),
                 "support_points": wall.inlier_count,
+                "confidence": round(wall.confidence, 4),
+                "fit_quality": round(wall.fit_quality, 4),
+                "coordinate_convention": wall.coordinate_convention,
+                "snap_status": wall.snap_status,
+                "snap_residual_mm": round(wall.snap_residual * 1000, 2),
+                "provenance": wall.provenance,
                 "tags": wall.tags,
             }
         )
@@ -663,6 +738,8 @@ def _assemble(
                 "header_height": round(opening.header_height, 3),
                 "u_offset": round(opening.u_range[0], 3),
                 "confidence": round(opening.confidence, 3),
+                "evidence_cells": opening.evidence_cells,
+                "provenance": opening.provenance,
             }
         )
 
@@ -689,6 +766,10 @@ def _assemble(
                 "polygon": room.polygon.tolist() if room.polygon is not None else [],
                 "wall_ids": room.wall_indices,
                 "neighbours": room.neighbours,
+                "observed_coverage": round(room.observed_coverage, 4),
+                "visibility": round(room.visibility, 4),
+                "confidence": round(room.confidence, 4),
+                "provenance": room.provenance,
             }
         )
         for neighbour in room.neighbours:
@@ -753,8 +834,10 @@ def _assemble(
             "floor_confidence": round(float(gravity.floor_confidence), 4),
             "manhattan_yaw_deg": round(float(np.degrees(frame.yaw)), 3),
             "manhattan_fraction": round(frame.manhattan_fraction, 4),
+            "wall_coordinate_convention": "finished_face",
             "walls": wall_docs,
             "openings": opening_docs,
+            "vectorization": vectorizer_output.to_metadata(),
         },
         "rooms": room_docs,
         "adjacency": adjacency,

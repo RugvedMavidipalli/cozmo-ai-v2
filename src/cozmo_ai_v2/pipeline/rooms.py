@@ -112,6 +112,13 @@ class Room:
             this one.
         polygon: The (N, 2) plan-space vertices that trace the room's
             outline, or `None` if no usable outline could be traced.
+        observed_coverage: Fraction of cell centers inside the face with
+            observed floor evidence.
+        visibility: Fraction of the face with any floor or wall evidence;
+            unknown cells do not count as visible.
+        confidence: Conservative face confidence derived from coverage and
+            visibility.
+        provenance: Evidence path that produced the face.
     """
 
     id: int
@@ -123,6 +130,10 @@ class Room:
     wall_indices: list[int] = field(default_factory=list)
     neighbours: list[int] = field(default_factory=list)
     polygon: np.ndarray | None = None
+    observed_coverage: float = 0.0
+    visibility: float = 0.0
+    confidence: float = 0.0
+    provenance: str = "validated wall graph"
 
     @property
     def height(self) -> float | None:
@@ -291,6 +302,8 @@ def segment_rooms(
     min_area: float = 1.4,
     wall_threshold: int = 6,
     floor_threshold: int = 3,
+    min_observed_coverage: float = 0.10,
+    min_visibility: float = 0.10,
 ) -> list[Room]:
     """Extract rooms as bounded faces of the fitted wall graph.
 
@@ -307,17 +320,29 @@ def segment_rooms(
     # that a proposed face was actually observed at floor height.
     free = (grid.free >= floor_threshold) & (grid.occupied < wall_threshold)
     polygons = polygonize_wall_graph(walls, min_area=min_area)
-    accepted = [
-        polygon for polygon in polygons if _has_observed_floor(polygon, grid, free)
-    ]
+    if not np.isfinite(min_observed_coverage) or not 0.0 <= min_observed_coverage <= 1.0:
+        raise ValueError("min_observed_coverage must be in [0, 1]")
+    if not np.isfinite(min_visibility) or not 0.0 <= min_visibility <= 1.0:
+        raise ValueError("min_visibility must be in [0, 1]")
+    accepted: list[tuple[object, float, float, str]] = []
+    for polygon in polygons:
+        coverage, visibility = _face_observation_metrics(polygon, grid, free)
+        if coverage >= min_observed_coverage and visibility >= min_visibility:
+            accepted.append(
+                (polygon, coverage, visibility, "validated wall graph + observed floor")
+            )
 
     if not accepted:
-        accepted = _observed_floor_polygons(grid, free, min_area)
+        accepted = [
+            (polygon, *(_face_observation_metrics(polygon, grid, free)),
+             "observed floor component")
+            for polygon in _observed_floor_polygons(grid, free, min_area)
+        ]
     if not accepted:
         return []
 
     rooms: list[Room] = []
-    for polygon in accepted:
+    for polygon, coverage, visibility, provenance in accepted:
         centroid = polygon.centroid
         rooms.append(
             Room(
@@ -328,6 +353,10 @@ def segment_rooms(
                 floor_height=floor_height,
                 ceiling_height=ceiling_height,
                 polygon=np.asarray(polygon.exterior.coords)[:-1],
+                observed_coverage=coverage,
+                visibility=visibility,
+                confidence=min(coverage, visibility),
+                provenance=provenance,
             )
         )
 
@@ -393,15 +422,50 @@ def polygonize_wall_graph(
 _polygonize_wall_graph = polygonize_wall_graph
 
 
-def _has_observed_floor(polygon, grid: PlanGrid, free: np.ndarray) -> bool:
+def _face_observation_metrics(
+    polygon, grid: PlanGrid, free: np.ndarray
+) -> tuple[float, float]:
+    """Measure observed-floor coverage and non-unknown visibility in a face."""
     from shapely.geometry import Point
     from shapely.prepared import prep
 
-    cells = np.argwhere(free)
-    if not len(cells):
-        return False
-    shape = prep(polygon)
-    return any(shape.covers(Point(x, y)) for x, y in grid.to_plan(cells))
+    min_x, min_y, max_x, max_y = polygon.bounds
+    lower = np.floor(
+        (np.array([min_x, min_y]) - grid.origin) / grid.resolution
+    ).astype(int)
+    upper = np.ceil(
+        (np.array([max_x, max_y]) - grid.origin) / grid.resolution
+    ).astype(int)
+    lower = np.maximum(lower, 0)
+    upper = np.minimum(upper, np.asarray(grid.occupied.shape))
+    if np.any(upper <= lower):
+        return 0.0, 0.0
+    columns, rows = np.meshgrid(
+        np.arange(lower[0], upper[0]),
+        np.arange(lower[1], upper[1]),
+        indexing="ij",
+    )
+    cells = np.stack([columns.ravel(), rows.ravel()], axis=1)
+    prepared = prep(polygon)
+    inside = np.array(
+        [prepared.covers(Point(point)) for point in grid.to_plan(cells)],
+        dtype=bool,
+    )
+    if not inside.any():
+        return 0.0, 0.0
+    selected = cells[inside]
+    observed_floor = free[selected[:, 0], selected[:, 1]]
+    visible = (
+        (grid.free[selected[:, 0], selected[:, 1]] > 0)
+        | (grid.occupied[selected[:, 0], selected[:, 1]] > 0)
+    )
+    return float(observed_floor.mean()), float(visible.mean())
+
+
+def _has_observed_floor(polygon, grid: PlanGrid, free: np.ndarray) -> bool:
+    """Backward-compatible boolean face validation using non-empty coverage."""
+    coverage, visibility = _face_observation_metrics(polygon, grid, free)
+    return coverage > 0.0 and visibility > 0.0
 
 
 def _observed_floor_polygons(

@@ -90,14 +90,15 @@ the wall off its true position. `filter_occluded_walls` handles the opposite fai
 a candidate plane sitting *behind* an already-accepted wall, whose points could only
 have arrived by light passing through solid material, which is physically impossible;
 it casts rays from each point's camera origin and drops any wall more than
-`occlusion_fraction` blocked by a stronger wall. `resolve_crossings` then enforces the
-one constraint the fitter can't see on its own — walls don't pass through each other —
-distinguishing a short T-junction overshoot (trim it) from real clutter cutting through
-a wall's middle (drop the weaker surface). Finally `snap_corners` moves each wall
-endpoint onto the intersection of the two fitted lines, because that intersection, not
-wherever the last inlier happened to fall, is where a tape measure would actually be
-hooked — this is also the step that makes reconstructed extent match what the
-wall-length uncertainty model assumes (a difference of two plane intersections).
+`occlusion_fraction` blocked by a stronger wall. `wall_graph.solve_wall_graph` then
+enforces the one constraint the fitter can't see on its own — walls don't pass through
+each other — distinguishing a short T-junction overshoot from real clutter cutting
+through a wall's middle (the weaker candidate is quarantined). It clusters all L/T/X
+intersections and solves each shared node from every incident finished-face plane line
+at once; endpoints are assigned that one plane-derived coordinate rather than being
+snapped independently. Weak/off-axis candidates retain their original geometry and
+quality metadata but are not forced into Manhattan topology. The legacy
+`planes.snap_corners` name is only a compatibility wrapper around this global solver.
 `WallSegment.inferred_fraction` tracks how much of a wall's final length was never
 directly observed (behind furniture, or reconstructed purely from its corners) so
 `result.json` can report those spans as inferred rather than measured.
@@ -119,6 +120,21 @@ two rooms and becomes shared, an exterior wall lands in one. `check_no_overlaps`
 validates that no two room polygons overlap beyond a small tolerance, and
 `_link_neighbours` builds the room-adjacency graph from raster proximity between room
 masks.
+
+The vectorizer boundary is explicit: `projection.DensityMap` carries retained
+wall-band counts, points-per-square-metre density, and observed/empty cells;
+`vectorizer.VectorizerInput` adds wall candidates and global junction evidence;
+`VectorizerOutput` returns accepted graph segments, validated faces, adjacency,
+and opening evidence with provenance/confidence. An optional
+`roomformer.RoomFormerAdapter` consumes a deterministic two-channel
+`(batch, channel, x, y)` tensor (`wall_density_points_per_m2`, `observability`)
+and converts local-checkpoint predictions into finished-face graph proposals.
+No checkpoint is downloaded and no model is imported on the default path; an
+unavailable or malformed optional model falls back to the point-cloud graph.
+Predicted normalized/cell coordinates are mapped through the same raster origin
+and resolution, so RoomFormer cannot silently invent a second coordinate frame.
+SD-TQ opening predictions are an injected extension point and are retained as
+separate evidence until the normal opening/gap validation accepts them.
 
 **Surfaces** (`occupancy.py::build_surface_grid` / `find_openings`, called per wall in
 `cli.py`). Bins each wall's supporting points into a UV grid (along-wall by

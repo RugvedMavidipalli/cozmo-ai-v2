@@ -33,8 +33,13 @@
         "floor_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
         "manhattan_yaw_deg": { "type": "number" },
         "manhattan_fraction": { "type": "number" },
+        "wall_coordinate_convention": {
+          "type": "string",
+          "enum": ["finished_face", "centerline", "room_side"]
+        },
         "walls": { "type": "array", "items": { "$ref": "#/$defs/wall" } },
-        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening" } }
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening" } },
+        "vectorization": { "$ref": "#/$defs/vectorization" }
       }
     },
     "rooms": { "type": "array", "items": { "$ref": "#/$defs/room" } },
@@ -140,6 +145,12 @@
         },
         "residual_rms_mm": { "type": "number" },
         "support_points": { "type": "integer" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fit_quality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "coordinate_convention": { "type": "string" },
+        "snap_status": { "type": "string" },
+        "snap_residual_mm": { "type": "number", "minimum": 0 },
+        "provenance": { "type": "string" },
         "tags": { "type": "array", "items": { "type": "string" } }
       }
     },
@@ -154,7 +165,9 @@
         "sill_height": { "type": "number" },
         "header_height": { "type": "number" },
         "u_offset": { "type": "number", "description": "Distance from the wall's start corner." },
-        "confidence": { "type": "number" }
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence_cells": { "type": "integer", "minimum": 0 },
+        "provenance": { "type": "string" }
       }
     },
     "room": {
@@ -169,7 +182,193 @@
         "centroid": { "$ref": "#/$defs/point2" },
         "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
         "wall_ids": { "type": "array", "items": { "type": "integer" } },
-        "neighbours": { "type": "array", "items": { "type": "integer" } }
+        "neighbours": { "type": "array", "items": { "type": "integer" } },
+        "observed_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "vectorization": {
+      "type": "object",
+      "required": ["coordinate_convention", "density", "candidate_segments", "junctions", "openings", "adjacency", "faces"],
+      "properties": {
+        "coordinate_convention": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "density": { "$ref": "#/$defs/density_map" },
+        "candidate_segments": { "type": "array", "items": { "$ref": "#/$defs/candidate_segment" } },
+        "junctions": { "type": "array", "items": { "$ref": "#/$defs/junction" } },
+        "rejected_crossings": { "type": "array", "items": { "$ref": "#/$defs/range2int" } },
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening_evidence" } },
+        "adjacency": { "type": "array", "items": { "$ref": "#/$defs/adjacency_evidence" } },
+        "faces": { "type": "array", "items": { "$ref": "#/$defs/face_evidence" } },
+        "roomformer": {
+          "oneOf": [
+            { "$ref": "#/$defs/roomformer_proposal" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "density_map": {
+      "type": "object",
+      "required": ["resolution_m", "origin", "bounds", "shape", "wall_band_m_above_floor", "count_semantics", "density_semantics", "counts", "observed", "empty", "retained_count"],
+      "properties": {
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0 },
+        "origin": { "$ref": "#/$defs/point2" },
+        "bounds": { "type": "array", "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 },
+        "clip_bounds": { "type": ["array", "null"], "items": { "$ref": "#/$defs/point2" }, "minItems": 2, "maxItems": 2 },
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 },
+        "wall_band_m_above_floor": { "$ref": "#/$defs/range2" },
+        "effective_height_bounds_m": { "$ref": "#/$defs/range2" },
+        "floor_height_m": { "type": "number" },
+        "ceiling_height_m": { "type": ["number", "null"] },
+        "count_semantics": { "type": "string" },
+        "density_semantics": { "type": "string" },
+        "counts": { "type": "array" },
+        "observed": { "type": "array" },
+        "empty": { "type": "array" },
+        "input_count": { "type": "integer", "minimum": 0 },
+        "finite_input_count": { "type": "integer", "minimum": 0 },
+        "invalid_input_count": { "type": "integer", "minimum": 0 },
+        "band_count": { "type": "integer", "minimum": 0 },
+        "retained_count": { "type": "integer", "minimum": 0 },
+        "out_of_bounds_count": { "type": "integer", "minimum": 0 },
+        "observed_cell_count": { "type": "integer", "minimum": 0 },
+        "empty_cell_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "range2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "range2int": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "candidate_segment": {
+      "type": "object",
+      "required": ["id", "start", "end", "normal", "confidence", "accepted", "quarantined", "coordinate_convention"],
+      "properties": {
+        "id": { "type": "integer" },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length_m": { "type": "number" },
+        "support_points": { "type": "integer", "minimum": 0 },
+        "residual_rms_m": { "type": ["number", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fit_quality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "accepted": { "type": "boolean" },
+        "quarantined": { "type": "boolean" },
+        "coordinate_convention": { "type": "string" },
+        "provenance": { "type": "string" },
+        "snap_status": { "type": "string" },
+        "snap_residual_m": { "type": "number", "minimum": 0 },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "junction": {
+      "type": "object",
+      "required": ["id", "coordinate", "kind", "incident_walls", "confidence"],
+      "properties": {
+        "id": { "type": "integer" },
+        "coordinate": { "$ref": "#/$defs/point2" },
+        "kind": { "type": "string", "enum": ["corner", "t", "x"] },
+        "incident_walls": { "type": "array", "items": { "type": "integer" } },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "opening_evidence": {
+      "type": "object",
+      "required": ["wall_id", "kind", "u_range_m", "v_range_m", "confidence"],
+      "properties": {
+        "wall_id": { "type": "integer" },
+        "kind": { "type": "string" },
+        "u_range_m": { "$ref": "#/$defs/range2" },
+        "v_range_m": { "$ref": "#/$defs/range2" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" }
+      }
+    },
+    "adjacency_evidence": {
+      "type": "object",
+      "required": ["room_a", "room_b", "confidence"],
+      "properties": {
+        "room_a": { "type": "integer" },
+        "room_b": { "type": "integer" },
+        "via": { "type": ["string", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": { "type": "string" }
+      }
+    },
+    "face_evidence": {
+      "type": "object",
+      "required": ["polygon", "area_m2", "observed_coverage", "visibility", "confidence", "provenance"],
+      "properties": {
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "area_m2": { "type": "number" },
+        "observed_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "visibility": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" }
+      }
+    },
+    "roomformer_proposal": {
+      "type": "object",
+      "required": ["available", "model_provenance", "confidence", "tensor", "graph", "opening_extension", "opening_predictions"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "model_provenance": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fallback_reason": { "type": ["string", "null"] },
+        "tensor": { "$ref": "#/$defs/roomformer_tensor" },
+        "graph": { "$ref": "#/$defs/roomformer_graph" },
+        "opening_extension": { "type": "string" },
+        "opening_predictions": { "type": "array", "items": { "$ref": "#/$defs/opening_evidence" } }
+      }
+    },
+    "roomformer_tensor": {
+      "type": "object",
+      "required": ["shape", "layout", "channels", "coordinate_convention"],
+      "properties": {
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 4, "maxItems": 4 },
+        "layout": { "type": "string", "const": "(batch, channel, x, y)" },
+        "channels": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 },
+        "coordinate_convention": { "type": "string" }
+      }
+    },
+    "roomformer_graph": {
+      "type": "object",
+      "required": ["coordinate_convention", "confidence", "provenance", "topology", "corners", "junctions", "segments", "polygons"],
+      "properties": {
+        "coordinate_convention": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "provenance": { "type": "string" },
+        "topology": { "type": "array", "items": { "$ref": "#/$defs/range2int" } },
+        "corners": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "junctions": { "type": "array" },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/roomformer_segment" } },
+        "polygons": { "type": "array", "items": { "type": "array", "items": { "$ref": "#/$defs/point2" } } }
+      }
+    },
+    "roomformer_segment": {
+      "type": "object",
+      "required": ["id", "start", "end", "normal", "length_m", "confidence", "coordinate_convention", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length_m": { "type": "number" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "coordinate_convention": { "type": "string" },
+        "provenance": { "type": "string" }
       }
     },
     "damage_region": {

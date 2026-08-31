@@ -8,6 +8,34 @@ from .projection import (
     project_wall_density,
     rasterize_points,
 )
+from .planes import (
+    FINISHED_FACE,
+    ProjectedWallLine,
+    WallCoordinateConvention,
+    project_vertical_plane,
+    vertical_plane_to_line,
+)
+from .wall_graph import WallGraph, WallGraphNode, solve_wall_graph
+from .roomformer import (
+    TENSOR_CHANNELS,
+    RoomFormerCoordinateSpace,
+    RoomFormerAdapter,
+    RoomFormerConfig,
+    RoomFormerPrediction,
+    RoomFormerProposal,
+    RoomFormerTensor,
+    WallGraphProposal,
+    build_roomformer_tensor,
+)
+from .vectorizer import (
+    AdjacencyEvidence,
+    FaceEvidence,
+    OpeningEvidence,
+    VectorizerInput,
+    VectorizerOutput,
+    build_vectorizer_input,
+    build_vectorizer_output,
+)
 
 __all__ = [
     "DensityMap",
@@ -16,4 +44,28 @@ __all__ = [
     "project_top_down_density",
     "project_wall_density",
     "rasterize_points",
+    "FINISHED_FACE",
+    "ProjectedWallLine",
+    "WallCoordinateConvention",
+    "vertical_plane_to_line",
+    "project_vertical_plane",
+    "WallGraph",
+    "WallGraphNode",
+    "solve_wall_graph",
+    "RoomFormerAdapter",
+    "RoomFormerCoordinateSpace",
+    "RoomFormerConfig",
+    "RoomFormerPrediction",
+    "RoomFormerProposal",
+    "RoomFormerTensor",
+    "WallGraphProposal",
+    "build_roomformer_tensor",
+    "TENSOR_CHANNELS",
+    "AdjacencyEvidence",
+    "FaceEvidence",
+    "OpeningEvidence",
+    "VectorizerInput",
+    "VectorizerOutput",
+    "build_vectorizer_input",
+    "build_vectorizer_output",
 ]
