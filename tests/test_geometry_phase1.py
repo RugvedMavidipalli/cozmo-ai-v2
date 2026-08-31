@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from cozmo_ai_v2.pipeline.geometry import estimate_gravity
+from cozmo_ai_v2.pipeline.geometry import GravityEstimate, estimate_gravity
 from cozmo_ai_v2.pipeline.planes import (
     HorizontalFrame,
     WallSegment,
@@ -15,6 +15,7 @@ from cozmo_ai_v2.pipeline.rooms import (
     _grow_to_walls,
     polygonize_wall_graph,
     segment_rooms,
+    build_plan_grid,
 )
 
 
@@ -81,6 +82,26 @@ def test_gravity_does_not_promote_wall_extent_to_ceiling():
     assert not mask[heights > 1.9].any()
 
 
+def test_geometry_degenerate_inputs_are_finite_and_conservative():
+    gravity = estimate_gravity(
+        np.empty((0, 3)), np.array([0.0, 0.0, 0.0]), np.empty((0, 3))
+    )
+
+    np.testing.assert_allclose(gravity.up, [0.0, 0.0, 1.0])
+    assert gravity.ceiling_height is None
+    assert gravity.ceiling_observed is False
+    assert gravity.room_height is None
+    assert np.isfinite(gravity.floor_height)
+    assert np.isfinite(gravity.inlier_fraction)
+
+    invalid = GravityEstimate(
+        np.array([np.nan, 0.0, 0.0]), np.nan, np.nan, np.nan
+    )
+    np.testing.assert_allclose(invalid.up, [0.0, 0.0, 1.0])
+    assert invalid.ceiling_observed is False
+    assert invalid.room_height is None
+
+
 def test_off_axis_wall_is_quarantined_from_manhattan_geometry():
     frame = HorizontalFrame(
         up=np.array([0.0, 0.0, 1.0]),
@@ -110,6 +131,18 @@ def test_duplicate_wall_suppression_is_independent_of_input_order():
     np.testing.assert_allclose(a[0].start, b[0].start)
     np.testing.assert_allclose(a[0].end, b[0].end)
     assert a[0].inlier_count == b[0].inlier_count == 190
+
+
+def test_degenerate_wall_and_grid_inputs_do_not_raise():
+    from cozmo_ai_v2.pipeline.planes import extract_walls, estimate_horizontal_frame
+
+    assert extract_walls(np.empty((0, 2)), np.empty(0)) == []
+    assert extract_walls(np.array([[1.0, 2.0]]), np.array([1.0]), min_inliers=1) == []
+    grid = build_plan_grid(
+        np.empty((0, 3)), estimate_horizontal_frame(np.empty((0, 3)), [0, 0, 0]), 0.0, None
+    )
+    assert grid.free.shape == (1, 1)
+    assert not grid.free.any()
 
 
 def test_label_growth_never_enters_unknown_cells():
@@ -163,3 +196,17 @@ def test_rooms_are_wall_graph_faces_not_raster_flood_regions():
     assert rooms[0].neighbours == [1]
     assert rooms[1].neighbours == [0]
     assert all(4 in room.wall_indices for room in rooms)
+
+
+def test_wall_graph_closes_only_small_endpoint_gaps():
+    walls = [
+        _wall(0, [0, 0], [4, 0], [0, 1]),
+        _wall(1, [4.04, 0], [4, 3], [1, 0]),
+        _wall(2, [4, 3], [0, 3], [0, 1]),
+        _wall(3, [0, 3], [0, 0], [1, 0]),
+    ]
+    assert len(polygonize_wall_graph(walls)) == 1
+
+    large_gap = list(walls)
+    large_gap[1] = _wall(1, [4.25, 0], [4, 3], [1, 0])
+    assert polygonize_wall_graph(large_gap) == []

@@ -167,13 +167,40 @@ class WallSegment:
     def __post_init__(self) -> None:
         normal = np.asarray(self.normal, dtype=float)
         norm = float(np.linalg.norm(normal))
-        if normal.shape != (2,) or norm <= 1e-9:
+        if normal.shape != (2,):
             raise ValueError("wall normal must be a non-zero 2D vector")
+        invalid_normal = not np.isfinite(norm) or norm <= 1e-9
+        if invalid_normal:
+            normal = np.array([1.0, 0.0])
+            norm = 1.0
         normal /= norm
         canonical = _canonical_normal(normal)
         if not np.allclose(canonical, normal):
             self.offset = -float(self.offset)
         self.normal = canonical
+        self.start = np.asarray(self.start, dtype=float).reshape(-1)
+        self.end = np.asarray(self.end, dtype=float).reshape(-1)
+        if self.start.shape != (2,) or self.end.shape != (2,):
+            raise ValueError("wall endpoints must be 2D vectors")
+        self.tags = list(self.tags)
+        if invalid_normal:
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+        if not np.isfinite(self.offset):
+            self.offset = 0.0
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+        if not np.isfinite(self.start).all() or not np.isfinite(self.end).all():
+            self.quarantined = True
+            self.tags.append("invalid-geometry")
+        elif np.linalg.norm(self.end - self.start) <= 1e-9:
+            self.quarantined = True
+            self.tags.append("degenerate")
+
+    @property
+    def off_axis(self) -> bool:
+        """Whether this wall was quarantined as a non-Manhattan line."""
+        return "off-axis" in self.tags
 
     @property
     def length(self) -> float:
@@ -287,7 +314,12 @@ def estimate_horizontal_frame(
     # or ceiling.
     normals = np.asarray(normals, dtype=float)
     up = np.asarray(up, dtype=float)
-    up /= max(float(np.linalg.norm(up)), 1e-9)
+    up_norm = float(np.linalg.norm(up))
+    up = (
+        up / up_norm
+        if up.shape == (3,) and np.isfinite(up_norm) and up_norm > 1e-9
+        else np.array([0.0, 0.0, 1.0])
+    )
     if normals.ndim != 2 or normals.shape[1] != 3:
         normals = np.empty((0, 3), dtype=float)
     horizontal = normals - np.outer(normals @ up, up)
@@ -396,6 +428,18 @@ def wall_band_mask(
         both sits in the wall-height band and has a wall-like (mostly
         sideways-pointing) normal.
     """
+    points = np.asarray(points, dtype=float)
+    normals = np.asarray(normals, dtype=float)
+    up = np.asarray(up, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if normals.shape != points.shape:
+        raise ValueError("normals must have the same shape as points")
+    up_norm = float(np.linalg.norm(up))
+    if up.shape != (3,) or not np.isfinite(up_norm) or up_norm <= 1e-9:
+        up = np.array([0.0, 0.0, 1.0])
+    else:
+        up = up / up_norm
     heights = points @ up
     # Never use the observed point-cloud extent as a ceiling.  Without an
     # observed ceiling, the configured upper wall-band bound is the only
@@ -494,9 +538,13 @@ def extract_walls(
     """
     plan_points = np.asarray(plan_points, dtype=float)
     heights = np.asarray(heights, dtype=float).reshape(-1)
+    if plan_points.ndim == 1 and plan_points.size == 0:
+        plan_points = plan_points.reshape(0, 2)
+    if plan_points.ndim != 2 or plan_points.shape[1] != 2:
+        raise ValueError("plan_points must have shape (N, 2)")
     if len(plan_points) != len(heights):
         raise ValueError("plan_points and heights must contain the same number of rows")
-    if not len(plan_points):
+    if plan_points.size == 0:
         return []
     finite = np.isfinite(plan_points).all(axis=1) & np.isfinite(heights)
     plan_points, heights = plan_points[finite], heights[finite]
@@ -609,6 +657,8 @@ def _ransac_line(
     best_count = 0
     best: tuple[np.ndarray, float, np.ndarray] | None = None
     count = len(points)
+    if count < 2:
+        return np.array([1.0, 0.0]), 0.0, np.zeros(count, bool)
 
     for _ in range(iterations):
         a, b = rng.choice(count, size=2, replace=False)
@@ -648,6 +698,11 @@ def _refit_line(points: np.ndarray) -> tuple[np.ndarray, float]:
         signed offset, such that every point `x` on the line satisfies
         `normal . x = offset`.
     """
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return np.array([1.0, 0.0]), 0.0
+    if len(points) == 1:
+        return np.array([1.0, 0.0]), float(points[0, 0])
     centroid = points.mean(axis=0)
     _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
     normal = _canonical_normal(vh[-1])
@@ -1010,6 +1065,7 @@ def filter_occluded_walls(
             other
             for other in walls
             if other is not wall
+            and not other.quarantined
             and other.inlier_count > wall.inlier_count
             and other.length >= min_blocker_length
         ]

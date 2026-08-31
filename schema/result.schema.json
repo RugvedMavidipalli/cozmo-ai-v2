@@ -22,7 +22,7 @@
     },
     "reconstruction": {
       "type": "object",
-      "required": ["up_axis", "floor_height", "walls"],
+      "required": ["up_axis", "floor_height", "ceiling_observed", "ceiling_confidence", "walls"],
       "properties": {
         "up_axis": { "$ref": "#/$defs/vector3" },
         "gravity_consistency": { "type": "number" },
@@ -124,7 +124,7 @@
         "end": { "$ref": "#/$defs/point2" },
         "normal": { "$ref": "#/$defs/point2" },
         "length": { "$ref": "#/$defs/measurement" },
-        "height": { "type": ["object", "null"], "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
         "inferred_fraction": {
           "type": "number",
           "description": "Share of the wall reconstructed behind furniture rather than directly observed."
@@ -164,7 +164,7 @@
         "id": { "type": "integer" },
         "name": { "type": "string" },
         "area": { "$ref": "#/$defs/measurement" },
-        "ceiling_height": { "type": ["object", "null"], "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "ceiling_height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
         "perimeter": { "type": "number" },
         "centroid": { "$ref": "#/$defs/point2" },
         "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },

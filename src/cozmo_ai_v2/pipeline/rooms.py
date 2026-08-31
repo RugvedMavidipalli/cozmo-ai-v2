@@ -148,10 +148,8 @@ def build_plan_grid(
     as evidence of a wall, and points close to floor height count as
     evidence of open, walkable floor. Each bucket is then dropped into
     its matching grid cell. Optionally, the camera's own path through the
-    space is also marked as walkable floor and puffed out slightly --
-    this helps fill in open floor in areas the depth sensor didn't get a
-    clean reading, since the camera obviously had to be standing
-    somewhere to take that shot.
+    space is marked in its exact visited cells as additional direct
+    evidence; neighbouring unknown cells are not filled in.
 
     Args:
         points: The full set of (N, 3) world-space points from the 3D
@@ -176,6 +174,20 @@ def build_plan_grid(
         margin around the edges, with wall and floor evidence already
         counted up per cell.
     """
+    points = np.asarray(points, dtype=float)
+    if points.ndim == 1 and points.size == 0:
+        points = points.reshape(0, 3)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    floor_height = float(floor_height) if np.isfinite(floor_height) else 0.0
+    points = points[np.isfinite(points).all(axis=1)]
+    if not len(points):
+        return PlanGrid(
+            resolution=resolution,
+            origin=np.zeros(2, dtype=float),
+            occupied=np.zeros((1, 1), dtype=np.int32),
+            free=np.zeros((1, 1), dtype=np.int32),
+        )
     heights = frame.height(points)
     plan = frame.to_plan(points)
 
@@ -186,13 +198,24 @@ def build_plan_grid(
     # Missing ceiling evidence must not turn a high wall return or a sensor
     # outlier into a room boundary.  The fixed wall-band upper bound remains
     # useful for wall evidence while staying deterministic.
-    ceiling = ceiling_height if ceiling_height is not None else floor_height + wall_band[1]
+    ceiling = (
+        float(ceiling_height)
+        if ceiling_height is not None and np.isfinite(ceiling_height)
+        else float(floor_height + wall_band[1])
+    )
     wall_mask = (heights > floor_height + wall_band[0]) & (
         heights < min(floor_height + wall_band[1], ceiling - 0.15)
     )
     floor_mask = np.abs(heights - floor_height) < floor_band
 
     free = _accumulate(plan[floor_mask], lower, shape, resolution)
+    if trajectory is not None:
+        trajectory = np.asarray(trajectory, dtype=float)
+        if trajectory.ndim == 1 and trajectory.size == 0:
+            trajectory = trajectory.reshape(0, 3)
+        if trajectory.ndim != 2 or trajectory.shape[1] != 3:
+            raise ValueError("trajectory must have shape (M, 3)")
+        trajectory = trajectory[np.isfinite(trajectory).all(axis=1)]
     if trajectory is not None and len(trajectory):
         # The camera position is direct free-space evidence, but cells around
         # it are not.  Mark only the visited cells; dilation here used to
@@ -227,6 +250,12 @@ def _accumulate(
         A `shape`-sized grid of integer hit counts. Points that fall
         outside the grid's bounds are simply dropped, not counted.
     """
+    plan = np.asarray(plan, dtype=float)
+    if plan.ndim == 1 and plan.size == 0:
+        plan = plan.reshape(0, 2)
+    if plan.ndim != 2 or plan.shape[1] != 2:
+        raise ValueError("plan must have shape (N, 2)")
+    plan = plan[np.isfinite(plan).all(axis=1)]
     cells = np.floor((plan - origin) / resolution).astype(int)
     inside = (
         (cells[:, 0] >= 0)
@@ -309,11 +338,21 @@ def polygonize_wall_graph(
     from shapely.geometry import LineString
     from shapely.ops import polygonize, snap, unary_union
 
-    lines = [
-        LineString([wall.start, wall.end])
-        for wall in walls
-        if not wall.quarantined and wall.length > 1e-6
-    ]
+    lines = []
+    for wall in walls:
+        if wall.quarantined:
+            continue
+        start = np.asarray(wall.start, dtype=float)
+        end = np.asarray(wall.end, dtype=float)
+        if (
+            start.shape != (2,)
+            or end.shape != (2,)
+            or not np.isfinite(start).all()
+            or not np.isfinite(end).all()
+            or np.linalg.norm(end - start) <= 1e-6
+        ):
+            continue
+        lines.append(LineString([start, end]))
     if len(lines) < 3:
         return []
     network = unary_union(lines)
@@ -378,7 +417,14 @@ def _observed_floor_polygons(
                 for point in points
             ]
         )
-        if polygon.geom_type == "Polygon" and polygon.area >= min_area:
+        # Room's public schema carries one exterior ring.  Do not discard
+        # an interior ring here: doing so would claim an unobserved hole is
+        # free space.  A future schema can represent holes explicitly.
+        if (
+            polygon.geom_type == "Polygon"
+            and not polygon.interiors
+            and polygon.area >= min_area
+        ):
             polygons.append(polygon)
     return sorted(
         polygons,

@@ -37,7 +37,7 @@ class GravityEstimate:
     # These fields are deliberately separate from ``ceiling_height``.  A
     # caller must be able to distinguish an observed plane from a fallback
     # height inferred from the point-cloud extent.
-    ceiling_observed: bool = False
+    ceiling_observed: bool = True
     ceiling_confidence: float = 0.0
     floor_confidence: float = 0.0
     floor_inlier_count: int = 0
@@ -45,11 +45,36 @@ class GravityEstimate:
     floor_residual_rms: float = 0.0
     ceiling_residual_rms: float | None = None
 
+    def __post_init__(self) -> None:
+        up = np.asarray(self.up, dtype=float).reshape(-1)
+        norm = float(np.linalg.norm(up))
+        self.up = (
+            up / norm
+            if up.shape == (3,) and np.isfinite(norm) and norm > 1e-9
+            else np.array([0.0, 0.0, 1.0])
+        )
+        if not np.isfinite(self.floor_height):
+            self.floor_height = 0.0
+        if self.ceiling_height is not None and not np.isfinite(self.ceiling_height):
+            self.ceiling_height = None
+        if self.ceiling_height is None:
+            self.ceiling_observed = False
+            self.ceiling_confidence = 0.0
+            self.ceiling_inlier_count = 0
+            self.ceiling_residual_rms = None
+        self.ceiling_confidence = float(np.clip(self.ceiling_confidence, 0.0, 1.0))
+        self.floor_confidence = float(np.clip(self.floor_confidence, 0.0, 1.0))
+        self.inlier_fraction = float(
+            np.clip(self.inlier_fraction, 0.0, 1.0)
+            if np.isfinite(self.inlier_fraction)
+            else 0.0
+        )
+
     @property
     def room_height(self) -> float | None:
         """The floor-to-ceiling distance, in metres, or `None` if no ceiling
         height was found for this reconstruction."""
-        if self.ceiling_height is None:
+        if self.ceiling_height is None or not self.ceiling_observed:
             return None
         return self.ceiling_height - self.floor_height
 
@@ -90,14 +115,28 @@ def estimate_gravity(
         A `GravityEstimate` holding the refined up direction along with the
         floor and ceiling heights found along it.
     """
-    up = hint / np.linalg.norm(hint)
-    if normals is not None and len(normals):
-        up = _refine_up(normals, up, cone_degrees)
+    hint = np.asarray(hint, dtype=float).reshape(-1)
+    hint_norm = float(np.linalg.norm(hint))
+    up = (
+        hint / hint_norm
+        if hint.shape == (3,) and np.isfinite(hint_norm) and hint_norm > 1e-9
+        else np.array([0.0, 0.0, 1.0])
+    )
+    normals_array = None
+    if normals is not None:
+        candidate_normals = np.asarray(normals, dtype=float)
+        if candidate_normals.ndim == 2 and candidate_normals.shape[1] == 3:
+            normals_array = candidate_normals
+    if normals_array is not None and len(normals_array):
+        up = _refine_up(normals_array, up, cone_degrees)
 
-    heights = np.asarray(points) @ up
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    heights = points @ up
     normal_alignment = None
-    if normals is not None and len(normals) == len(points):
-        normal_unit = np.asarray(normals, dtype=float)
+    if normals_array is not None and len(normals_array) == len(points):
+        normal_unit = normals_array.copy()
         normal_unit /= np.maximum(
             np.linalg.norm(normal_unit, axis=1, keepdims=True), 1e-9
         )
@@ -274,7 +313,22 @@ def _fit_horizontal_planes(
         return HorizontalPlaneFits(floor, PlaneFit(None, 0, 0.0, 0.0, False), 0.0)
 
     floor_candidate = min(candidates, key=lambda item: (item[0], -item[1], item[2]))
-    floor = _plane_fit_from_candidate(floor_candidate, minimum_support=1)
+    floor_minimum_support = max(20, int(np.ceil(0.03 * len(values))))
+    floor = (
+        _plane_fit_from_candidate(floor_candidate, minimum_support=1)
+        if (
+            floor_candidate[1] >= floor_minimum_support
+            and floor_candidate[2] <= 0.04
+            and floor_candidate[3] >= 0.35
+        )
+        else PlaneFit(
+            float(floor_candidate[0]),
+            int(floor_candidate[1]),
+            float(floor_candidate[2]),
+            0.0,
+            False,
+        )
+    )
 
     ceiling_candidates = [
         candidate
@@ -288,7 +342,11 @@ def _fit_horizontal_planes(
             ceiling_candidates,
             key=lambda item: (-item[1], item[2], -item[3], -item[0]),
         )[0]
-        if candidate[1] >= minimum_support and candidate[3] >= 0.35:
+        if (
+            candidate[1] >= minimum_support
+            and candidate[2] <= 0.04
+            and candidate[3] >= 0.35
+        ):
             ceiling_candidate = candidate
 
     ceiling = (
