@@ -18,6 +18,23 @@ class ModelUnavailableError(RuntimeError):
     pass
 
 
+def _checkpoint_state_dict(checkpoint):
+    """Return model weights from common local Metric3D checkpoint layouts.
+
+    Metric3D v2 releases have used both ``state_dict`` and
+    ``model_state_dict`` as their top-level weight key.  Passing the wrapper
+    dictionary to ``load_state_dict`` silently leaves the model uninitialised
+    when strict loading is disabled, so select the known wrapper explicitly.
+    """
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+    for key in ("state_dict", "model_state_dict"):
+        weights = checkpoint.get(key)
+        if isinstance(weights, dict):
+            return weights
+    return checkpoint
+
+
 class DepthModel(Protocol):
     def predict(self, rgb: np.ndarray, fx: float) -> np.ndarray: ...
 
@@ -71,7 +88,7 @@ class Metric3Dv2Model:
                 raise ModelUnavailableError(f"Metric3D weights file does not exist: {weights_path}")
             self._model = torch.hub.load(str(repository), variant, source="local", pretrain=False)
             checkpoint = torch.load(str(weights_path), map_location="cpu")
-            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            state_dict = _checkpoint_state_dict(checkpoint)
             self._model.load_state_dict(state_dict, strict=False)
         self._model = self._model.to(self._device).eval()
 
