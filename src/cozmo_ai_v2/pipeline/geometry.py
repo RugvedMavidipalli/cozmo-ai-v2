@@ -47,15 +47,17 @@ class GravityEstimate:
     ceiling_observed: bool = True
     ceiling_confidence: float = 0.0
     floor_confidence: float = 0.0
+    # Keep the original Phase 1 positional field order above this extension;
+    # callers outside the pipeline construct GravityEstimate directly.
+    floor_inlier_count: int = 0
+    ceiling_inlier_count: int = 0
+    floor_residual_rms: float = 0.0
+    ceiling_residual_rms: float | None = None
     floor_observed: bool = False
     floor_quality_status: str = "unknown"
     floor_low_confidence: bool = False
     floor_support_fraction: float = 0.0
     floor_adaptive_residual_limit: float = 0.0
-    floor_inlier_count: int = 0
-    ceiling_inlier_count: int = 0
-    floor_residual_rms: float = 0.0
-    ceiling_residual_rms: float | None = None
     floor_fit: PlaneFit | None = None
     ceiling_fit: PlaneFit | None = None
 
