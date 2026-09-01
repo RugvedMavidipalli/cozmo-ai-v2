@@ -51,8 +51,12 @@ output feeds the next:
 7. **rooms** (`rooms.segment_rooms`) — watershed segmentation over free space, room
    naming, adjacency, and (this session) a self-consistency check
    (`rooms.check_no_overlaps`) that flags any polygon overlap as a warning.
-8. **surfaces** (`occupancy.build_surface_grid`, `occupancy.find_openings`) — per-wall
-   UV occupancy grids and door/window detection from silhouette holes in them.
+8. **surfaces/openings** (`occupancy.build_surface_grid`, `occupancy.find_openings`) —
+   per-wall UV occupancy grids and conservative door/window detection from
+   silhouette holes. Optional `--rgb-openings` adds local-only Grounding DINO
+   boxes and SAM2 masks; `--roomformer-predictions` adapts precomputed
+   RoomFormer SD-TQ hints. All sources share `NormalizedOpening`, and only
+   wall-associated masks with valid calibrated depth become metric evidence.
 9. **damage** (`cli._damage_pass`, skippable with `--no-damage`) — Track B in full:
    keyframe selection, VLM detection, mask refinement, fusion into per-surface
    regions. See track-b-damage-intelligence.md.
@@ -84,6 +88,12 @@ All flags apply to `python -m pipeline run <capture> [flags]`.
 | `--frame-association` | `pts` | Associate RGB frames to sidecars by normalized presentation timestamps or identity indices |
 | `--damage-frames` | `40` | Max keyframes sent to the VLM for damage detection |
 | `--min-views` | `2` | Minimum independent views required to accept a fused damage region |
+| `--rgb-openings` | off | Enable optional RGB door/window detection; requires local model paths |
+| `--grounding-dino-model` | — | Local Grounding DINO checkpoint directory; no download is attempted |
+| `--sam2-checkpoint` / `--sam2-config` | — | Local SAM2 checkpoint/config; no download is attempted |
+| `--rgb-device` | `cuda` | Device for explicitly enabled RGB model inference |
+| `--opening-frames` | `40` | Maximum sharp, spatially diverse RGB opening frames |
+| `--roomformer-predictions` | — | Precomputed RoomFormer SD-TQ JSON; image-only hints remain unmeasured |
 | `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |
 | `--coverage` | `0.90` | Target confidence-interval coverage |
 | `--no-refine` | off | Use raw ARKit poses, skip the pose graph |
@@ -107,6 +117,7 @@ Everything below lands in `<out>/<capture-name>/` (or `--out`'s value directly):
 | `fusion_manifest.json` | fusion | Deterministic integrated/rejected/fallback frame indices, depth/pose provenance, and video availability evidence |
 | `scope_sketch.csv` | `export.export_scope_csv` | Room/wall geometry table (room, area, ceiling height, wall, wall length) — the sketch half of an Xactimate-style import |
 | `scope_line_items.csv` | `export.export_scope_csv` | Line-item table (room, surface, action, material, description, quantity, unit, trade, rule_id, source, basis) — the scope half |
+| `openings.csv` | `export.export_openings_csv` | Door/window evidence with state, provenance, metric intervals, wall association, and depth support |
 | `damage_overlays/frame_NNNNNN.jpg` | `export.render_damage_overlays` | Per-frame images with the fused damage mask, box, and class/confidence label drawn on — saved at native video resolution, correctly oriented |
 | `furniture_debug_overlays/frame_NNNNNN.jpg` | same renderer | Only present with `--debug-furniture --furniture-overlays` together; same rendering, diagnostic content |
 

@@ -11,6 +11,8 @@ from .frame_contract import (
 from .ingest import FrameAssociation, VideoAvailability
 from .diagnostics import TSDFVariant, compare_tsdf_parameters
 
+from .openings import NormalizedOpening, fuse_openings
+
 __all__ = [
     "FrameContract",
     "FrameContractError",
@@ -22,4 +24,6 @@ __all__ = [
     "FrameAssociation",
     "TSDFVariant",
     "compare_tsdf_parameters",
+    "NormalizedOpening",
+    "fuse_openings",
 ]
