@@ -88,6 +88,7 @@ out/<capture>/
 | `--reference-type`, `--reference-observed-m`, `--reference-known-m` | — | Validate an explicit marker/tape/user reference; the factor is reported but not applied automatically |
 | `--no-refine` | off | Use raw ARKit poses. The pose-refinement ablation |
 | `--no-loop-closure` | off | Refine sequentially only, without loop edges |
+| `--run-mast3r` | off | Run MASt3R-SLAM for a Stray capture even when ARKit poses are present; ARKit is retained as a prior/validation reference and refinement is skipped |
 | `--no-damage` | off | Geometry only; skips all API calls |
 | `--no-sam` | off | Local GrabCut masks instead of hosted SAM 2 |
 | `--debug-furniture` | off | Diagnostic: also ask the VLM to tag named furniture, to sanity-check it's resolving objects in the frame at all — never reaches `result.json` or scope. Prints counts only |
@@ -375,8 +376,25 @@ is claimed. When MASt3R-SLAM timestamps start at video time zero but Stray
 odometry uses an absolute capture clock, the adapter detects and records the
 single timestamp-origin offset before matching or interpolation.
 
-For the LiDAR pipeline, validate and use a completed MASt3R trajectory before
-the fusion stage with:
+For the LiDAR pipeline, `--run-mast3r` launches MASt3R-SLAM directly from a
+Stray capture. This deliberately prefers accepted MASt3R poses over the ARKit
+refinement path: `odometry.csv` remains a capability-gated upstream prior and
+the metric post-run validation reference, not a reason to skip SLAM.
+
+```console
+python -m cozmo_ai_v2.pipeline run /path/to/capture \
+  --run-mast3r \
+  --mast3r-slam-dir /path/to/MASt3R-SLAM \
+  --mast3r-python /path/to/mast3r-slam-environment/bin/python \
+  --mast3r-no-viz --mast3r-save-as capture
+```
+
+This mode skips ARKit pose refinement, runs MASt3R-SLAM, then applies the same
+pre-fusion ARKit alignment/divergence gates. A failed launcher, missing result,
+or rejected trajectory stops before fusion and writes `mast3r_pose_provenance.json`.
+
+Alternatively, validate and use a completed MASt3R trajectory before the fusion
+stage with:
 
 ```console
 python -m cozmo_ai_v2.pipeline run /path/to/capture \

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..mast3r_slam import Mast3rSlamError, run_rgb_video
 from . import export
 from .damage import fusion as damage_fusion
 from .damage.masks import refine
@@ -45,6 +46,8 @@ from .scope import ScopeEngine
 from .slam import (
     SlamResultError,
     integrate_mast3r_results,
+    mast3r_results_dir,
+    mast3r_trajectory_path,
     write_pose_failure_manifest,
     write_pose_integration_manifest,
 )
@@ -83,6 +86,40 @@ class Timings(dict):
         self[name] = round(elapsed, 2)
         if verbose:
             print(f" {elapsed:.1f}s")
+
+
+def _launch_mast3r_for_capture(
+    capture_root: Path,
+    mast3r_slam_dir: Path,
+    config: str,
+    python_executable: str,
+    save_as: str | None,
+    no_viz: bool,
+) -> tuple[Path, Path, str]:
+    """Run MASt3R-SLAM on a Stray capture's RGB stream.
+
+    Stray odometry is deliberately retained as a measured metric prior and
+    post-run validation reference. It does not suppress RGB SLAM: upstream
+    receives it only when that checkout advertises a compatible prior option.
+    """
+
+    video_path = capture_root / "rgb.mp4"
+    pose_priors_path = capture_root / "odometry.csv"
+    invocation = run_rgb_video(
+        video_path,
+        mast3r_slam_dir,
+        config,
+        python_executable=python_executable,
+        save_as=save_as,
+        no_viz=no_viz,
+        pose_priors_path=pose_priors_path,
+    )
+    results_dir = mast3r_results_dir(invocation.cwd, video_path, save_as)
+    return (
+        mast3r_trajectory_path(invocation.cwd, video_path, save_as),
+        results_dir,
+        invocation.pose_prior_mode,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -148,10 +185,49 @@ def run(args: argparse.Namespace) -> int:
             "poses or the device mapping may be wrong for this capture source"
         )
 
+    mast3r_trajectory = args.mast3r_trajectory
+    mast3r_results_path: Path | None = None
+    mast3r_pose_prior_mode = "post_alignment"
+    if args.run_mast3r:
+        if args.mast3r_slam_dir is None:
+            print(
+                "error: --run-mast3r requires --mast3r-slam-dir",
+                file=sys.stderr,
+            )
+            return 1
+        mast3r_manifest = out_dir / "mast3r_pose_provenance.json"
+        try:
+            with timings.stage("MASt3R-SLAM RGB tracking"):
+                (
+                    mast3r_trajectory,
+                    mast3r_results_path,
+                    mast3r_pose_prior_mode,
+                ) = _launch_mast3r_for_capture(
+                    bundle.root,
+                    args.mast3r_slam_dir,
+                    args.mast3r_config,
+                    args.mast3r_python,
+                    args.mast3r_save_as,
+                    args.mast3r_no_viz,
+                )
+        except Mast3rSlamError as exc:
+            write_pose_failure_manifest(
+                mast3r_manifest,
+                exc,
+                pose_priors_path=bundle.root / "odometry.csv",
+                pose_prior_mode="not_started",
+            )
+            print(f"error: {exc}; wrote diagnostics to {mast3r_manifest}", file=sys.stderr)
+            return 1
+        print(
+            "  MASt3R-SLAM requested with ARKit as a prior/validation reference; "
+            "skipping ARKit pose refinement"
+        )
+
     # Stage 2: pose refinement
     poses = bundle.poses
     drift_report = None
-    if not args.no_refine and bundle.has_depth:
+    if not args.no_refine and not args.run_mast3r and bundle.has_depth:
         with timings.stage("pose refinement"):
             keyframes = select_keyframes(bundle)
             poses, drift_report = refine_trajectory(
@@ -170,7 +246,7 @@ def run(args: argparse.Namespace) -> int:
         )
         if drift_report.rejected:
             warnings.extend(f"pose refinement rejected: {reason}" for reason in drift_report.rejection_reasons)
-    elif not args.no_refine:
+    elif not args.no_refine and not args.run_mast3r:
         warnings.append(
             "pose refinement skipped: no raw LiDAR depth is available; "
             "using the selected SLAM/ARKit pose table"
@@ -182,15 +258,15 @@ def run(args: argparse.Namespace) -> int:
     # pass. This must happen before the frame contract is built so fusion and
     # provenance observe the selected pose table.
     mast3r_integration = None
-    if args.mast3r_trajectory:
+    if mast3r_trajectory:
         mast3r_manifest = out_dir / "mast3r_pose_provenance.json"
         try:
             with timings.stage("MASt3R-SLAM trajectory validation"):
                 mast3r_integration = integrate_mast3r_results(
-                    args.mast3r_trajectory,
+                    mast3r_trajectory,
                     pose_priors_path=bundle.root / "odometry.csv",
-                    pose_prior_mode="post_alignment",
-                    results_dir=Path(args.mast3r_trajectory).parent,
+                    pose_prior_mode=mast3r_pose_prior_mode,
+                    results_dir=mast3r_results_path or Path(mast3r_trajectory).parent,
                     metrics_path=args.mast3r_metrics,
                     target_timestamps=bundle.timestamps,
                     interpolation_max_gap_seconds=args.mast3r_max_pose_gap,
@@ -201,7 +277,7 @@ def run(args: argparse.Namespace) -> int:
                 mast3r_manifest,
                 exc,
                 pose_priors_path=bundle.root / "odometry.csv",
-                pose_prior_mode="post_alignment",
+                pose_prior_mode=mast3r_pose_prior_mode,
             )
             print(f"error: {exc}; wrote diagnostics to {mast3r_manifest}", file=sys.stderr)
             return 1
@@ -1410,13 +1486,47 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--reference-known-m", type=float)
     runner.add_argument("--no-refine", action="store_true", help="use raw ARKit/SLAM poses")
     runner.add_argument("--no-loop-closure", action="store_true")
-    runner.add_argument(
+    mast3r_input = runner.add_mutually_exclusive_group()
+    mast3r_input.add_argument(
         "--mast3r-trajectory",
         type=Path,
         help=(
             "MASt3R-SLAM trajectory file to align to this capture's ARKit priors "
             "and use only if it passes pre-fusion divergence gates"
         ),
+    )
+    mast3r_input.add_argument(
+        "--run-mast3r",
+        action="store_true",
+        help=(
+            "run MASt3R-SLAM on this Stray capture's rgb.mp4 even though "
+            "ARKit poses exist; ARKit becomes a prior/validation reference "
+            "and pose refinement is skipped"
+        ),
+    )
+    runner.add_argument(
+        "--mast3r-slam-dir",
+        type=Path,
+        help="path to the external MASt3R-SLAM checkout (required by --run-mast3r)",
+    )
+    runner.add_argument(
+        "--mast3r-config",
+        default="config/base.yaml",
+        help="config path relative to --mast3r-slam-dir",
+    )
+    runner.add_argument(
+        "--mast3r-python",
+        default=sys.executable,
+        help="Python executable from the MASt3R-SLAM environment",
+    )
+    runner.add_argument(
+        "--mast3r-save-as",
+        help="optional MASt3R-SLAM logs subdirectory name",
+    )
+    runner.add_argument(
+        "--mast3r-no-viz",
+        action="store_true",
+        help="pass --no-viz to MASt3R-SLAM",
     )
     runner.add_argument(
         "--mast3r-metrics",
