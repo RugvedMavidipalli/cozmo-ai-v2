@@ -28,7 +28,13 @@ from .measurements import (
     validate_reference_scale,
     validate_scale,
 )
-from .planes import TLSPlane, TLSPlaneModel
+from .planes import (
+    PlaneClassification,
+    StructuralPlane,
+    TLSPlane,
+    TLSPlaneModel,
+    extract_structural_planes,
+)
 
 __all__ = [
     "FrameContract",
@@ -60,4 +66,7 @@ __all__ = [
     "validate_scale",
     "TLSPlane",
     "TLSPlaneModel",
+    "PlaneClassification",
+    "StructuralPlane",
+    "extract_structural_planes",
 ]
