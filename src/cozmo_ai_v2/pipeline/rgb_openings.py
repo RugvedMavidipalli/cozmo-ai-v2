@@ -179,12 +179,35 @@ class SAM2Adapter:
         if not Path(self.model_cfg).exists():
             raise ModelUnavailable(f"SAM2 model config does not exist: {self.model_cfg}")
         try:
+            import sam2  # noqa: PLC0415 - optional, lazy dependency
             from sam2.build_sam import build_sam2  # noqa: PLC0415 - optional, lazy dependency
             from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: PLC0415
         except ImportError as exc:
             raise ModelUnavailable("SAM2 requires the optional sam2 package") from exc
-        model = build_sam2(self.model_cfg, self.checkpoint, device=self.device)
+        config_name = _sam2_config_name(
+            Path(self.model_cfg), Path(sam2.__file__).resolve().parent
+        )
+        model = build_sam2(config_name, self.checkpoint, device=self.device)
         return SAM2ImagePredictor(model)
+
+
+def _sam2_config_name(config_path: Path, package_root: Path) -> str:
+    """Return the package-relative config name required by SAM2 Hydra.
+
+    SAM2's ``build_sam2`` passes its config argument to ``hydra.compose``.
+    Hydra resolves that name within the installed ``sam2`` package rather than
+    accepting an absolute filesystem path.  We keep the CLI contract explicit
+    (a local file path) while converting it only after confirming it belongs to
+    the imported package.
+    """
+
+    try:
+        return config_path.resolve().relative_to(package_root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ModelUnavailable(
+            "SAM2 model config must be located under the installed sam2 package: "
+            f"{config_path} is outside {package_root}"
+        ) from exc
 
 
 def _first_mask(result: Any) -> tuple[np.ndarray, float]:

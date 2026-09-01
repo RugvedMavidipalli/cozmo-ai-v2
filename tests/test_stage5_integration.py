@@ -11,7 +11,9 @@ from cozmo_ai_v2.pipeline.fuse import fuse
 from cozmo_ai_v2.pipeline.ingest import load_capture
 
 
-def _write_dense_artifacts(output_dir, indices=(0, 1), approved=(True, True)):
+def _write_dense_artifacts(
+    output_dir, indices=(0, 1), approved=(True, True), shape=(48, 64), rgb_scale=None,
+):
     dense_dir = output_dir / "dense_depth"
     confidence_dir = output_dir / "dense_confidence"
     qc_dir = output_dir / "dense_qc"
@@ -20,7 +22,7 @@ def _write_dense_artifacts(output_dir, indices=(0, 1), approved=(True, True)):
     qc_dir.mkdir()
     reports = []
     for index, is_approved in zip(indices, approved):
-        depth = np.full((48, 64), 2_000 + index * 500, dtype=np.uint16)
+        depth = np.full(shape, 2_000 + index * 500, dtype=np.uint16)
         cv2.imwrite(str(dense_dir / f"{index:06d}.png"), depth)
         cv2.imwrite(
             str(confidence_dir / f"{index:06d}.png"),
@@ -43,7 +45,10 @@ def _write_dense_artifacts(output_dir, indices=(0, 1), approved=(True, True)):
             }
         )
     manifest = output_dir / "densify_manifest.json"
-    manifest.write_text(json.dumps({"frames": reports}, indent=2) + "\n")
+    payload = {"frames": reports}
+    if rgb_scale is not None:
+        payload["dense_rgb_scale"] = list(rgb_scale)
+    manifest.write_text(json.dumps(payload, indent=2) + "\n")
     return dense_dir, manifest
 
 
@@ -77,7 +82,24 @@ def test_contract_uses_qc_dense_depth_and_rgb_intrinsics(stray_capture, tmp_path
     assert report["max_depth_m"] == 4.0
     assert report["contract_parameters"]["max_depth_m"] == 4.0
     assert report["contract_parameters"]["min_confidence"] == 1
-    assert report["registration_alignment"]["dense_depth"]["shape_mismatch"] == "reject"
+    assert report["registration_alignment"]["dense_depth"]["shape_mismatch"] == "reject_unless_manifest_declared_scale"
+    assert report["frame_provenance"][0]["depth_resolution"] == [64, 48]
+
+
+def test_contract_uses_manifest_declared_scaled_dense_rgb(stray_capture, tmp_path):
+    dense_dir, manifest = _write_dense_artifacts(
+        tmp_path / "stage4", indices=(0,), approved=(True,), shape=(24, 32), rgb_scale=(0.5, 0.5),
+    )
+    bundle = load_capture(stray_capture)
+    contract = build_frame_contract(
+        bundle, indices=[0], dense_depth_dir=dense_dir, densify_manifest=manifest, max_depth=4.0,
+    )
+
+    frame = next(contract.iter_frames())
+    assert frame.depth.shape == (24, 32)
+    assert frame.color.shape == (24, 32, 3)
+    assert frame.provenance.registration == "dense_scaled_rgb_area_resize"
+    np.testing.assert_allclose(frame.intrinsics, bundle.intrinsics_for_size(32, 24))
 
 
 def test_contract_falls_back_per_index_to_raw_lidar(stray_capture, tmp_path):
@@ -167,6 +189,11 @@ def test_contract_reports_one_frame_short_video_without_shifting_sidecars(
     writer = cv2.VideoWriter(
         str(video_path), cv2.VideoWriter_fourcc(*"avc1"), 30, (64, 48)
     )
+    if not writer.isOpened():
+        writer.release()
+        writer = cv2.VideoWriter(
+            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (64, 48)
+        )
     assert writer.isOpened()
     writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
     writer.release()

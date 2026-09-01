@@ -3,7 +3,7 @@ import json
 import cv2
 import numpy as np
 
-from cozmo_ai_v2.cli import run_densify
+from cozmo_ai_v2.cli import _densify_indices, run_densify
 from cozmo_ai_v2.depth.capture import require_lidar_capture
 from cozmo_ai_v2.depth.densify import densify_capture
 
@@ -76,6 +76,50 @@ def test_densify_capture_end_to_end(stray_capture, tmp_path):
         assert (output_dir / "dense_qc" / f"{index:06d}.png").exists()
 
 
+def test_densify_capture_records_alignment_rejection_and_continues(stray_capture, tmp_path):
+    capture = require_lidar_capture(stray_capture)
+
+    depth0 = cv2.imread(str(stray_capture / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    depth1 = cv2.imread(str(stray_capture / "depth" / "000001.png"), cv2.IMREAD_UNCHANGED)
+    # The second prediction is anti-correlated with its LiDAR depth, causing
+    # the robust scale/shift fit to reject it with a negative scale.
+    model = FakeDepthModel(
+        [_full_res_ramp(depth0), np.fliplr(_full_res_ramp(depth1))],
+        bias=0.0,
+    )
+    output_dir = tmp_path / "out"
+
+    densify_capture(capture, model, output_dir)
+
+    manifest = json.loads((output_dir / "densify_manifest.json").read_text())
+    assert manifest["frame_count"] == 2
+    assert manifest["frames"][0]["status"] == "qc_approved"
+    rejected = manifest["frames"][1]
+    assert rejected["index"] == 1
+    assert rejected["status"] == "rejected"
+    assert rejected["qc_approved"] is False
+    assert "outside the plausible range" in rejected["qc_reason"]
+    assert not (output_dir / "dense_depth" / "000001.png").exists()
+
+
+def test_densify_capture_can_emit_manifest_declared_scaled_rgb(stray_capture, tmp_path):
+    capture = require_lidar_capture(stray_capture)
+    depth = cv2.imread(str(stray_capture / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    model = FakeDepthModel([cv2.resize(_full_res_ramp(depth), (32, 24), interpolation=cv2.INTER_AREA)])
+    output_dir = tmp_path / "out"
+
+    densify_capture(capture, model, output_dir, indices=[0], output_scale=0.5)
+
+    manifest = json.loads((output_dir / "densify_manifest.json").read_text())
+    assert manifest["dense_rgb_scale"] == [0.5, 0.5]
+    report = manifest["frames"][0]
+    assert report["registration_alignment"]["dense_output"] == "scaled_rgb"
+    assert report["source_rgb_resolution"] == [VIDEO_WIDTH, VIDEO_HEIGHT]
+    assert report["depth_resolution"] == [32, 24]
+    dense = cv2.imread(str(output_dir / "dense_depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    assert dense.shape == (24, 32)
+
+
 def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path, capsys):
     exit_code = run_densify(
         lidar_stray_scanner_dataset, tmp_path / "out", "metric3d_vit_small",
@@ -84,3 +128,10 @@ def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path
 
     assert exit_code == 1
     assert "error" in capsys.readouterr().err.lower()
+
+
+def test_densify_indices_sample_real_depth_frame_ids(stray_capture):
+    capture = require_lidar_capture(stray_capture)
+
+    assert _densify_indices(capture, 1) is None
+    assert _densify_indices(capture, 2) == [0]

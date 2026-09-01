@@ -14,6 +14,7 @@ from cozmo_ai_v2.pipeline.rgb_openings import (
     RGBOpeningMask,
     SAM2Adapter,
     _project_detection,
+    _sam2_config_name,
 )
 from cozmo_ai_v2.pipeline.roomformer import RoomFormerSDTQAdapter
 
@@ -101,6 +102,18 @@ def test_model_adapters_are_lazy_and_mockable():
 
     with pytest.raises(ModelUnavailable):
         GroundingDINOAdapter().detect(np.zeros((4, 4, 3), np.uint8))
+
+
+def test_sam2_config_path_is_translated_to_hydra_package_name(tmp_path):
+    package_root = tmp_path / "sam2"
+    config = package_root / "configs" / "sam2.1" / "sam2.1_hiera_s.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("model: test\n")
+
+    assert _sam2_config_name(config, package_root) == "configs/sam2.1/sam2.1_hiera_s.yaml"
+
+    with pytest.raises(ModelUnavailable, match="must be located"):
+        _sam2_config_name(tmp_path / "outside.yaml", package_root)
 
 
 def test_rgb_projection_requires_depth_and_associates_to_wall_plane():

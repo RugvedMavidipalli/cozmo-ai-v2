@@ -52,7 +52,12 @@ class FrameProvenance:
     depth_resolution: tuple[int, int]
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        # JSON Schema distinguishes Python tuples from JSON arrays even
+        # though ``json.dumps`` would serialize both alike.  Keep the public
+        # provenance contract schema-valid before validation/export.
+        payload["depth_resolution"] = list(self.depth_resolution)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,7 @@ class _DenseEntry:
     qc_path: Path | None
     reason: str = ""
     depth_unit: str = "mm"
+    rgb_scale: tuple[float, float] = (1.0, 1.0)
 
 
 def _normalise_indices(indices: list[int] | np.ndarray | None, count: int) -> tuple[int, ...]:
@@ -169,6 +175,19 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
+def _manifest_rgb_scale(payload: dict) -> tuple[float, float]:
+    value = payload.get("dense_rgb_scale", (1.0, 1.0))
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise FrameContractError("densify manifest dense_rgb_scale must contain [x_scale, y_scale]")
+    try:
+        scale_x, scale_y = (float(value[0]), float(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise FrameContractError("densify manifest dense_rgb_scale must contain numbers") from exc
+    if not all(np.isfinite(value) and 0.0 < value <= 1.0 for value in (scale_x, scale_y)):
+        raise FrameContractError("densify manifest dense_rgb_scale must be finite and in (0, 1]")
+    return scale_x, scale_y
+
+
 def _manifest_entries(manifest_path: Path | None, dense_dir: Path | None) -> dict[int, _DenseEntry]:
     if manifest_path is None or not manifest_path.exists():
         return {}
@@ -178,6 +197,7 @@ def _manifest_entries(manifest_path: Path | None, dense_dir: Path | None) -> dic
         raise FrameContractError(f"cannot read densify manifest {manifest_path}: {exc}") from exc
 
     manifest_root = manifest_path.parent
+    manifest_rgb_scale = _manifest_rgb_scale(payload)
     entries: dict[int, _DenseEntry] = {}
     for raw in payload.get("frames", []):
         try:
@@ -207,6 +227,7 @@ def _manifest_entries(manifest_path: Path | None, dense_dir: Path | None) -> dic
             qc_path=qc_path,
             reason=str(raw.get("qc_reason", "")),
             depth_unit=str(raw.get("depth_unit", payload.get("depth_unit", "mm"))),
+            rgb_scale=manifest_rgb_scale,
         )
     return entries
 
@@ -366,9 +387,20 @@ class FrameContract:
         depth = _read_depth(entry.depth_path, entry.depth_unit)
         height, width = bgr.shape[:2]
         if depth.shape != (height, width):
-            raise FrameContractError(
-                f"dense depth shape {depth.shape} does not match RGB shape {(height, width)}"
-            )
+            expected_width = round(width * entry.rgb_scale[0])
+            expected_height = round(height * entry.rgb_scale[1])
+            if (
+                entry.rgb_scale == (1.0, 1.0)
+                or depth.shape != (expected_height, expected_width)
+            ):
+                raise FrameContractError(
+                    f"dense depth shape {depth.shape} does not match RGB shape {(height, width)} "
+                    f"or manifest-declared scaled RGB {(expected_height, expected_width)}"
+                )
+            bgr = cv2.resize(bgr, (width := depth.shape[1], height := depth.shape[0]), interpolation=cv2.INTER_AREA)
+            registration = "dense_scaled_rgb_area_resize"
+        else:
+            registration = "dense_native_rgb_exact_shape"
 
         if entry.confidence_path is not None and entry.confidence_path.exists():
             confidence = _aligned_mask(_read_array(entry.confidence_path), depth.shape, "confidence")
@@ -419,7 +451,7 @@ class FrameContract:
                 pose_path=self.pose_path,
                 source_depth_unit=entry.depth_unit,
                 contract_depth_unit=CONTRACT_DEPTH_UNIT,
-                registration="dense_native_rgb_exact_shape",
+                registration=registration,
                 depth_resolution=(int(width), int(height)),
             ),
         )
@@ -484,12 +516,13 @@ class FrameContract:
         sources = sorted(set(self.depth_sources.values()))
         provenance = list(self.provenance_by_index.values())
         registration = {
-            "policy": "dense_requires_native_rgb_alignment; raw_rgb_area_resize_to_depth",
+            "policy": "dense_requires_native_or_manifest_declared_scaled_rgb_alignment; raw_rgb_area_resize_to_depth",
             "dense_depth": {
-                "required_shape": "native_rgb",
-                "shape_mismatch": "reject",
+                "required_shape": "native_rgb_or_manifest_declared_scaled_rgb",
+                "shape_mismatch": "reject_unless_manifest_declared_scale",
                 "confidence_alignment": "nearest",
                 "qc_alignment": "nearest",
+                "scaled_rgb_alignment": "INTER_AREA_resize",
             },
             "raw_lidar": {
                 "depth_shape": "native_lidar",

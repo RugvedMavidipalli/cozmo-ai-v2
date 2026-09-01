@@ -74,6 +74,8 @@ def run_densify(
     weights_path: Path | None = None,
     repository: Path | None = None,
     device: str | None = None,
+    stride: int = 1,
+    output_scale: float = 1.0,
 ) -> int:
     try:
         capture = require_lidar_capture(input_path)
@@ -92,13 +94,36 @@ def run_densify(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        densify_capture(capture, model, output_dir, None, min_confidence, max_depth, guide_radius, guide_eps)
+        indices = _densify_indices(capture, stride)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        densify_capture(
+            capture, model, output_dir, indices, min_confidence, max_depth,
+            guide_radius, guide_eps, output_scale=output_scale,
+        )
     except (AlignmentError, LidarCaptureError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     print(f"Wrote dense_depth/ and densify_manifest.json to {output_dir}")
     return 0
+
+
+def _densify_indices(capture, stride: int) -> list[int] | None:
+    """Return deterministic LiDAR frame indices for optional temporal sampling."""
+    if stride < 1:
+        raise ValueError(f"densify stride must be at least 1, got {stride}")
+    if stride == 1:
+        return None
+    indices: list[int] = []
+    for path in capture.depth_dir.glob("*.png"):
+        try:
+            indices.append(int(path.stem))
+        except ValueError:
+            continue
+    return sorted(indices)[::stride]
 
 
 def run_slam(
@@ -239,6 +264,17 @@ def build_parser() -> argparse.ArgumentParser:
     densify.add_argument("--guide-radius", type=int, default=20, help="Guided filter window radius (pixels) for local residual fusion")
     densify.add_argument("--guide-eps", type=float, default=100.0, help="Guided filter regularization epsilon")
     densify.add_argument(
+        "--stride", type=int, default=1,
+        help="process every Nth LiDAR/RGB frame; use the same stride for downstream fusion",
+    )
+    densify.add_argument(
+        "--output-scale", type=float, default=1.0,
+        help=(
+            "aspect-preserving RGB/dense-depth scale in (0, 1]; recorded in the "
+            "manifest so downstream intrinsics are scaled consistently"
+        ),
+    )
+    densify.add_argument(
         "--weights", type=Path, default=None,
         help="local Metric3D v2 checkpoint; no weights are downloaded automatically",
     )
@@ -310,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.output_dir, args.variant,
             args.min_confidence, args.max_depth, args.guide_radius, args.guide_eps,
             args.weights, args.metric3d_repository, args.device,
+            args.stride, args.output_scale,
         )
     if args.command == "validate-scale":
         import json
