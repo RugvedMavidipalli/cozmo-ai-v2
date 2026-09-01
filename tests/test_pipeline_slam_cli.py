@@ -143,7 +143,9 @@ def test_run_mast3r_skips_arkit_refinement_before_trajectory_validation(monkeypa
     def must_not_refine(*_args, **_kwargs):
         raise AssertionError("ARKit refinement must be skipped when --run-mast3r is set")
 
-    monkeypatch.setattr("cozmo_ai_v2.pipeline.cli.load_capture", lambda _path: Bundle())
+    monkeypatch.setattr(
+        "cozmo_ai_v2.pipeline.cli.load_capture", lambda _path, **_kwargs: Bundle()
+    )
     monkeypatch.setattr("cozmo_ai_v2.pipeline.cli._launch_mast3r_for_capture", fake_launch)
     monkeypatch.setattr("cozmo_ai_v2.pipeline.cli.refine_trajectory", must_not_refine)
     monkeypatch.setattr(
