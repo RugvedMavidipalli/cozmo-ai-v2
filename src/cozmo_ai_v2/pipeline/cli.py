@@ -290,13 +290,6 @@ def run(args: argparse.Namespace) -> int:
                 )
             )
     print(f"  {len(rooms)} rooms")
-    print(
-        "  geometry stages: "
-        + ", ".join(
-            f"{stage}={count}"
-            for stage, count in geometry_diagnostics.stage_counts.items()
-        )
-    )
     if not rooms:
         reason = geometry_diagnostics.room_segmentation.get("zero_room_reason")
         print(f"  room extraction reason: {reason or 'not reported'}")
@@ -477,6 +470,13 @@ def run(args: argparse.Namespace) -> int:
     result["diagnostics"]["timings_s"]["total"] = round(time.time() - total_start, 2)
     export.write_json(result, out_dir / "result.json")
 
+    print(
+        "  geometry stages: "
+        + ", ".join(
+            f"{stage}={count}"
+            for stage, count in geometry_diagnostics.stage_counts.items()
+        )
+    )
     print(f"\nWrote {out_dir}/ in {time.time() - total_start:.1f}s")
     for warning in warnings:
         print(f"  ! {warning}")
