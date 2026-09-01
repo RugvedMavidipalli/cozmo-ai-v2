@@ -1,0 +1,384 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cozmo capture result",
+  "description": "Per-capture output: metric reconstruction, damage intelligence, and scope of work. Every measurement carries a confidence interval; every scope quantity carries the rule and source it came from.",
+  "type": "object",
+  "required": ["capture", "reconstruction", "rooms", "damage", "scope", "diagnostics"],
+  "properties": {
+    "capture": {
+      "type": "object",
+      "required": ["name", "modality", "frame_count"],
+      "properties": {
+        "name": { "type": "string" },
+        "modality": {
+          "type": "string",
+          "enum": ["lidar", "video_only"],
+          "description": "video_only captures run the estimated-depth fallback and carry wider intervals."
+        },
+        "frame_count": { "type": "integer" },
+        "duration_s": { "type": "number" },
+        "path_length_m": { "type": "number" }
+      }
+    },
+    "reconstruction": {
+      "type": "object",
+      "required": ["up_axis", "floor_height", "ceiling_observed", "ceiling_confidence", "walls"],
+      "properties": {
+        "up_axis": { "$ref": "#/$defs/vector3" },
+        "gravity_consistency": { "type": "number" },
+        "floor_height": { "type": "number" },
+        "ceiling_height": { "type": ["number", "null"] },
+        "ceiling_observed": { "type": "boolean" },
+        "ceiling_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "floor_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "manhattan_yaw_deg": { "type": "number" },
+        "manhattan_fraction": { "type": "number" },
+        "walls": { "type": "array", "items": { "$ref": "#/$defs/wall" } },
+        "openings": { "type": "array", "items": { "$ref": "#/$defs/opening" } }
+      }
+    },
+    "rooms": { "type": "array", "items": { "$ref": "#/$defs/room" } },
+    "adjacency": {
+      "type": "array",
+      "description": "Room connectivity graph; pairs of room ids sharing a wall or doorway.",
+      "items": {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {
+          "a": { "type": "integer" },
+          "b": { "type": "integer" },
+          "via": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "damage": { "type": "array", "items": { "$ref": "#/$defs/damage_region" } },
+    "concealed": { "type": "array", "items": { "$ref": "#/$defs/concealed_flag" } },
+    "scope": {
+      "type": "object",
+      "required": ["line_items"],
+      "properties": {
+        "line_items": { "type": "array", "items": { "$ref": "#/$defs/line_item" } },
+        "rules_version": { "type": ["integer", "string"] }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "description": "Stage timings and the error budget the report is built from.",
+      "properties": {
+        "timings_s": { "type": "object", "additionalProperties": { "type": "number" } },
+        "drift": {
+          "type": "object",
+          "properties": {
+            "median_mm": { "type": "number" },
+            "p90_mm": { "type": "number" },
+            "max_mm": { "type": "number" },
+            "revisited_walls": { "type": "integer" }
+          }
+        },
+        "calibration": {
+          "type": "object",
+          "properties": {
+            "calibrated": { "type": "boolean" },
+            "scale": { "type": "number" },
+            "coverage_target": { "type": "number" }
+          }
+        },
+        "fusion": {
+          "type": "object",
+          "description": "Stage 4-to-5 depth/pose contract and deterministic frame decisions.",
+          "properties": {
+            "depth_sources": { "type": "array", "items": { "type": "string" } },
+            "depth_units": { "type": "array", "items": { "type": "string" } },
+            "depth_unit": { "type": "string" },
+            "confidence_threshold": { "type": "integer", "minimum": 0, "maximum": 2 },
+            "max_depth_m": { "type": "number", "exclusiveMinimum": 0 },
+            "registration_alignment": { "$ref": "#/$defs/registration_alignment" },
+            "dense_depth_dir": { "type": ["string", "null"] },
+            "densify_manifest": { "type": ["string", "null"] },
+            "pose_source": { "type": "string" },
+            "pose_path": { "type": ["string", "null"] },
+            "pose_convention": { "type": "string" },
+            "depth_source_mode": { "type": "string", "enum": ["auto", "dense", "raw"] },
+            "contract_parameters": { "$ref": "#/$defs/contract_parameters" },
+            "requested_indices": { "type": "array", "items": { "type": "integer" } },
+            "integrated_indices": { "type": "array", "items": { "type": "integer" } },
+            "video_availability": {
+              "oneOf": [
+                { "$ref": "#/$defs/video_availability" },
+                { "type": "null" }
+              ]
+            },
+            "frame_provenance": { "type": "array", "items": { "$ref": "#/$defs/frame_provenance" } },
+            "rejected_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
+            "fallback_frames": { "type": "array", "items": { "$ref": "#/$defs/frame_decision" } },
+            "frame_count": { "type": "integer", "minimum": 0 },
+            "resolutions": {
+              "type": "array",
+              "items": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+            },
+            "tsdf_parameters": { "$ref": "#/$defs/tsdf_parameters" }
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "frame_decision": {
+      "type": "object",
+      "required": ["index", "reason", "attempted_depth_source"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" },
+        "attempted_depth_source": { "type": "string" }
+      }
+    },
+    "frame_provenance": {
+      "type": "object",
+      "required": [
+        "index", "depth_source", "confidence_source", "qc_source", "pose_source",
+        "source_depth_unit", "contract_depth_unit", "registration", "depth_resolution"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "depth_source": { "type": "string" },
+        "depth_path": { "type": ["string", "null"] },
+        "confidence_source": { "type": "string" },
+        "confidence_path": { "type": ["string", "null"] },
+        "qc_source": { "type": "string" },
+        "qc_path": { "type": ["string", "null"] },
+        "pose_source": { "type": "string" },
+        "pose_path": { "type": ["string", "null"] },
+        "source_depth_unit": { "type": "string" },
+        "contract_depth_unit": { "type": "string" },
+        "registration": { "type": "string" },
+        "depth_resolution": {
+          "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2
+        }
+      }
+    },
+    "registration_alignment": {
+      "type": "object",
+      "properties": {
+        "policy": { "type": "string" },
+        "dense_depth": { "type": "object" },
+        "raw_lidar": { "type": "object" }
+      }
+    },
+    "contract_parameters": {
+      "type": "object",
+      "properties": {
+        "min_confidence": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "max_depth_m": { "type": "number", "exclusiveMinimum": 0 },
+        "max_depth_inclusive": { "type": "boolean" },
+        "invalid_depth_action": { "type": "string" },
+        "depth_output_unit": { "type": "string" },
+        "depth_source_policy": { "type": "string" },
+        "registration_alignment": { "$ref": "#/$defs/registration_alignment" }
+      }
+    },
+    "tsdf_parameters": {
+      "type": "object",
+      "properties": {
+        "voxel_size_m": { "type": "number", "exclusiveMinimum": 0 },
+        "sdf_trunc_m": { "type": "number", "exclusiveMinimum": 0 },
+        "sdf_trunc_explicit": { "type": "boolean" },
+        "depth_scale": { "type": "number", "exclusiveMinimum": 0 },
+        "depth_unit": { "type": "string" },
+        "depth_trunc_m": { "type": "number", "exclusiveMinimum": 0 },
+        "color_type": { "type": "string" },
+        "extrinsic_convention": { "type": "string" }
+      }
+    },
+    "video_availability": {
+      "type": "object",
+      "required": [
+        "expected_frame_count", "sidecar_frame_count", "reported_frame_count",
+        "decoded_frame_count", "missing_indices", "reported_shortfall",
+        "terminal_decode_missing", "decode_complete", "association_mode",
+        "pts_source", "pts_status", "pts_tolerance_s", "associations"
+      ],
+      "properties": {
+        "expected_frame_count": { "type": "integer", "minimum": 0 },
+        "sidecar_frame_count": { "type": "integer", "minimum": 0 },
+        "reported_frame_count": { "type": ["integer", "null"], "minimum": 0 },
+        "decoded_frame_count": { "type": "integer", "minimum": 0 },
+        "missing_indices": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "reported_shortfall": { "type": "integer", "minimum": 0 },
+        "terminal_decode_missing": { "type": "boolean" },
+        "decode_complete": { "type": "boolean" },
+        "association_mode": { "type": "string", "enum": ["index", "pts"] },
+        "pts_source": { "type": ["string", "null"] },
+        "pts_status": { "type": "string", "enum": ["used", "index_fallback", "not_evaluated", "not_requested"] },
+        "pts_tolerance_s": { "type": ["number", "null"], "minimum": 0 },
+        "associations": {
+          "type": "array", "items": { "$ref": "#/$defs/frame_association" }
+        }
+      }
+    },
+    "frame_association": {
+      "type": "object",
+      "required": ["video_index", "sidecar_index", "method"],
+      "properties": {
+        "video_index": { "type": "integer", "minimum": 0 },
+        "sidecar_index": { "type": ["integer", "null"], "minimum": 0 },
+        "pts_s": { "type": ["number", "null"] },
+        "sidecar_timestamp_s": { "type": ["number", "null"] },
+        "delta_s": { "type": ["number", "null"], "minimum": 0 },
+        "method": { "type": "string" }
+      }
+    },
+    "point2": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "measurement": {
+      "type": "object",
+      "description": "A value with a calibrated confidence interval.",
+      "required": ["value", "ci_low", "ci_high", "coverage"],
+      "properties": {
+        "value": { "type": "number" },
+        "ci_low": { "type": "number" },
+        "ci_high": { "type": "number" },
+        "half_width": { "type": "number" },
+        "coverage": { "type": "number" },
+        "basis": { "type": "string", "description": "How the interval was derived." }
+      }
+    },
+    "wall": {
+      "type": "object",
+      "required": ["id", "name", "length", "start", "end"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string", "description": "Stable surface reference, e.g. room_1.north_wall." },
+        "room_id": { "type": ["integer", "null"] },
+        "start": { "$ref": "#/$defs/point2" },
+        "end": { "$ref": "#/$defs/point2" },
+        "normal": { "$ref": "#/$defs/point2" },
+        "length": { "$ref": "#/$defs/measurement" },
+        "height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "inferred_fraction": {
+          "type": "number",
+          "description": "Share of the wall reconstructed behind furniture rather than directly observed."
+        },
+        "occluded_spans": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "residual_rms_mm": { "type": "number" },
+        "support_points": { "type": "integer" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "opening": {
+      "type": "object",
+      "required": ["wall", "kind", "width"],
+      "properties": {
+        "wall": { "type": "string" },
+        "kind": { "type": "string", "enum": ["door", "window", "pass-through"] },
+        "width": { "$ref": "#/$defs/measurement" },
+        "height": { "$ref": "#/$defs/measurement" },
+        "sill_height": { "type": "number" },
+        "header_height": { "type": "number" },
+        "u_offset": { "type": "number", "description": "Distance from the wall's start corner." },
+        "confidence": { "type": "number" }
+      }
+    },
+    "room": {
+      "type": "object",
+      "required": ["id", "name", "area"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "area": { "$ref": "#/$defs/measurement" },
+        "ceiling_height": { "oneOf": [{ "$ref": "#/$defs/measurement" }, { "type": "null" }] },
+        "perimeter": { "type": "number" },
+        "centroid": { "$ref": "#/$defs/point2" },
+        "polygon": { "type": "array", "items": { "$ref": "#/$defs/point2" } },
+        "wall_ids": { "type": "array", "items": { "type": "integer" } },
+        "neighbours": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "damage_region": {
+      "type": "object",
+      "required": ["id", "surface_ref", "damage_class", "area"],
+      "properties": {
+        "id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "damage_class": { "type": "string", "enum": ["water", "fire", "mold", "combined"] },
+        "subtype": { "type": ["string", "null"] },
+        "area": { "$ref": "#/$defs/measurement" },
+        "water_category": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "water_class": { "type": ["integer", "null"], "minimum": 1, "maximum": 4 },
+        "mold_condition": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "classification_basis": { "type": "string" },
+        "extent": {
+          "type": "object",
+          "description": "Position on the surface: u along the wall, v up from the floor.",
+          "properties": {
+            "u_range": { "$ref": "#/$defs/point2" },
+            "v_range": { "$ref": "#/$defs/point2" }
+          }
+        },
+        "description": { "type": "string" },
+        "view_count": { "type": "integer" },
+        "confidence": { "type": "number" },
+        "contributing_frames": { "type": "array", "items": { "type": "integer" } },
+        "mask_method": { "type": "string" }
+      }
+    },
+    "concealed_flag": {
+      "type": "object",
+      "required": ["rule_id", "inferred", "probability"],
+      "properties": {
+        "rule_id": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "inferred": { "type": "string" },
+        "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": { "type": "string" },
+        "source": { "type": "string" },
+        "triggered_by": { "type": "string" }
+      }
+    },
+    "line_item": {
+      "type": "object",
+      "required": ["code", "action", "quantity", "unit", "rule_id"],
+      "properties": {
+        "code": { "type": "string" },
+        "description": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["remove", "replace", "clean", "treat", "seal", "detach_and_reset", "install", "operate", "monitor", "supply"]
+        },
+        "material": { "type": "string" },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "trade": { "type": "string" },
+        "surface_ref": { "type": "string" },
+        "room_id": { "type": ["integer", "null"] },
+        "rule_id": { "type": "string" },
+        "source": { "type": "string", "description": "The standard the rule cites." },
+        "basis": { "type": "string", "description": "How this quantity was derived, in words." },
+        "derived_from": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
