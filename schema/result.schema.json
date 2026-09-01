@@ -163,8 +163,7 @@
             { "type": "null" }
           ]
         },
-        "measurement_conventions": { "type": ["object", "null"] },
-        "warnings": { "type": "array", "items": { "type": "string" } }
+        "measurement_conventions": { "type": ["object", "null"] }
       }
     }
   },
