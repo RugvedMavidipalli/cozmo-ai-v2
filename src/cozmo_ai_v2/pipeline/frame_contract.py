@@ -52,7 +52,12 @@ class FrameProvenance:
     depth_resolution: tuple[int, int]
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        # JSON Schema distinguishes Python tuples from JSON arrays even
+        # though ``json.dumps`` would serialize both alike.  Keep the public
+        # provenance contract schema-valid before validation/export.
+        payload["depth_resolution"] = list(self.depth_resolution)
+        return payload
 
 
 @dataclass(frozen=True)

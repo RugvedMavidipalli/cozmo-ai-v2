@@ -83,6 +83,7 @@ def test_contract_uses_qc_dense_depth_and_rgb_intrinsics(stray_capture, tmp_path
     assert report["contract_parameters"]["max_depth_m"] == 4.0
     assert report["contract_parameters"]["min_confidence"] == 1
     assert report["registration_alignment"]["dense_depth"]["shape_mismatch"] == "reject_unless_manifest_declared_scale"
+    assert report["frame_provenance"][0]["depth_resolution"] == [64, 48]
 
 
 def test_contract_uses_manifest_declared_scaled_dense_rgb(stray_capture, tmp_path):
