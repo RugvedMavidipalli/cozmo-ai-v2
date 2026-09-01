@@ -25,6 +25,22 @@ class DenseDepthResult:
     qc_mask: np.ndarray | None = None
 
 
+def _scaled_color(
+    color: np.ndarray,
+    output_scale: float,
+) -> tuple[np.ndarray, tuple[float, float]]:
+    """Return an aspect-preserving RGB raster and its realised xy scale."""
+    if not np.isfinite(output_scale) or not 0.0 < output_scale <= 1.0:
+        raise ValueError(f"output_scale must be finite and in (0, 1], got {output_scale}")
+    height, width = color.shape[:2]
+    scaled_width = max(1, round(width * output_scale))
+    scaled_height = max(1, round(height * output_scale))
+    scale = (scaled_width / width, scaled_height / height)
+    if scale == (1.0, 1.0):
+        return color, scale
+    return cv2.resize(color, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA), scale
+
+
 def densify_frame(
     model: DepthModel,
     color: np.ndarray,
@@ -35,8 +51,10 @@ def densify_frame(
     max_depth: float = 8.0,
     guide_radius: int = 20,
     guide_eps: float = 100.0,
+    output_scale: float = 1.0,
 ) -> DenseDepthResult:
-    mono_fullres = model.predict(color, fx)
+    output_color, (scale_x, _scale_y) = _scaled_color(color, output_scale)
+    mono_fullres = model.predict(output_color, fx * scale_x)
 
     lidar_h, lidar_w = lidar_depth_m.shape
     mono_at_lidar_res = cv2.resize(mono_fullres, (lidar_w, lidar_h), interpolation=cv2.INTER_AREA)
@@ -45,7 +63,7 @@ def densify_frame(
     corrected_mono_fullres = fit.scale * mono_fullres + fit.shift
 
     fusion = fuse_local_residual(
-        color, corrected_mono_fullres, lidar_depth_m, confidence,
+        output_color, corrected_mono_fullres, lidar_depth_m, confidence,
         min_confidence, max_depth, guide_radius, guide_eps,
     )
 
@@ -70,11 +88,14 @@ def densify_capture(
     guide_eps: float = 100.0,
     min_qc_coverage: float = 0.25,
     max_qc_rms_m: float = 0.25,
+    output_scale: float = 1.0,
 ) -> None:
     if not 0.0 <= min_qc_coverage <= 1.0:
         raise ValueError(f"min_qc_coverage must be in [0, 1], got {min_qc_coverage}")
     if max_qc_rms_m < 0.0:
         raise ValueError(f"max_qc_rms_m must be non-negative, got {max_qc_rms_m}")
+    if not np.isfinite(output_scale) or not 0.0 < output_scale <= 1.0:
+        raise ValueError(f"output_scale must be finite and in (0, 1], got {output_scale}")
     matrix = parse_camera_matrix(capture.camera_matrix_path)
     fx = extract_calibration_4(matrix)[0]
 
@@ -93,10 +114,11 @@ def densify_capture(
         sidecar_timestamps=capture.sidecar_timestamps,
     )
     for frame in iter_capture_frames(capture, indices, availability=availability):
+        _output_color, rgb_scale = _scaled_color(frame.color, output_scale)
         try:
             result = densify_frame(
                 model, frame.color, fx, frame.depth_m, frame.confidence,
-                min_confidence, max_depth, guide_radius, guide_eps,
+                min_confidence, max_depth, guide_radius, guide_eps, output_scale,
             )
         except AlignmentError as exc:
             # A single bad frame must not invalidate a whole capture.  Its
@@ -156,8 +178,10 @@ def densify_capture(
             "registration_alignment": {
                 "mono_to_lidar": "INTER_AREA_resize",
                 "lidar_to_rgb": "INTER_NEAREST_resize",
-                "dense_output": "native_rgb",
+                "dense_output": "native_rgb" if rgb_scale == (1.0, 1.0) else "scaled_rgb",
             },
+            "source_rgb_resolution": [int(frame.color.shape[1]), int(frame.color.shape[0])],
+            "dense_rgb_scale": [float(rgb_scale[0]), float(rgb_scale[1])],
             "depth_resolution": [int(result.dense_depth_m.shape[1]), int(result.dense_depth_m.shape[0])],
             "scale": result.fit.scale,
             "shift": result.fit.shift,
@@ -189,9 +213,10 @@ def densify_capture(
         "registration_alignment": {
             "mono_to_lidar": "INTER_AREA_resize",
             "lidar_to_rgb": "INTER_NEAREST_resize",
-            "dense_output": "native_rgb",
+            "dense_output": "native_rgb" if output_scale == 1.0 else "scaled_rgb",
             "confidence_to_rgb": "INTER_NEAREST_resize",
         },
+        "dense_rgb_scale": [float(output_scale), float(output_scale)],
         "filter_policy": {
             "confidence_threshold": min_confidence,
             "max_depth_m": max_depth,

@@ -102,6 +102,24 @@ def test_densify_capture_records_alignment_rejection_and_continues(stray_capture
     assert not (output_dir / "dense_depth" / "000001.png").exists()
 
 
+def test_densify_capture_can_emit_manifest_declared_scaled_rgb(stray_capture, tmp_path):
+    capture = require_lidar_capture(stray_capture)
+    depth = cv2.imread(str(stray_capture / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    model = FakeDepthModel([cv2.resize(_full_res_ramp(depth), (32, 24), interpolation=cv2.INTER_AREA)])
+    output_dir = tmp_path / "out"
+
+    densify_capture(capture, model, output_dir, indices=[0], output_scale=0.5)
+
+    manifest = json.loads((output_dir / "densify_manifest.json").read_text())
+    assert manifest["dense_rgb_scale"] == [0.5, 0.5]
+    report = manifest["frames"][0]
+    assert report["registration_alignment"]["dense_output"] == "scaled_rgb"
+    assert report["source_rgb_resolution"] == [VIDEO_WIDTH, VIDEO_HEIGHT]
+    assert report["depth_resolution"] == [32, 24]
+    dense = cv2.imread(str(output_dir / "dense_depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    assert dense.shape == (24, 32)
+
+
 def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path, capsys):
     exit_code = run_densify(
         lidar_stray_scanner_dataset, tmp_path / "out", "metric3d_vit_small",

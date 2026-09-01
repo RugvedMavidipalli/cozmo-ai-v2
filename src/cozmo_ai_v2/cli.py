@@ -75,6 +75,7 @@ def run_densify(
     repository: Path | None = None,
     device: str | None = None,
     stride: int = 1,
+    output_scale: float = 1.0,
 ) -> int:
     try:
         capture = require_lidar_capture(input_path)
@@ -98,7 +99,10 @@ def run_densify(
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        densify_capture(capture, model, output_dir, indices, min_confidence, max_depth, guide_radius, guide_eps)
+        densify_capture(
+            capture, model, output_dir, indices, min_confidence, max_depth,
+            guide_radius, guide_eps, output_scale=output_scale,
+        )
     except (AlignmentError, LidarCaptureError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -264,6 +268,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="process every Nth LiDAR/RGB frame; use the same stride for downstream fusion",
     )
     densify.add_argument(
+        "--output-scale", type=float, default=1.0,
+        help=(
+            "aspect-preserving RGB/dense-depth scale in (0, 1]; recorded in the "
+            "manifest so downstream intrinsics are scaled consistently"
+        ),
+    )
+    densify.add_argument(
         "--weights", type=Path, default=None,
         help="local Metric3D v2 checkpoint; no weights are downloaded automatically",
     )
@@ -335,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.output_dir, args.variant,
             args.min_confidence, args.max_depth, args.guide_radius, args.guide_eps,
             args.weights, args.metric3d_repository, args.device,
-            args.stride,
+            args.stride, args.output_scale,
         )
     if args.command == "validate-scale":
         import json
