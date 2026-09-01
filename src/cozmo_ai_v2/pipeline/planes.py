@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .geometry import GravityEstimate
+
+if TYPE_CHECKING:
+    from .geometry_diagnostics import GeometryDiagnostics
 
 
 @dataclass
@@ -491,6 +495,7 @@ def extract_walls(
     point_spacing: float = 0.02,
     min_coverage: float = 0.06,
     quarantine_off_axis: bool = True,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[WallSegment]:
     """Finds straight wall lines in a cloud of plan-space points, one wall at a time.
 
@@ -545,8 +550,17 @@ def extract_walls(
     if len(plan_points) != len(heights):
         raise ValueError("plan_points and heights must contain the same number of rows")
     if plan_points.size == 0:
+        if diagnostics is not None:
+            diagnostics.set_wall_stage("raw", [])
         return []
     finite = np.isfinite(plan_points).all(axis=1) & np.isfinite(heights)
+    if diagnostics is not None and int((~finite).sum()):
+        diagnostics.record_drop_summary(
+            "non-finite-input",
+            int((~finite).sum()),
+            stage="raw",
+            provenance="extract_walls.finite-input-gate",
+        )
     plan_points, heights = plan_points[finite], heights[finite]
     # RANSAC has a seeded generator, but its tie behaviour still depends on
     # input order.  Canonical ordering makes the complete wall result stable
@@ -564,6 +578,13 @@ def extract_walls(
             subset, inlier_threshold, rng, angle_tolerance_degrees
         )
         if inlier_mask.sum() < min_inliers:
+            if diagnostics is not None:
+                diagnostics.record_drop_summary(
+                    "insufficient-ransac-support",
+                    1,
+                    stage="raw",
+                    provenance="extract_walls.ransac",
+                )
             break
 
         # RANSAC's line is just a rough guess from two sample points, so
@@ -587,9 +608,23 @@ def extract_walls(
         for lo, hi, count in _contiguous_runs(np.sort(projection), gap=0.35):
             run_length = hi - lo
             if run_length < min_length:
+                if diagnostics is not None:
+                    diagnostics.record_drop_summary(
+                        "run-too-short",
+                        1,
+                        stage="raw",
+                        provenance="extract_walls.contiguous_runs",
+                    )
                 continue
             expected = (run_length / point_spacing) * (band_height / point_spacing)
             if count < min_coverage * expected:
+                if diagnostics is not None:
+                    diagnostics.record_drop_summary(
+                        "insufficient-coverage",
+                        1,
+                        stage="raw",
+                        provenance="extract_walls.coverage_gate",
+                    )
                 continue
             base = normal * offset
             wall = WallSegment(
@@ -609,12 +644,30 @@ def extract_walls(
                 )
             if is_off_axis:
                 wall.tags.append("off-axis")
+                if diagnostics is not None:
+                    diagnostics.record_wall_event(
+                        wall,
+                        stage="raw",
+                        action="quarantine",
+                        reason="off-axis",
+                        provenance="extract_walls.manhattan_gate",
+                    )
+            elif diagnostics is not None:
+                diagnostics.record_wall_event(
+                    wall,
+                    stage="raw",
+                    action="accepted",
+                    reason="ransac-fit",
+                    provenance="extract_walls",
+                )
             walls.append(wall)
         remaining = remaining[~inlier_mask]
 
     walls.sort(key=_wall_output_rank)
     for position, wall in enumerate(walls):
         wall.index = position
+    if diagnostics is not None:
+        diagnostics.set_wall_stage("raw", walls)
     return walls
 
 
@@ -746,6 +799,7 @@ def merge_collinear(
     min_overlap: float = 0.30,
     angle_tolerance_degrees: float = 15.0,
     gap_tolerance: float = 0.4,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[WallSegment]:
     """Cleans up duplicate and near-duplicate walls left over from wall detection.
 
@@ -812,8 +866,17 @@ def merge_collinear(
             # Keep the diagnostic object out of the topology candidates.  A
             # non-Manhattan line must never win a duplicate merge and move a
             # valid wall off its building axis.
+            if diagnostics is not None:
+                diagnostics.record_wall_event(
+                    wall,
+                    stage="quarantine",
+                    action="quarantine",
+                    reason=_quarantine_reason(wall),
+                    provenance="merge_collinear.input",
+                )
             kept.append(wall)
             continue
+        matched = False
         for target in kept:
             if target.quarantined:
                 continue
@@ -838,21 +901,52 @@ def merge_collinear(
                 if lo > target.length + gap_tolerance or hi < -gap_tolerance:
                     continue
                 _absorb(target, wall, lo, hi)
+                matched = True
+                if diagnostics is not None:
+                    diagnostics.record_wall_event(
+                        wall,
+                        stage="merged",
+                        action="drop",
+                        reason="duplicate-wall",
+                        provenance="merge_collinear.duplicate_suppression",
+                        related_walls=[target],
+                    )
                 break
             if overlap >= min_overlap:
                 # Further away but still overlapping -- likely clutter
                 # sitting in front of the real wall, not the wall itself.
                 # Tag it and keep the two surfaces separate.
                 target.tags.append("clutter-in-front")
+                matched = True
+                if diagnostics is not None:
+                    diagnostics.record_wall_event(
+                        wall,
+                        stage="merged",
+                        action="drop",
+                        reason="clutter-in-front",
+                        provenance="merge_collinear.parallel_surface",
+                        related_walls=[target],
+                    )
                 break
-        else:
+        if not matched:
             kept.append(wall)
 
     kept.sort(key=_wall_output_rank)
     for position, wall in enumerate(kept):
         wall.index = position
         wall.tags = sorted(set(wall.tags))
+    if diagnostics is not None:
+        diagnostics.set_wall_stage("merged", kept)
     return kept
+
+
+def _quarantine_reason(wall: WallSegment) -> str:
+    """Choose a stable primary reason from diagnostic wall tags."""
+    tags = set(getattr(wall, "tags", []))
+    for reason in ("off-axis", "invalid-geometry", "degenerate"):
+        if reason in tags:
+            return reason
+    return "quarantined"
 
 
 def _wall_geometry_key(wall: WallSegment) -> tuple[float, ...]:
@@ -998,6 +1092,7 @@ def filter_occluded_walls(
     min_points: int = 200,
     min_blocker_length: float = 1.0,
     occlusion_fraction: float = 0.6,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> tuple[list[WallSegment], int]:
     """Throws out candidate walls that could only have been seen by looking straight through another wall.
 
@@ -1056,6 +1151,16 @@ def filter_occluded_walls(
     ordered = sorted((w for w in walls if not w.quarantined), key=_wall_rank)
     dropped = sum(1 for wall in walls if wall.quarantined)
     kept: list[WallSegment] = []
+    if diagnostics is not None:
+        for wall in walls:
+            if wall.quarantined:
+                diagnostics.record_wall_event(
+                    wall,
+                    stage="quarantine",
+                    action="quarantine",
+                    reason=_quarantine_reason(wall),
+                    provenance="filter_occluded_walls.input",
+                )
 
     for wall in ordered:
         # Only stronger, longer walls are trusted enough to act as
@@ -1096,12 +1201,23 @@ def filter_occluded_walls(
 
         if float(blocked.mean()) >= occlusion_fraction:
             dropped += 1
+            if diagnostics is not None:
+                diagnostics.record_wall_event(
+                    wall,
+                    stage="occlusion",
+                    action="drop",
+                    reason="occlusion-inconsistent",
+                    provenance="filter_occluded_walls.ray_blocking",
+                    related_walls=blockers,
+                )
             continue
         kept.append(wall)
 
     kept.sort(key=_wall_output_rank)
     for position, wall in enumerate(kept):
         wall.index = position
+    if diagnostics is not None:
+        diagnostics.set_wall_stage("occlusion", kept)
     return kept, dropped
 
 
@@ -1145,6 +1261,7 @@ def resolve_crossings(
     walls: list[WallSegment],
     interior_margin: float = 0.15,
     max_trim: float = 0.45,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[WallSegment]:
     """Cleans up cases where two walls appear to cut through each other partway along their length.
 
@@ -1187,6 +1304,15 @@ def resolve_crossings(
         order and length of the returned list may differ from `walls`,
         since walls can be removed.
     """
+    for wall in walls:
+        if wall.quarantined and diagnostics is not None:
+            diagnostics.record_wall_event(
+                wall,
+                stage="quarantine",
+                action="quarantine",
+                reason=_quarantine_reason(wall),
+                provenance="resolve_crossings.input",
+            )
     walls = [wall for wall in walls if not wall.quarantined]
     changed = True
     while changed:
@@ -1225,11 +1351,29 @@ def resolve_crossings(
                             min(victim.observed_span[1], victim.length),
                         )
                     victim.tags.append("trimmed-at-junction")
+                    if diagnostics is not None:
+                        diagnostics.record_wall_event(
+                            victim,
+                            stage="crossing",
+                            action="trim",
+                            reason="t-junction-overshoot",
+                            provenance="resolve_crossings",
+                            related_walls=[a if victim is b else b],
+                        )
                 else:
                     # Too much overlap to be a simple overshoot -- treat
                     # the weaker-supported wall as spurious and drop it.
                     weaker = a if a.inlier_count < b.inlier_count else b
                     walls.remove(weaker)
+                    if diagnostics is not None:
+                        diagnostics.record_wall_event(
+                            weaker,
+                            stage="crossing",
+                            action="drop",
+                            reason="weaker-crossing-wall",
+                            provenance="resolve_crossings",
+                            related_walls=[a if weaker is b else b],
+                        )
                 changed = True
                 break
             if changed:
@@ -1237,6 +1381,8 @@ def resolve_crossings(
 
     for wall in walls:
         wall.tags = sorted(set(wall.tags))
+    if diagnostics is not None:
+        diagnostics.set_wall_stage("crossing", walls)
     return walls
 
 
@@ -1244,6 +1390,7 @@ def snap_corners(
     walls: list[WallSegment],
     max_extension: float = 0.45,
     max_trim: float = 0.30,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> int:
     """Nudges wall endpoints so that walls meeting at a corner actually touch at a clean point.
 
@@ -1322,12 +1469,24 @@ def snap_corners(
                 min(wall.observed_span[1], wall.length),
             )
         wall.tags = sorted(set(wall.tags) | {f"corner-{end_name}"})
+        if diagnostics is not None:
+            diagnostics.record_wall_event(
+                wall,
+                stage="crossing",
+                action="trim",
+                reason="corner-snap",
+                provenance="snap_corners.line_intersection",
+                extra={"endpoint": end_name},
+            )
         snapped += 1
     return snapped
 
 
 def snap_to_frame(
-    walls: list[WallSegment], frame: HorizontalFrame, tolerance_degrees: float = 8.0
+    walls: list[WallSegment],
+    frame: HorizontalFrame,
+    tolerance_degrees: float = 8.0,
+    diagnostics: GeometryDiagnostics | None = None,
 ) -> list[WallSegment]:
     """Straightens out walls that are already close to square with the building, so they're exactly square.
 
@@ -1363,6 +1522,14 @@ def snap_to_frame(
         if abs(np.degrees(angle - snapped)) > tolerance_degrees:
             wall.tags.append("off-axis")
             wall.quarantined = True
+            if diagnostics is not None:
+                diagnostics.record_wall_event(
+                    wall,
+                    stage="quarantine",
+                    action="quarantine",
+                    reason="off-axis",
+                    provenance="snap_to_frame.manhattan_gate",
+                )
             continue
         normal = _nearest_manhattan_normal(wall.normal)
         offset = float(normal @ wall.midpoint)

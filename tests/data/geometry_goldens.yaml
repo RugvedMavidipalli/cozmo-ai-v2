@@ -1,0 +1,18 @@
+# Optional recording-level assertions.  The media is intentionally not part
+# of the repository; set COZMO_RECORDING_RESULTS to a directory containing
+# <recording>/result.json and run with COZMO_RECORDING_REGRESSION=1.
+recordings-2:
+  description: "Annotated capture expected to contain approximately three rectilinear rooms."
+  expected_room_count: 3
+  room_count_tolerance: 1
+  require_room_polygons: true
+  min_total_area_m2: 10.0
+  max_total_area_m2: 200.0
+  min_wall_assignment_fraction: 0.50
+  max_overlap_fraction: 0.10
+
+# Keep this entry intentionally annotation-light until a recordings-1
+# topology/area/wall-assignment annotation is supplied by the dataset owner.
+recordings-1:
+  description: "Optional recordings-1 annotation entry."
+
