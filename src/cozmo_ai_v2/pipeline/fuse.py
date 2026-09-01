@@ -48,6 +48,9 @@ def fuse(
     dense_depth_dir: str | None = None,
     densify_manifest: str | None = None,
     pose_source: str | None = None,
+    depth_source: str = "auto",
+    frame_association: str = "pts",
+    pts_tolerance_s: float | None = None,
 ) -> Reconstruction:
     """Merges a set of a capture's depth frames into one mesh and point
     cloud, using TSDF fusion.
@@ -73,11 +76,22 @@ def fuse(
             `voxel_size * 4` if not given.
         min_confidence: The lowest depth-confidence level to keep.
         max_depth: The furthest depth value to include, in metres.
+        depth_source: ``auto`` uses QC-approved dense depth and falls back to
+            same-index raw LiDAR; ``dense`` and ``raw`` force an ablation
+            source.
+        frame_association: ``pts`` associates decoded frames to sidecars by
+            presentation timestamp; ``index`` selects the legacy identity
+            mapping.
+        pts_tolerance_s: Optional maximum timestamp distance for PTS matching.
 
     Returns:
         A `Reconstruction` holding the fused mesh, the fused point cloud,
         and how many frames actually made it into the volume.
     """
+    if voxel_size <= 0 or not np.isfinite(voxel_size):
+        raise ValueError(f"voxel_size must be a positive finite number, got {voxel_size}")
+    if sdf_trunc is not None and (sdf_trunc <= 0 or not np.isfinite(sdf_trunc)):
+        raise ValueError(f"sdf_trunc must be a positive finite number, got {sdf_trunc}")
     if frame_contract is None:
         frame_contract = build_frame_contract(
             bundle,
@@ -88,11 +102,18 @@ def fuse(
             densify_manifest=densify_manifest,
             min_confidence=min_confidence,
             max_depth=max_depth,
+            depth_source=depth_source,
+            frame_association=frame_association,
+            pts_tolerance_s=pts_tolerance_s,
         )
 
+    effective_max_depth = (
+        frame_contract.max_depth if frame_contract is not None else max_depth
+    )
+    effective_sdf_trunc = sdf_trunc if sdf_trunc is not None else voxel_size * 4
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size,
-        sdf_trunc=sdf_trunc if sdf_trunc is not None else voxel_size * 4,
+        sdf_trunc=effective_sdf_trunc,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
     count = 0
@@ -111,7 +132,7 @@ def fuse(
             o3d.geometry.Image(np.ascontiguousarray(frame.color)),
             o3d.geometry.Image(np.ascontiguousarray(frame.depth)),
             depth_scale=1.0,
-            depth_trunc=max_depth,
+            depth_trunc=effective_max_depth,
             convert_rgb_to_intensity=False,
         )
         # TSDF fusion wants the world-to-camera transform for each frame,
@@ -127,6 +148,16 @@ def fuse(
     report = frame_contract.report()
     report["frame_count"] = count
     report["resolutions"] = [list(size) for size in sorted(resolutions)]
+    report["tsdf_parameters"] = {
+        "voxel_size_m": float(voxel_size),
+        "sdf_trunc_m": float(effective_sdf_trunc),
+        "sdf_trunc_explicit": sdf_trunc is not None,
+        "depth_scale": 1.0,
+        "depth_unit": "m",
+        "depth_trunc_m": float(effective_max_depth),
+        "color_type": "RGB8",
+        "extrinsic_convention": "inverse_c2w_opencv_to_world_to_camera",
+    }
     return Reconstruction(
         mesh=mesh,
         cloud=cloud,

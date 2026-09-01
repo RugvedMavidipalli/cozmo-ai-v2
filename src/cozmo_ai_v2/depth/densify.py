@@ -9,7 +9,8 @@ import numpy as np
 
 from ..camera import extract_calibration_4, parse_camera_matrix
 from .align import ScaleShiftFit, fit_scale_shift
-from .capture import LidarCaptureInput, iter_capture_frames
+from .capture import LidarCaptureInput, _sidecar_frame_count, iter_capture_frames
+from ..pipeline.ingest import VideoAvailability
 from .fusion import FusionResult, fuse_local_residual
 from .model import DepthModel
 
@@ -85,7 +86,13 @@ def densify_capture(
     dense_qc_dir.mkdir(parents=True, exist_ok=True)
 
     frame_reports = []
-    for frame in iter_capture_frames(capture, indices):
+    expected_frame_count = _sidecar_frame_count(capture)
+    availability = VideoAvailability(
+        expected_frame_count=expected_frame_count,
+        association_mode=("pts" if capture.sidecar_timestamps is not None else "index"),
+        sidecar_timestamps=capture.sidecar_timestamps,
+    )
+    for frame in iter_capture_frames(capture, indices, availability=availability):
         try:
             result = densify_frame(
                 model, frame.color, fx, frame.depth_m, frame.confidence,
@@ -144,6 +151,13 @@ def densify_capture(
             "confidence_path": str(confidence_path.relative_to(output_dir)),
             "qc_mask_path": str(qc_path.relative_to(output_dir)),
             "depth_unit": "mm",
+            "input_depth_unit": "m",
+            "output_depth_unit": "mm",
+            "registration_alignment": {
+                "mono_to_lidar": "INTER_AREA_resize",
+                "lidar_to_rgb": "INTER_NEAREST_resize",
+                "dense_output": "native_rgb",
+            },
             "depth_resolution": [int(result.dense_depth_m.shape[1]), int(result.dense_depth_m.shape[0])],
             "scale": result.fit.scale,
             "shift": result.fit.shift,
@@ -156,9 +170,34 @@ def densify_capture(
     manifest = {
         "capture": str(capture.root),
         "frame_count": len(frame_reports),
+        "video_availability": availability.to_dict(),
+        "model": {
+            "adapter": type(model).__name__,
+            "variant": getattr(model, "variant", None),
+            "device": getattr(model, "device", None),
+            "weights_path": getattr(model, "weights_path", None),
+            "repository": getattr(model, "repository", None),
+        },
         "min_confidence": min_confidence,
         "max_depth": max_depth,
         "depth_provenance": "metric3d_v2_scale_shift_lidar_residual",
+        "units": {
+            "lidar_input": "m",
+            "model_canonical_output": "m",
+            "dense_raster_output": "mm",
+        },
+        "registration_alignment": {
+            "mono_to_lidar": "INTER_AREA_resize",
+            "lidar_to_rgb": "INTER_NEAREST_resize",
+            "dense_output": "native_rgb",
+            "confidence_to_rgb": "INTER_NEAREST_resize",
+        },
+        "filter_policy": {
+            "confidence_threshold": min_confidence,
+            "max_depth_m": max_depth,
+            "max_depth_inclusive": True,
+            "invalid_depth_action": "zero",
+        },
         "qc_policy": {
             "min_qc_coverage": min_qc_coverage,
             "max_qc_rms_m": max_qc_rms_m,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -74,6 +74,28 @@ class Frame:
 
 
 @dataclass
+class FrameAssociation:
+    """Association evidence for one successfully decoded video frame."""
+
+    video_index: int
+    sidecar_index: int | None
+    pts_s: float | None
+    sidecar_timestamp_s: float | None
+    delta_s: float | None
+    method: str
+
+    def to_dict(self) -> dict:
+        return {
+            "video_index": self.video_index,
+            "sidecar_index": self.sidecar_index,
+            "pts_s": self.pts_s,
+            "sidecar_timestamp_s": self.sidecar_timestamp_s,
+            "delta_s": self.delta_s,
+            "method": self.method,
+        }
+
+
+@dataclass
 class VideoAvailability:
     """Deterministic availability evidence for a sequential video walk.
 
@@ -90,6 +112,140 @@ class VideoAvailability:
     missing_indices: tuple[int, ...] = ()
     terminal_decode_missing: bool = False
     decode_complete: bool = False
+    association_mode: str = "index"
+    pts_tolerance_s: float | None = None
+    sidecar_timestamps: np.ndarray | None = field(default=None, repr=False, compare=False)
+    associations: list[FrameAssociation] = field(default_factory=list)
+    _video_pts_origin_s: float | None = field(default=None, repr=False, compare=False)
+    _last_pts_s: float | None = field(default=None, repr=False, compare=False)
+    _pts_usable: bool | None = field(default=None, repr=False, compare=False)
+    _associated_video_indices: set[int] = field(default_factory=set, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.expected_frame_count < 0:
+            raise ValueError("expected_frame_count must be non-negative")
+        if self.association_mode not in {"index", "pts"}:
+            raise ValueError(
+                f"association_mode must be 'index' or 'pts', got {self.association_mode!r}"
+            )
+        if self.sidecar_timestamps is not None:
+            timestamps = np.asarray(self.sidecar_timestamps, dtype=np.float64).reshape(-1)
+            if (
+                len(timestamps) != self.expected_frame_count
+                or not np.isfinite(timestamps).all()
+                or (len(timestamps) > 1 and np.any(np.diff(timestamps) < 0))
+            ):
+                self.sidecar_timestamps = None
+            else:
+                self.sidecar_timestamps = timestamps
+                if self.pts_tolerance_s is None and len(timestamps) > 1:
+                    intervals = np.diff(timestamps)
+                    positive = intervals[intervals > 0]
+                    if len(positive):
+                        self.pts_tolerance_s = max(float(np.median(positive) * 0.75), 0.05)
+        if self.association_mode == "pts" and self.sidecar_timestamps is None:
+            self._pts_usable = False
+        if self.pts_tolerance_s is not None and self.pts_tolerance_s < 0:
+            raise ValueError("pts_tolerance_s must be non-negative")
+
+    def associate(self, video_index: int, pts_ms: float | None) -> FrameAssociation:
+        """Associate a decoded video frame to a stable sidecar index.
+
+        OpenCV exposes presentation time through ``CAP_PROP_POS_MSEC`` after
+        each successful read. Both clocks are normalised to their first
+        sample, so absolute timestamp epochs do not matter. A PTS match must
+        be monotonic and one-to-one; otherwise the frame is recorded as
+        unmatched rather than shifting a neighbouring sidecar index.
+        """
+        for association in self.associations:
+            if association.video_index == video_index:
+                return association
+
+        raw_pts = float(pts_ms) if pts_ms is not None else float("nan")
+        pts_s = raw_pts / 1000.0 if np.isfinite(raw_pts) else None
+        sidecar_index: int | None = None
+        sidecar_timestamp_s: float | None = None
+        delta_s: float | None = None
+        method = "index"
+
+        timestamps = self.sidecar_timestamps
+        if self.association_mode == "pts":
+            if pts_s is None:
+                self._pts_usable = False
+            elif self._pts_usable is not False:
+                if self._last_pts_s is not None and pts_s <= self._last_pts_s:
+                    # Some codecs expose a constant or non-monotonic
+                    # CAP_PROP_POS_MSEC. Use the safe identity mapping for
+                    # the complete stream instead of dropping or shifting
+                    # every frame after the first bad timestamp.
+                    self._pts_usable = False
+                else:
+                    self._pts_usable = True
+                self._last_pts_s = pts_s
+        if (
+            self.association_mode == "pts"
+            and self._pts_usable is not False
+            and timestamps is not None
+            and pts_s is not None
+            and len(timestamps)
+        ):
+            if self._video_pts_origin_s is None:
+                self._video_pts_origin_s = pts_s
+            relative_pts = pts_s - self._video_pts_origin_s
+            relative_sidecar = timestamps - timestamps[0]
+            candidate = int(np.searchsorted(relative_sidecar, relative_pts, side="left"))
+            candidates = [candidate]
+            if candidate > 0:
+                candidates.append(candidate - 1)
+            candidate = min(
+                (value for value in candidates if 0 <= value < len(relative_sidecar)),
+                key=lambda value: abs(float(relative_sidecar[value] - relative_pts)),
+                default=-1,
+            )
+            if candidate >= 0:
+                delta_s = abs(float(relative_sidecar[candidate] - relative_pts))
+                tolerance = self.pts_tolerance_s
+                previous = {
+                    association.sidecar_index
+                    for association in self.associations
+                    if association.sidecar_index is not None
+                }
+                if (
+                    (tolerance is None or delta_s <= tolerance)
+                    and candidate not in previous
+                    and (not previous or candidate > max(previous))
+                ):
+                    sidecar_index = candidate
+                    sidecar_timestamp_s = float(relative_sidecar[candidate])
+                    method = "pts_nearest"
+                else:
+                    method = "pts_unmatched"
+
+        if sidecar_index is None and method == "index":
+            if video_index < self.expected_frame_count:
+                sidecar_index = video_index
+            method = "index_fallback" if self.association_mode == "pts" else "index"
+        elif self.association_mode == "pts" and self._pts_usable is False:
+            if video_index < self.expected_frame_count:
+                sidecar_index = video_index
+            method = "index_fallback"
+
+        association = FrameAssociation(
+            video_index=video_index,
+            sidecar_index=sidecar_index,
+            pts_s=(
+                None
+                if pts_s is None or self._video_pts_origin_s is None
+                else float(pts_s - self._video_pts_origin_s)
+            ),
+            sidecar_timestamp_s=sidecar_timestamp_s,
+            delta_s=delta_s,
+            method=method,
+        )
+        if video_index not in self._associated_video_indices:
+            self.associations.append(association)
+            self._associated_video_indices.add(video_index)
+        return association
 
     @property
     def sidecar_frame_count(self) -> int:
@@ -114,6 +270,23 @@ class VideoAvailability:
             "reported_shortfall": self.reported_shortfall,
             "terminal_decode_missing": self.terminal_decode_missing,
             "decode_complete": self.decode_complete,
+            "association_mode": self.association_mode,
+            "pts_source": (
+                "opencv_cap_pos_msec"
+                if any(association.pts_s is not None for association in self.associations)
+                else None
+            ),
+            "pts_status": (
+                "used"
+                if self._pts_usable is True
+                else "not_evaluated"
+                if self._pts_usable is None and self.association_mode == "pts"
+                else "index_fallback"
+                if self.association_mode == "pts"
+                else "not_requested"
+            ),
+            "pts_tolerance_s": self.pts_tolerance_s,
+            "associations": [association.to_dict() for association in self.associations],
         }
 
 
@@ -780,6 +953,11 @@ def iter_raw_frames(
         else:
             wanted_set = set(wanted)
             last = wanted[-1]
+        # PTS can associate a video position with a sidecar index that is not
+        # numerically identical. Decode the complete stream in that mode so
+        # the requested sidecar index cannot be missed by an index cutoff.
+        if availability is not None and availability.association_mode == "pts":
+            last = None
 
     video = cv2.VideoCapture(str(root / "rgb.mp4"))
     if not video.isOpened():
@@ -798,15 +976,25 @@ def iter_raw_frames(
             ok, bgr = video.read()
             if not ok:
                 break
-            if wanted_set is None or index in wanted_set:
+            sidecar_index = index
+            association = None
+            if availability is not None:
+                association = availability.associate(
+                    index, video.get(cv2.CAP_PROP_POS_MSEC)
+                )
+                sidecar_index = association.sidecar_index
+            if sidecar_index is not None and (
+                wanted_set is None or sidecar_index in wanted_set
+            ):
                 yield (
-                    index,
+                    sidecar_index,
                     bgr,
                     cv2.imread(
-                        str(root / "depth" / f"{index:06d}.png"), cv2.IMREAD_UNCHANGED
+                        str(root / "depth" / f"{sidecar_index:06d}.png"),
+                        cv2.IMREAD_UNCHANGED,
                     ),
                     cv2.imread(
-                        str(root / "confidence" / f"{index:06d}.png"),
+                        str(root / "confidence" / f"{sidecar_index:06d}.png"),
                         cv2.IMREAD_UNCHANGED,
                     ),
                 )
@@ -820,14 +1008,29 @@ def iter_raw_frames(
                 ok, _ = video.read()
                 if not ok:
                     break
+                availability.associate(index, video.get(cv2.CAP_PROP_POS_MSEC))
                 index += 1
 
             availability.decoded_frame_count = index
+            associated = {
+                association.sidecar_index
+                for association in availability.associations
+                if association.sidecar_index is not None
+            }
             availability.missing_indices = tuple(
-                range(index, availability.expected_frame_count)
+                sidecar_index
+                for sidecar_index in range(availability.expected_frame_count)
+                if sidecar_index not in associated
             )
             availability.terminal_decode_missing = bool(
-                availability.missing_indices or availability.reported_shortfall
+                availability.reported_shortfall
+                or (
+                    availability.expected_frame_count > 0
+                    and (
+                        not associated
+                        or max(associated) < availability.expected_frame_count - 1
+                    )
+                )
             )
             availability.decode_complete = True
     finally:

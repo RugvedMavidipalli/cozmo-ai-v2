@@ -165,14 +165,21 @@ def run(args: argparse.Namespace) -> int:
             densify_manifest=densify_manifest,
             min_confidence=args.min_confidence,
             max_depth=args.max_depth,
+            depth_source=getattr(args, "depth_source", "auto"),
+            frame_association=getattr(args, "frame_association", "pts"),
+            pts_tolerance_s=getattr(args, "pts_tolerance_s", None),
         )
 
     with timings.stage("fusion"):
         indices = np.arange(0, len(bundle), args.stride)
         reconstruction = fuse(
             bundle, indices, poses=poses, voxel_size=args.voxel,
+            sdf_trunc=getattr(args, "sdf_trunc", None),
             min_confidence=args.min_confidence, max_depth=args.max_depth,
             frame_contract=frame_contract,
+            depth_source=getattr(args, "depth_source", "auto"),
+            frame_association=getattr(args, "frame_association", "pts"),
+            pts_tolerance_s=getattr(args, "pts_tolerance_s", None),
         )
     cloud = reconstruction.cloud
     import open3d as o3d
@@ -870,8 +877,24 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--model", default="claude-opus-5")
     runner.add_argument("--stride", type=int, default=4)
     runner.add_argument("--voxel", type=float, default=0.02)
+    runner.add_argument(
+        "--sdf-trunc", type=float, default=None,
+        help="TSDF truncation distance in metres (defaults to 4 * --voxel)",
+    )
     runner.add_argument("--max-depth", type=float, default=3.5)
     runner.add_argument("--min-confidence", type=int, default=1)
+    runner.add_argument(
+        "--depth-source", choices=("auto", "dense", "raw"), default="auto",
+        help="use QC-approved dense depth, raw LiDAR, or auto dense-then-raw fallback",
+    )
+    runner.add_argument(
+        "--frame-association", choices=("pts", "index"), default="pts",
+        help="associate decoded RGB frames to sidecars by PTS (default) or identity index",
+    )
+    runner.add_argument(
+        "--pts-tolerance-s", type=float, default=None,
+        help="maximum sidecar/video timestamp distance for PTS association; defaults from sidecar cadence",
+    )
     runner.add_argument(
         "--dense-depth-dir", type=Path, default=None,
         help="Stage 4 dense_depth directory (must have a QC-approved manifest); "

@@ -77,8 +77,11 @@ All flags apply to `python -m pipeline run <capture> [flags]`.
 | `--model` | `claude-opus-5` | VLM model for damage detection |
 | `--stride` | `4` | Frame stride for the main fusion pass |
 | `--voxel` | `0.02` | TSDF voxel size, metres |
+| `--sdf-trunc` | `4 * --voxel` | TSDF truncation distance, metres |
 | `--max-depth` | `3.5` | Depth cutoff — the knee where ARKit depth starts reading systematically far, measured by `tools/depth_bias.py` |
 | `--min-confidence` | `1` | Minimum ARKit depth-confidence value to trust (0=low, 1=medium, 2=high) |
+| `--depth-source` | `auto` | Use QC-approved dense depth, raw LiDAR, or dense-then-raw fallback |
+| `--frame-association` | `pts` | Associate RGB frames to sidecars by normalized presentation timestamps or identity indices |
 | `--damage-frames` | `40` | Max keyframes sent to the VLM for damage detection |
 | `--min-views` | `2` | Minimum independent views required to accept a fused damage region |
 | `--min-detection-confidence` | `0.0` | Drop VLM detections (any class, including furniture) below this confidence before masking/fusion |

@@ -88,10 +88,18 @@
           "description": "Stage 4-to-5 depth/pose contract and deterministic frame decisions.",
           "properties": {
             "depth_sources": { "type": "array", "items": { "type": "string" } },
+            "depth_units": { "type": "array", "items": { "type": "string" } },
+            "depth_unit": { "type": "string" },
+            "confidence_threshold": { "type": "integer", "minimum": 0, "maximum": 2 },
+            "max_depth_m": { "type": "number", "exclusiveMinimum": 0 },
+            "registration_alignment": { "$ref": "#/$defs/registration_alignment" },
             "dense_depth_dir": { "type": ["string", "null"] },
             "densify_manifest": { "type": ["string", "null"] },
             "pose_source": { "type": "string" },
             "pose_path": { "type": ["string", "null"] },
+            "pose_convention": { "type": "string" },
+            "depth_source_mode": { "type": "string", "enum": ["auto", "dense", "raw"] },
+            "contract_parameters": { "$ref": "#/$defs/contract_parameters" },
             "requested_indices": { "type": "array", "items": { "type": "integer" } },
             "integrated_indices": { "type": "array", "items": { "type": "integer" } },
             "video_availability": {
@@ -107,7 +115,8 @@
             "resolutions": {
               "type": "array",
               "items": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
-            }
+            },
+            "tsdf_parameters": { "$ref": "#/$defs/tsdf_parameters" }
           }
         },
         "warnings": { "type": "array", "items": { "type": "string" } }
@@ -133,7 +142,8 @@
     "frame_provenance": {
       "type": "object",
       "required": [
-        "index", "depth_source", "confidence_source", "qc_source", "pose_source"
+        "index", "depth_source", "confidence_source", "qc_source", "pose_source",
+        "source_depth_unit", "contract_depth_unit", "registration", "depth_resolution"
       ],
       "properties": {
         "index": { "type": "integer", "minimum": 0 },
@@ -144,7 +154,46 @@
         "qc_source": { "type": "string" },
         "qc_path": { "type": ["string", "null"] },
         "pose_source": { "type": "string" },
-        "pose_path": { "type": ["string", "null"] }
+        "pose_path": { "type": ["string", "null"] },
+        "source_depth_unit": { "type": "string" },
+        "contract_depth_unit": { "type": "string" },
+        "registration": { "type": "string" },
+        "depth_resolution": {
+          "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2
+        }
+      }
+    },
+    "registration_alignment": {
+      "type": "object",
+      "properties": {
+        "policy": { "type": "string" },
+        "dense_depth": { "type": "object" },
+        "raw_lidar": { "type": "object" }
+      }
+    },
+    "contract_parameters": {
+      "type": "object",
+      "properties": {
+        "min_confidence": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "max_depth_m": { "type": "number", "exclusiveMinimum": 0 },
+        "max_depth_inclusive": { "type": "boolean" },
+        "invalid_depth_action": { "type": "string" },
+        "depth_output_unit": { "type": "string" },
+        "depth_source_policy": { "type": "string" },
+        "registration_alignment": { "$ref": "#/$defs/registration_alignment" }
+      }
+    },
+    "tsdf_parameters": {
+      "type": "object",
+      "properties": {
+        "voxel_size_m": { "type": "number", "exclusiveMinimum": 0 },
+        "sdf_trunc_m": { "type": "number", "exclusiveMinimum": 0 },
+        "sdf_trunc_explicit": { "type": "boolean" },
+        "depth_scale": { "type": "number", "exclusiveMinimum": 0 },
+        "depth_unit": { "type": "string" },
+        "depth_trunc_m": { "type": "number", "exclusiveMinimum": 0 },
+        "color_type": { "type": "string" },
+        "extrinsic_convention": { "type": "string" }
       }
     },
     "video_availability": {
@@ -152,7 +201,8 @@
       "required": [
         "expected_frame_count", "sidecar_frame_count", "reported_frame_count",
         "decoded_frame_count", "missing_indices", "reported_shortfall",
-        "terminal_decode_missing", "decode_complete"
+        "terminal_decode_missing", "decode_complete", "association_mode",
+        "pts_source", "pts_status", "pts_tolerance_s", "associations"
       ],
       "properties": {
         "expected_frame_count": { "type": "integer", "minimum": 0 },
@@ -165,7 +215,26 @@
         },
         "reported_shortfall": { "type": "integer", "minimum": 0 },
         "terminal_decode_missing": { "type": "boolean" },
-        "decode_complete": { "type": "boolean" }
+        "decode_complete": { "type": "boolean" },
+        "association_mode": { "type": "string", "enum": ["index", "pts"] },
+        "pts_source": { "type": ["string", "null"] },
+        "pts_status": { "type": "string", "enum": ["used", "index_fallback", "not_evaluated", "not_requested"] },
+        "pts_tolerance_s": { "type": ["number", "null"], "minimum": 0 },
+        "associations": {
+          "type": "array", "items": { "$ref": "#/$defs/frame_association" }
+        }
+      }
+    },
+    "frame_association": {
+      "type": "object",
+      "required": ["video_index", "sidecar_index", "method"],
+      "properties": {
+        "video_index": { "type": "integer", "minimum": 0 },
+        "sidecar_index": { "type": ["integer", "null"], "minimum": 0 },
+        "pts_s": { "type": ["number", "null"] },
+        "sidecar_timestamp_s": { "type": ["number", "null"] },
+        "delta_s": { "type": ["number", "null"], "minimum": 0 },
+        "method": { "type": "string" }
       }
     },
     "point2": {

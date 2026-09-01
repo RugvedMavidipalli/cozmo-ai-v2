@@ -33,11 +33,11 @@ def _full_res_ramp(depth_mm_low_res):
     return (np.tile(ramp_mm, (VIDEO_HEIGHT, 1)) / 1000.0).astype(np.float32)
 
 
-def test_densify_capture_end_to_end(lidar_stray_scanner_dataset, tmp_path):
-    capture = require_lidar_capture(lidar_stray_scanner_dataset)
+def test_densify_capture_end_to_end(stray_capture, tmp_path):
+    capture = require_lidar_capture(stray_capture)
 
-    depth0 = cv2.imread(str(lidar_stray_scanner_dataset / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
-    depth1 = cv2.imread(str(lidar_stray_scanner_dataset / "depth" / "000001.png"), cv2.IMREAD_UNCHANGED)
+    depth0 = cv2.imread(str(stray_capture / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    depth1 = cv2.imread(str(stray_capture / "depth" / "000001.png"), cv2.IMREAD_UNCHANGED)
     true_depths = [_full_res_ramp(depth0), _full_res_ramp(depth1)]
 
     model = FakeDepthModel(true_depths, bias=-0.3)
@@ -47,6 +47,18 @@ def test_densify_capture_end_to_end(lidar_stray_scanner_dataset, tmp_path):
 
     manifest = json.loads((output_dir / "densify_manifest.json").read_text())
     assert manifest["frame_count"] == 2
+    assert manifest["units"] == {
+        "lidar_input": "m",
+        "model_canonical_output": "m",
+        "dense_raster_output": "mm",
+    }
+    assert manifest["filter_policy"]["confidence_threshold"] == 1
+    assert manifest["filter_policy"]["max_depth_m"] == 8.0
+    assert manifest["registration_alignment"]["dense_output"] == "native_rgb"
+    assert manifest["model"]["adapter"] == "FakeDepthModel"
+    assert manifest["video_availability"]["expected_frame_count"] == 2
+    assert manifest["video_availability"]["decoded_frame_count"] == 2
+    assert manifest["video_availability"]["pts_status"] == "used"
     assert len(manifest["frames"]) == 2
     for report in manifest["frames"]:
         assert report["scale"] > 0

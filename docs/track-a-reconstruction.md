@@ -191,9 +191,16 @@ Track A isn't invoked separately — it's the geometry portion of a single
 
 - `--stride` (default 4) — frame stride used for the main fusion pass.
 - `--voxel` (default 0.02) — TSDF voxel size in metres.
+- `--sdf-trunc` (default `4 * --voxel`) — TSDF truncation distance in metres.
+- `tools/stage45_ablate.py` — CPU-only comparison of dense/raw/auto depth sources and
+  named TSDF `(voxel, truncation)` variants; it writes each variant's full contract
+  provenance without executing a model.
 - `--max-depth` (default 3.5) — depth truncation; also the knee measured against real
   ARKit depth-accuracy falloff (see `tools/depth_bias.py`).
 - `--min-confidence` (default 1) — minimum ARKit depth-confidence value (0/1/2) kept.
+- `--depth-source` — force `auto`, QC-approved `dense`, or raw LiDAR for an ablation.
+- `--frame-association` (default `pts`) — associate video to sidecars by normalized
+  OpenCV presentation timestamps, with identity-index fallback available for comparison.
 - `--no-refine` — skip pose-graph refinement and use raw ARKit poses.
 - `--no-loop-closure` — refine sequential edges only, skip ICP loop closure.
 - `--coverage` (default 0.90) — the target interval coverage passed to

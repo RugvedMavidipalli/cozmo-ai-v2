@@ -6,11 +6,15 @@ reconstruction path wants colour at depth resolution with low-confidence
 samples zeroed, densification wants the raw samples untouched.
 """
 
+from unittest.mock import patch
+
+import cv2
 import numpy as np
 import pytest
 
 from cozmo_ai_v2.pipeline.ingest import (
     CONFIDENCE_HIGH,
+    VideoAvailability,
     iter_frames,
     iter_raw_frames,
     load_capture,
@@ -143,3 +147,51 @@ def test_iter_raw_frames_rejects_unreadable_video(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         list(iter_raw_frames(tmp_path))
+
+
+def test_pts_availability_records_5443_sidecars_and_5442_decodes(tmp_path):
+    class FakeVideo:
+        def __init__(self):
+            self.read_count = 0
+
+        def isOpened(self):
+            return True
+
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return 5443.0
+            if property_id == cv2.CAP_PROP_POS_MSEC:
+                return (self.read_count - 1) * (1000.0 / 30.0)
+            return 0.0
+
+        def read(self):
+            if self.read_count >= 5442:
+                return False, None
+            self.read_count += 1
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    availability = VideoAvailability(
+        expected_frame_count=5443,
+        association_mode="pts",
+        sidecar_timestamps=100.0 + np.arange(5443, dtype=np.float64) / 30.0,
+    )
+    with patch("cozmo_ai_v2.pipeline.ingest.cv2.VideoCapture", return_value=FakeVideo()):
+        decoded = list(iter_raw_frames(tmp_path, [0], availability=availability))
+
+    assert [index for index, *_ in decoded] == [0]
+    report = availability.to_dict()
+    assert report["expected_frame_count"] == 5443
+    assert report["sidecar_frame_count"] == 5443
+    assert report["reported_frame_count"] == 5443
+    assert report["decoded_frame_count"] == 5442
+    assert report["reported_shortfall"] == 1
+    assert report["missing_indices"] == [5442]
+    assert report["terminal_decode_missing"] is True
+    assert report["association_mode"] == "pts"
+    assert report["pts_status"] == "used"
+    assert len(report["associations"]) == 5442
+    assert report["associations"][0]["sidecar_index"] == 0
+    assert report["associations"][-1]["sidecar_index"] == 5441

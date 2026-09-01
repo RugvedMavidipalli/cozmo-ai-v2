@@ -64,8 +64,12 @@ out/<capture>/
 | `--model` | `claude-opus-5` | VLM model for damage detection |
 | `--stride N` | `4` | Frame stride for the main fusion pass. Lower is slower and denser |
 | `--voxel` | `0.02` | TSDF voxel size, metres |
+| `--sdf-trunc` | `4 * --voxel` | TSDF truncation distance, metres |
 | `--dense-depth-dir` | auto | QC-approved Stage 4 `dense_depth/` directory; raw LiDAR is used per frame when dense data is unavailable |
 | `--densify-manifest` | auto | Stage 4 manifest carrying the QC approval and mask paths |
+| `--depth-source` | `auto` | Ablation hook: `auto` (QC dense then same-index raw), `dense`, or `raw` |
+| `--frame-association` | `pts` | Associate decoded RGB to sidecars by presentation timestamp, or use identity index mapping |
+| `--pts-tolerance-s` | derived | Maximum timestamp mismatch accepted by PTS association |
 | `--pose-source` | `auto` | ARKit for Stray Scanner captures, SLAM for video captures, with explicit fallback metadata |
 | `--slam-poses` | — | Offline SLAM pose table (`CSV`, `JSON`, `NPY`, or `NPZ`) |
 | `--max-depth` | `3.5` | Depth cutoff — the knee where ARKit depth starts reading systematically far |

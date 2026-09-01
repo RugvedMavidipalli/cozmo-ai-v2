@@ -44,9 +44,13 @@ class Metric3Dv2Model:
             ) from exc
 
         self._torch = torch
+        self.variant = variant
         self._device = device or (
             "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         )
+        self.device = self._device
+        self.weights_path = str(weights_path) if weights_path is not None else None
+        self.repository = str(repository) if repository is not None else None
         self._input_size = CONVNEXT_INPUT_SIZE if "convnext" in variant else VIT_INPUT_SIZE
         if model is not None:
             # Dependency injection is useful for offline tests and for

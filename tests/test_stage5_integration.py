@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from cozmo_ai_v2.pipeline import export
+from cozmo_ai_v2.pipeline.diagnostics import TSDFVariant, compare_tsdf_parameters
 from cozmo_ai_v2.pipeline.frame_contract import build_frame_contract
 from cozmo_ai_v2.pipeline.fuse import fuse
 from cozmo_ai_v2.pipeline.ingest import load_capture
@@ -65,8 +66,18 @@ def test_contract_uses_qc_dense_depth_and_rgb_intrinsics(stray_capture, tmp_path
     assert all(frame.depth.shape == (48, 64) for frame in frames)
     assert all(frame.color.shape == (48, 64, 3) for frame in frames)
     assert all(frame.provenance.depth_source == "metric3d_v2_scale_shift_lidar_residual" for frame in frames)
+    assert all(frame.provenance.source_depth_unit == "mm" for frame in frames)
+    assert all(frame.provenance.contract_depth_unit == "m" for frame in frames)
+    assert all(frame.provenance.registration == "dense_native_rgb_exact_shape" for frame in frames)
     np.testing.assert_allclose(frames[0].intrinsics, bundle.rgb_intrinsics)
-    assert contract.report()["integrated_indices"] == []
+    report = contract.report()
+    assert report["integrated_indices"] == []
+    assert report["depth_unit"] == "m"
+    assert report["confidence_threshold"] == 1
+    assert report["max_depth_m"] == 4.0
+    assert report["contract_parameters"]["max_depth_m"] == 4.0
+    assert report["contract_parameters"]["min_confidence"] == 1
+    assert report["registration_alignment"]["dense_depth"]["shape_mismatch"] == "reject"
 
 
 def test_contract_falls_back_per_index_to_raw_lidar(stray_capture, tmp_path):
@@ -90,6 +101,63 @@ def test_contract_falls_back_per_index_to_raw_lidar(stray_capture, tmp_path):
     assert report["fallback_frames"][0]["index"] == 0
     assert report["rejected_frames"] == []
     assert [item["index"] for item in report["frame_provenance"]] == [0, 1]
+
+
+def test_contract_can_force_raw_source_for_ablation(stray_capture, tmp_path):
+    dense_dir, manifest = _write_dense_artifacts(tmp_path / "stage4")
+    bundle = load_capture(stray_capture)
+    contract = build_frame_contract(
+        bundle,
+        indices=[0],
+        dense_depth_dir=dense_dir,
+        densify_manifest=manifest,
+        depth_source="raw",
+    )
+
+    frame = next(contract.iter_frames())
+
+    assert frame.index == 0
+    assert frame.provenance.depth_source == "raw_lidar"
+    assert contract.report()["depth_source_mode"] == "raw"
+    assert contract.report()["contract_parameters"]["depth_source_policy"] == "raw"
+
+
+def test_dense_confidence_threshold_is_part_of_qc_policy(stray_capture, tmp_path):
+    dense_dir, manifest = _write_dense_artifacts(tmp_path / "stage4")
+    cv2.imwrite(
+        str(dense_dir.parent / "dense_confidence" / "000000.png"),
+        np.zeros((48, 64), dtype=np.uint8),
+    )
+    bundle = load_capture(stray_capture)
+    contract = build_frame_contract(
+        bundle,
+        indices=[0],
+        dense_depth_dir=dense_dir,
+        densify_manifest=manifest,
+        min_confidence=2,
+    )
+
+    frame = next(contract.iter_frames())
+
+    assert frame.provenance.depth_source == "raw_lidar"
+    assert contract.report()["contract_parameters"]["min_confidence"] == 2
+    assert contract.report()["fallback_frames"][0]["index"] == 0
+
+
+def test_contract_records_default_3_5m_range_filter(stray_capture):
+    depth_path = stray_capture / "depth" / "000000.png"
+    depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    depth[0, 0] = 4000
+    cv2.imwrite(str(depth_path), depth)
+    bundle = load_capture(stray_capture)
+    contract = build_frame_contract(bundle, indices=[0])
+
+    frame = next(contract.iter_frames())
+    report = contract.report()
+
+    assert frame.depth[0, 0] == 0.0
+    assert report["contract_parameters"]["max_depth_m"] == 3.5
+    assert report["contract_parameters"]["max_depth_inclusive"] is True
 
 
 def test_contract_reports_one_frame_short_video_without_shifting_sidecars(
@@ -120,6 +188,8 @@ def test_contract_reports_one_frame_short_video_without_shifting_sidecars(
     assert availability["missing_indices"] == [1]
     assert availability["terminal_decode_missing"] is True
     assert availability["decode_complete"] is True
+    assert availability["association_mode"] == "pts"
+    assert availability["associations"][0]["sidecar_index"] == 0
 
 
 def test_contract_rejects_dense_without_qc_when_raw_is_missing(stray_capture, tmp_path):
@@ -216,3 +286,33 @@ def test_fuse_extracts_and_exports_cloud_and_mesh(stray_capture, tmp_path):
     assert fusion_manifest["contract"]["depth_sources"] == [
         "metric3d_v2_scale_shift_lidar_residual"
     ]
+    assert fusion_manifest["contract"]["tsdf_parameters"] == {
+        "voxel_size_m": 0.1,
+        "sdf_trunc_m": 0.2,
+        "sdf_trunc_explicit": True,
+        "depth_scale": 1.0,
+        "depth_unit": "m",
+        "depth_trunc_m": 4.0,
+        "color_type": "RGB8",
+        "extrinsic_convention": "inverse_c2w_opencv_to_world_to_camera",
+    }
+
+
+def test_tsdf_variant_comparison_persists_effective_parameters(stray_capture):
+    bundle = load_capture(stray_capture)
+
+    records = compare_tsdf_parameters(
+        bundle,
+        [
+            TSDFVariant("baseline", 0.1, 0.2),
+            TSDFVariant("coarse", 0.2, 0.4),
+        ],
+        indices=[0],
+        max_depth=3.5,
+    )
+
+    assert [record["label"] for record in records] == ["baseline", "coarse"]
+    assert [record["tsdf_parameters"]["voxel_size_m"] for record in records] == [0.1, 0.2]
+    assert [record["tsdf_parameters"]["sdf_trunc_m"] for record in records] == [0.2, 0.4]
+    assert all(record["contract"]["contract_parameters"]["max_depth_m"] == 3.5 for record in records)
+    assert all(record["contract"]["video_availability"]["association_mode"] == "pts" for record in records)

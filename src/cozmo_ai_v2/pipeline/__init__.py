@@ -8,7 +8,8 @@ from .frame_contract import (
     ReconstructionFrame,
     build_frame_contract,
 )
-from .ingest import VideoAvailability
+from .ingest import FrameAssociation, VideoAvailability
+from .diagnostics import TSDFVariant, compare_tsdf_parameters
 
 __all__ = [
     "FrameContract",
@@ -18,4 +19,7 @@ __all__ = [
     "ReconstructionFrame",
     "build_frame_contract",
     "VideoAvailability",
+    "FrameAssociation",
+    "TSDFVariant",
+    "compare_tsdf_parameters",
 ]

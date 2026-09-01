@@ -25,6 +25,7 @@ import numpy as np
 from .ingest import CaptureBundle, VideoAvailability, iter_raw_frames
 
 DEPTH_SCALE_MM_TO_M = 1000.0
+CONTRACT_DEPTH_UNIT = "m"
 DENSE_DEPTH_SOURCE = "metric3d_v2_scale_shift_lidar_residual"
 RAW_LIDAR_SOURCE = "raw_lidar"
 
@@ -45,8 +46,12 @@ class FrameProvenance:
     qc_path: str | None
     pose_source: str
     pose_path: str | None
+    source_depth_unit: str
+    contract_depth_unit: str
+    registration: str
+    depth_resolution: tuple[int, int]
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict:
         return asdict(self)
 
 
@@ -244,6 +249,7 @@ class FrameContract:
     densify_manifest: Path | None = None
     min_confidence: int = 1
     max_depth: float = 3.5
+    depth_source_mode: str = "auto"
     _dense_entries: dict[int, _DenseEntry] = field(default_factory=dict)
     yielded_indices: set[int] = field(default_factory=set)
     integrated_indices: set[int] = field(default_factory=set)
@@ -301,37 +307,45 @@ class FrameContract:
             return None
 
         entry = self._dense_entries.get(index)
-        if entry is not None and entry.qc_approved:
+        if self.depth_source_mode != "raw" and entry is not None and entry.qc_approved:
             try:
                 dense_frame = self._dense_frame(index, bgr, raw_confidence, pose, entry)
                 if dense_frame.valid_mask.any():
                     return dense_frame
                 raise FrameContractError("dense QC mask contains no usable pixels")
             except (FrameContractError, OSError, ValueError) as exc:
-                if raw_depth is not None:
+                if self.depth_source_mode == "auto" and raw_depth is not None:
                     self.fallback_frames[index] = FrameRejection(
                         index, f"dense frame rejected ({exc}); raw LiDAR used", DENSE_DEPTH_SOURCE
                     )
                 else:
                     self._reject(index, f"dense frame rejected: {exc}", DENSE_DEPTH_SOURCE)
                     return None
-        elif entry is not None:
+        elif self.depth_source_mode != "raw" and entry is not None:
             reason = entry.reason or "manifest entry is not qc_approved"
-            if raw_depth is not None:
+            if self.depth_source_mode == "auto" and raw_depth is not None:
                 self.fallback_frames[index] = FrameRejection(index, f"{reason}; raw LiDAR used", DENSE_DEPTH_SOURCE)
             else:
                 self._reject(index, reason, DENSE_DEPTH_SOURCE)
                 return None
-        elif self.dense_depth_dir is not None:
+        elif self.depth_source_mode != "raw" and self.dense_depth_dir is not None:
             reason = "dense raster has no QC-approved manifest entry"
-            if raw_depth is not None:
+            if self.depth_source_mode == "auto" and raw_depth is not None:
                 self.fallback_frames[index] = FrameRejection(index, f"{reason}; raw LiDAR used", DENSE_DEPTH_SOURCE)
             else:
                 self._reject(index, reason, DENSE_DEPTH_SOURCE)
                 return None
+        elif self.depth_source_mode == "dense":
+            self._reject(index, "dense depth source was requested but no QC-approved entry exists", DENSE_DEPTH_SOURCE)
+            return None
 
         if raw_depth is None:
-            self._reject(index, "no QC-approved dense depth and no raw LiDAR depth", RAW_LIDAR_SOURCE)
+            reason = (
+                "raw LiDAR source was requested but no raw LiDAR depth is available"
+                if self.depth_source_mode == "raw"
+                else "no QC-approved dense depth and no raw LiDAR depth"
+            )
+            self._reject(index, reason, RAW_LIDAR_SOURCE)
             return None
         try:
             return self._raw_frame(index, bgr, raw_depth, raw_confidence, pose)
@@ -377,7 +391,12 @@ class FrameContract:
             raise FrameContractError("QC-approved dense depth is missing its QC mask")
 
         depth = depth.astype(np.float32, copy=False)
-        qc &= np.isfinite(depth) & (depth > 0) & (depth <= self.max_depth)
+        qc &= (
+            np.isfinite(depth)
+            & (depth > 0)
+            & (depth <= self.max_depth)
+            & (confidence >= self.min_confidence)
+        )
         depth = np.where(qc, depth, 0.0).astype(np.float32)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return ReconstructionFrame(
@@ -398,6 +417,10 @@ class FrameContract:
                 qc_path=qc_path,
                 pose_source=self.pose_source,
                 pose_path=self.pose_path,
+                source_depth_unit=entry.depth_unit,
+                contract_depth_unit=CONTRACT_DEPTH_UNIT,
+                registration="dense_native_rgb_exact_shape",
+                depth_resolution=(int(width), int(height)),
             ),
         )
 
@@ -449,18 +472,57 @@ class FrameContract:
                 qc_path=None,
                 pose_source=self.pose_source,
                 pose_path=self.pose_path,
+                source_depth_unit="mm",
+                contract_depth_unit=CONTRACT_DEPTH_UNIT,
+                registration="raw_depth_native_rgb_area_resize",
+                depth_resolution=(int(width), int(height)),
             ),
         )
 
     def report(self) -> dict:
         """Return deterministic provenance and frame-decision metadata."""
         sources = sorted(set(self.depth_sources.values()))
+        provenance = list(self.provenance_by_index.values())
+        registration = {
+            "policy": "dense_requires_native_rgb_alignment; raw_rgb_area_resize_to_depth",
+            "dense_depth": {
+                "required_shape": "native_rgb",
+                "shape_mismatch": "reject",
+                "confidence_alignment": "nearest",
+                "qc_alignment": "nearest",
+            },
+            "raw_lidar": {
+                "depth_shape": "native_lidar",
+                "rgb_alignment": "INTER_AREA_resize",
+                "confidence_alignment": "exact_shape_required",
+            },
+        }
         return {
             "depth_sources": sources,
+            "depth_units": sorted({item.source_depth_unit for item in provenance}),
+            "depth_unit": CONTRACT_DEPTH_UNIT,
+            "confidence_threshold": self.min_confidence,
+            "max_depth_m": self.max_depth,
+            "registration_alignment": registration,
             "dense_depth_dir": str(self.dense_depth_dir) if self.dense_depth_dir is not None else None,
             "densify_manifest": str(self.densify_manifest) if self.densify_manifest is not None else None,
             "pose_source": self.pose_source,
             "pose_path": self.pose_path,
+            "pose_convention": "camera_to_world_opencv",
+            "depth_source_mode": self.depth_source_mode,
+            "contract_parameters": {
+                "min_confidence": self.min_confidence,
+                "max_depth_m": self.max_depth,
+                "max_depth_inclusive": True,
+                "invalid_depth_action": "zero",
+                "depth_output_unit": CONTRACT_DEPTH_UNIT,
+                "depth_source_policy": (
+                    "qc_approved_dense_else_same_index_raw_lidar"
+                    if self.depth_source_mode == "auto"
+                    else self.depth_source_mode
+                ),
+                "registration_alignment": registration,
+            },
             "requested_indices": list(self.requested_indices),
             "integrated_indices": sorted(self.integrated_indices),
             "video_availability": (
@@ -488,12 +550,29 @@ def build_frame_contract(
     densify_manifest: str | Path | None = None,
     min_confidence: int = 1,
     max_depth: float = 3.5,
+    depth_source: str = "auto",
+    frame_association: str = "pts",
+    pts_tolerance_s: float | None = None,
 ) -> FrameContract:
     """Build the Stage 4→5 contract without reading frame rasters yet."""
     if not 0 <= min_confidence <= 2:
         raise FrameContractError(f"min_confidence must be in [0, 2], got {min_confidence}")
     if max_depth <= 0 or not np.isfinite(max_depth):
         raise FrameContractError(f"max_depth must be a positive finite number, got {max_depth}")
+    if depth_source not in {"auto", "dense", "raw"}:
+        raise FrameContractError(
+            f"depth_source must be 'auto', 'dense', or 'raw', got {depth_source!r}"
+        )
+    if frame_association not in {"index", "pts"}:
+        raise FrameContractError(
+            f"frame_association must be 'index' or 'pts', got {frame_association!r}"
+        )
+    if pts_tolerance_s is not None and (
+        pts_tolerance_s < 0 or not np.isfinite(pts_tolerance_s)
+    ):
+        raise FrameContractError(
+            f"pts_tolerance_s must be a non-negative finite number, got {pts_tolerance_s}"
+        )
     pose_table = np.asarray(bundle.poses if poses is None else poses, dtype=np.float64)
     if pose_table.ndim != 3 or pose_table.shape[1:] != (4, 4):
         raise FrameContractError(f"poses must have shape (N, 4, 4), got {pose_table.shape}")
@@ -517,6 +596,12 @@ def build_frame_contract(
         densify_manifest=manifest,
         min_confidence=min_confidence,
         max_depth=max_depth,
+        depth_source_mode=depth_source,
         _dense_entries=entries,
-        video_availability=VideoAvailability(expected_frame_count=len(pose_table)),
+        video_availability=VideoAvailability(
+            expected_frame_count=len(pose_table),
+            association_mode=frame_association,
+            pts_tolerance_s=pts_tolerance_s,
+            sidecar_timestamps=np.asarray(bundle.timestamps, dtype=np.float64),
+        ),
     )
