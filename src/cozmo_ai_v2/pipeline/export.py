@@ -956,13 +956,17 @@ def export_scope_csv(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
             writer.writerow(
                 [
                     room["name"] if room else "",
-                    f"{room['area']['value']:.3f}" if room else "",
+                    _csv_measurement_value(room.get("area") if room else None),
                     f"{room['ceiling_height']['value']:.3f}"
                     if room and room.get("ceiling_height") and room["ceiling_height"].get("value") is not None
                     else "",
                     wall["name"],
                     _csv_measurement_value(wall.get("length")),
-                    f"{wall['length'].get('half_width') or 0.0:.3f}",
+                    (
+                        f"{wall['length']['half_width']:.3f}"
+                        if wall.get("length", {}).get("half_width") is not None
+                        else ""
+                    ),
                     f"{wall['length'].get('confidence', '')}",
                     wall["length"].get("status", "measured"),
                     _csv_measurement_value(wall.get("inlier_vertical_extent")),

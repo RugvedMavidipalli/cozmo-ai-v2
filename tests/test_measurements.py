@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import csv
 
 from cozmo_ai_v2.pipeline.geometry import GravityEstimate
+from cozmo_ai_v2.pipeline.export import export_scope_csv
 from cozmo_ai_v2.pipeline.measurements import (
     MeasurementContext,
     TLSPlaneModel,
@@ -321,3 +323,35 @@ def test_phase1_raster_polygon_is_not_a_stage9_area_boundary():
     )
     result = measure_scene(_rectangle_walls(), [phase1_room], frame=FRAME)
     assert result.rooms[0].interior_face_area.value is None
+
+
+def test_scope_csv_keeps_unmeasured_geometry_blank(tmp_path):
+    result = {
+        "rooms": [{
+            "id": 0,
+            "name": "room_1",
+            "area": {"value": None, "half_width": None},
+            "ceiling_height": None,
+            "interior_face_area": {"value": None, "confidence": 0.0},
+            "wall_centerline_area": {"value": None},
+            "outer_footprint_area": {"value": None},
+            "floor_to_ceiling_height": None,
+        }],
+        "reconstruction": {"walls": [{
+            "name": "wall_0",
+            "room_id": 0,
+            "length": {"value": None, "half_width": None, "status": "unmeasured"},
+            "inlier_vertical_extent": {"value": None},
+            "thickness": {"value": None, "status": "unmeasured"},
+        }]},
+        "scope": {"line_items": []},
+    }
+
+    sketch_path, _ = export_scope_csv(result, tmp_path)
+    with sketch_path.open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["room_area_m2"] == ""
+    assert row["wall_length_m"] == ""
+    assert row["wall_length_ci_half_width_m"] == ""
+    assert row["room_interior_face_area_m2"] == ""
+    assert row["wall_thickness_status"] == "unmeasured"
