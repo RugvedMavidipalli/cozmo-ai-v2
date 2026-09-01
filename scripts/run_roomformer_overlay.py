@@ -178,10 +178,18 @@ def main() -> int:
     if not cv2.imwrite(str(args.output_dir / "roomformer_overlay_dimensions.png"), overlay):
         raise OSError("could not write RoomFormer dimensional overlay")
     with (args.output_dir / "roomformer_wall_dimensions.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["label", "wall_id", "length_m", "tolerance_m", "status", "flags"])
+        fieldnames = ["label", "wall_id", "length_m", "tolerance_m", "status", "flags"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for wall in walls:
-            writer.writerow({**wall, "flags": ";".join(wall["flags"])})
+            writer.writerow({
+                "label": wall["label"],
+                "wall_id": wall["wall_id"],
+                "length_m": wall["length_m"],
+                "tolerance_m": wall["tolerance_m"],
+                "status": wall["status"],
+                "flags": ";".join(wall["flags"]),
+            })
     metadata = {
         "official_repository": str(args.roomformer_repository),
         "checkpoint": str(args.checkpoint),
