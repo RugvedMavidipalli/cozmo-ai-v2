@@ -14,7 +14,10 @@ import pytest
 
 from cozmo_ai_v2.pipeline.ingest import (
     CONFIDENCE_HIGH,
+    STRAY_ODOMETRY_CONVENTION,
     VideoAvailability,
+    _imu_gravity,
+    _nearest_timestamp_indices,
     iter_frames,
     iter_raw_frames,
     load_capture,
@@ -33,6 +36,30 @@ def test_load_capture_reads_metadata(stray_capture):
     assert bundle.poses.shape == (2, 4, 4)
     # Camera translates one metre per frame along +x.
     np.testing.assert_allclose(bundle.poses[1][:3, 3], [1.0, 0.0, 0.0])
+    assert bundle.pose_convention == STRAY_ODOMETRY_CONVENTION
+
+
+def test_nearest_timestamp_association_does_not_always_choose_future_pose():
+    nearest = _nearest_timestamp_indices(
+        np.array([0.0, 1.0, 2.0]), np.array([0.1, 0.6, 1.5, 2.4])
+    )
+
+    # Exact ties deliberately choose the earlier bracket, not the future one.
+    np.testing.assert_array_equal(nearest, [0, 1, 1, 2])
+
+
+def test_imu_gravity_uses_the_nearest_pose_not_the_future_pose(tmp_path):
+    imu = tmp_path / "imu.csv"
+    imu.write_text("timestamp,ax,ay,az\n0.1,0,-1,0\n")
+    poses = np.tile(np.eye(4), (2, 1, 1))
+    poses[1, :3, :3] = np.diag([-1.0, -1.0, 1.0])
+
+    up, consistency = _imu_gravity(imu, np.array([0.0, 1.0]), poses)
+
+    # 0.1 seconds is nearest the identity pose at t=0.  Choosing the
+    # future pose would reverse this x direction.
+    np.testing.assert_allclose(up, [-1.0, 0.0, 0.0])
+    assert consistency == pytest.approx(1.0)
 
 
 def test_load_capture_scales_intrinsics_to_depth_resolution(stray_capture):

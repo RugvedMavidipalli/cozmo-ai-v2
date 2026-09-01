@@ -8,10 +8,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Rotates ARKit's coordinate convention (X right, Y up, Z toward the
-# viewer) into OpenCV's convention (X right, Y down, Z into the scene),
-# which is what the rest of this pipeline expects poses to use.
+# Retained for raw ARKit adapters that need it. Stray Scanner's exported
+# odometry.csv is already in OpenCV camera axes and this matrix must not be
+# applied to it again.
 ARKIT_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
+
+# Measured against recordings-2: CSV poses are camera-to-world transforms in
+# OpenCV camera axes. The pipeline intentionally uses them without a flip.
+STRAY_ODOMETRY_CONVENTION = "camera_to_world_opencv_csv_no_arkit_to_cv_flip"
 
 # ARKit's three depth-confidence levels, from least to most trustworthy.
 CONFIDENCE_LOW = 0
@@ -330,6 +334,9 @@ class CaptureBundle:
             agreement at all) to 1 (perfect agreement). A low value can be
             a sign that the capture involved a lot of shaking or unusual
             device motion.
+        pose_convention: Provenance for the input poses. Stray Scanner CSV
+            poses are camera-to-world transforms in OpenCV camera axes and
+            are intentionally used without an ARKit-to-OpenCV flip.
     """
 
     root: Path
@@ -349,6 +356,7 @@ class CaptureBundle:
     rgb_intrinsics: np.ndarray | None = None
     pose_source: str = "arkit"
     pose_path: str | None = None
+    pose_convention: str = STRAY_ODOMETRY_CONVENTION
 
     def __len__(self) -> int:
         """How many frames are in this capture."""
@@ -443,11 +451,55 @@ def _read_odometry(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
                 tuple(float(row[column[key]]) for key in ("fx", "fy", "cx", "cy"))
             )
 
-    return (
-        np.asarray(timestamps),
-        np.asarray(poses),
-        np.asarray(intrinsics),
-    )
+    pose_array = np.asarray(poses)
+    _validate_camera_to_world_poses(pose_array, path)
+    return np.asarray(timestamps), pose_array, np.asarray(intrinsics)
+
+
+def _validate_camera_to_world_poses(poses: np.ndarray, source: Path) -> None:
+    """Structurally validate expected C2W transforms without guessing a flip."""
+
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4) or len(poses) == 0:
+        raise ValueError(f"{source} contains no valid 4x4 camera-to-world poses")
+    if not np.isfinite(poses).all() or not np.allclose(
+        poses[:, 3, :], [0.0, 0.0, 0.0, 1.0], atol=1e-6
+    ):
+        raise ValueError(f"{source} contains invalid homogeneous camera-to-world poses")
+    rotations = poses[:, :3, :3]
+    orthogonality = np.einsum("nji,njk->nik", rotations, rotations)
+    if not np.allclose(orthogonality, np.eye(3), atol=1e-4) or np.any(
+        np.linalg.det(rotations) <= 0.0
+    ):
+        raise ValueError(f"{source} contains invalid camera rotations; no convention flip was inferred")
+
+
+def load_odometry_pose_priors(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load timestamped Stray Scanner/ARKit camera-to-world pose priors.
+
+    The returned transforms are already in the pipeline's measured OpenCV
+    camera convention. Callers must not apply ``ARKIT_TO_CV`` again: that
+    conversion is for a different raw ARKit convention and would corrupt
+    Stray Scanner's exported odometry.
+    """
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"ARKit pose-prior file not found: {path}")
+    timestamps, poses, _intrinsics = _read_odometry(path)
+    return timestamps, poses
+
+
+def _nearest_timestamp_indices(timestamps: np.ndarray, queries: np.ndarray) -> np.ndarray:
+    """Choose the nearest timestamp, preferring the earlier sample on ties."""
+
+    timestamps = np.asarray(timestamps, dtype=float)
+    queries = np.asarray(queries, dtype=float)
+    if timestamps.ndim != 1 or len(timestamps) == 0 or np.any(np.diff(timestamps) < 0):
+        raise ValueError("pose timestamps must be a non-empty sorted array")
+    right = np.clip(np.searchsorted(timestamps, queries, side="left"), 0, len(timestamps) - 1)
+    left = np.clip(right - 1, 0, len(timestamps) - 1)
+    choose_right = np.abs(timestamps[right] - queries) < np.abs(queries - timestamps[left])
+    return np.where(choose_right, right, left)
 
 
 def _quaternion_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -857,10 +909,9 @@ def _imu_gravity(
         return np.array([0.0, 1.0, 0.0]), 0.0
 
     data = np.asarray(samples)
-    # Match each accelerometer sample to whichever frame's pose was
-    # recorded closest to it in time, so the sample can be rotated into
-    # world coordinates below.
-    nearest = np.clip(np.searchsorted(timestamps, data[:, 0]), 0, len(poses) - 1)
+    # Match each accelerometer sample to the genuinely nearest frame pose,
+    # rather than always taking the future pose returned by searchsorted.
+    nearest = _nearest_timestamp_indices(timestamps, data[:, 0])
     rotations = poses[nearest][:, :3, :3]
     # Accelerometer readings come in the phone's own physical orientation,
     # not the camera's, so rotate them into camera space first.

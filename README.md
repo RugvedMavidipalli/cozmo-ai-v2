@@ -88,6 +88,7 @@ out/<capture>/
 | `--reference-type`, `--reference-observed-m`, `--reference-known-m` | — | Validate an explicit marker/tape/user reference; the factor is reported but not applied automatically |
 | `--no-refine` | off | Use raw ARKit poses. The pose-refinement ablation |
 | `--no-loop-closure` | off | Refine sequentially only, without loop edges |
+| `--run-mast3r` | off | Run MASt3R-SLAM for a Stray capture even when ARKit poses are present; ARKit is retained as a prior/validation reference and refinement is skipped |
 | `--no-damage` | off | Geometry only; skips all API calls |
 | `--no-sam` | off | Local GrabCut masks instead of hosted SAM 2 |
 | `--debug-furniture` | off | Diagnostic: also ask the VLM to tag named furniture, to sanity-check it's resolving objects in the frame at all — never reaches `result.json` or scope. Prints counts only |
@@ -111,11 +112,20 @@ Sensor conventions were **measured, not assumed** — `tools/conv_test.py` and
 that silently produce confident, geometrically meaningless output if guessed:
 
 - Poses in `odometry.csv` are *already* camera-to-world in the OpenCV
-  convention. Applying the textbook ARKit→OpenCV flip degrades frame alignment
-  from 4.2 cm to 25.9 cm.
+  convention. On recordings-2, the measured median alignment error is 4.80 cm
+  with no flip versus 24.59 cm with an ARKit→OpenCV flip; treating the CSV as
+  world-to-camera is worse still (70.41 cm median / 99.44 cm metric). The
+  pipeline structurally validates the expected homogeneous camera-to-world
+  transforms and records `camera_to_world_opencv_csv_no_arkit_to_cv_flip` as
+  provenance instead of inferring or applying a flip.
 - The IMU body frame is rotated from the camera frame by `rotZ(-90°)`. Only that
   mapping resolves the accelerometer to a constant world vector (0.992
   consistency); the identity mapping scores 0.59 and yields a 10 m "room height".
+- Colour/depth frame IDs remain stable for file lookup, but their poses are
+  associated by the decoded RGB presentation timestamp (PTS), normalized to
+  the video clock origin and matched to the nearest odometry timestamp. This
+  preserves variable-frame-rate timing; a decoder that does not provide an
+  advancing PTS is explicitly marked as using the frame-index fallback.
 
 Rerun both scripts before trusting a new capture source.
 
@@ -211,7 +221,10 @@ exposed as `--max-depth` and `--min-confidence`.
 pose-graph edges from pairwise ICP *lowered* measured drift by 66% while
 stretching the 2.99 m storey to 4.48 m — a self-consistent, badly wrong
 solution. Sequential edges now come from ARKit weighted ~100× above ICP loop
-edges, and `refine_trajectory` refuses its own output past a 75 cm correction.
+edges. A refinement is accepted only when both the weighted pose-graph objective
+and the independent loop residual improve, the loop gap does not worsen by more
+than 5 cm, and no keyframe moves more than 75 cm. Otherwise raw ARKit poses and
+the full rejection rationale are retained in diagnostics.
 
 **A wall behind a wall gets filtered by ray occlusion, not proximity.**
 `merge_collinear` removes clutter too *close* to the camera (furniture in
@@ -304,3 +317,91 @@ docs/            design rationale, algorithm derivations, and a gap analysis
   weights implicitly.
 - Damage output requires `ANTHROPIC_API_KEY`; without it the geometry tracks
   run and the scope comes out empty.
+
+## MASt3R-SLAM RGB video
+
+To run an installed [MASt3R-SLAM](https://github.com/rmurai0610/MASt3R-SLAM)
+checkout on a standalone RGB MP4 without calibration:
+
+```console
+cozmo-ai-v2 run recording.mp4 \
+  --mast3r-slam-dir /path/to/MASt3R-SLAM \
+  --python /path/to/mast3r-slam-environment/bin/python \
+  --no-viz \
+  --save-as recording
+```
+
+The checkout must contain MASt3R-SLAM, its submodules, model checkpoints, and
+GPU-enabled dependencies. The command runs from that checkout so its relative
+config and checkpoint paths resolve. Results are written beneath its `logs/`
+directory. This project does not bundle those external dependencies.
+
+### Pose provenance and ARKit checks
+
+MASt3R-SLAM's result file is read from `logs/<save-as>/<video-stem>.txt` (or
+`logs/<video-stem>.txt`) using its `timestamp x y z qx qy qz qw` format. It is
+converted into the pipeline's documented pose contract: a timestamped 4×4
+**camera-to-world** transform in OpenCV camera axes (+X right, +Y down, +Z
+forward).
+
+For a Stray Scanner capture, retain its `odometry.csv` as a metric ARKit prior:
+
+```console
+cozmo-ai-v2 run /path/to/capture/rgb.mp4 \
+  --mast3r-slam-dir /path/to/MASt3R-SLAM \
+  --python /path/to/mast3r-slam-environment/bin/python \
+  --pose-priors /path/to/capture/odometry.csv \
+  --no-viz --save-as capture
+```
+
+When the input video is the sibling `capture/rgb.mp4`, the launcher discovers
+`capture/odometry.csv` automatically; `--pose-priors` is useful when the prior
+is stored elsewhere.
+
+Stray Scanner odometry is already camera-to-world in this OpenCV convention;
+do **not** apply an ARKit axis flip a second time. The launcher inspects
+`main.py` without importing CUDA code. If that upstream checkout advertises a
+pose-prior option, it is supplied; otherwise the prior is never passed as an
+unknown argument and is used solely for post-run robust alignment.
+
+The resulting `pose_provenance.json` records source paths, the prior mode,
+coordinate convention, loop-closure counters when an optional
+`mast3r_slam_metrics.json` sidecar is supplied, and diagnostics. It aligns
+MASt3R-SLAM to ARKit with SE(3) for metric trajectories or Sim(3) when scale
+differs, then gates fusion at: 25 cm translation RMSE, 75 cm maximum
+translation error, 15° rotation RMSE, 45° maximum rotation error, and 15%
+scale divergence. RGB-only input remains supported; without an ARKit prior the
+manifest explicitly marks the trajectory as unaligned and no ARKit fusion gate
+is claimed. When MASt3R-SLAM timestamps start at video time zero but Stray
+odometry uses an absolute capture clock, the adapter detects and records the
+single timestamp-origin offset before matching or interpolation.
+
+For the LiDAR pipeline, `--run-mast3r` launches MASt3R-SLAM directly from a
+Stray capture. This deliberately prefers accepted MASt3R poses over the ARKit
+refinement path: `odometry.csv` remains a capability-gated upstream prior and
+the metric post-run validation reference, not a reason to skip SLAM.
+
+```console
+python -m cozmo_ai_v2.pipeline run /path/to/capture \
+  --run-mast3r \
+  --mast3r-slam-dir /path/to/MASt3R-SLAM \
+  --mast3r-python /path/to/mast3r-slam-environment/bin/python \
+  --mast3r-no-viz --mast3r-save-as capture
+```
+
+This mode skips ARKit pose refinement, runs MASt3R-SLAM, then applies the same
+pre-fusion ARKit alignment/divergence gates. A failed launcher, missing result,
+or rejected trajectory stops before fusion and writes `mast3r_pose_provenance.json`.
+
+Alternatively, validate and use a completed MASt3R trajectory before the fusion
+stage with:
+
+```console
+python -m cozmo_ai_v2.pipeline run /path/to/capture \
+  --mast3r-trajectory /path/to/MASt3R-SLAM/logs/capture/rgb.txt \
+  --mast3r-metrics /path/to/MASt3R-SLAM/logs/capture/mast3r_slam_metrics.json
+```
+
+The pipeline interpolates only safely bracketed timestamp gaps (at most one
+second by default), rejects trajectories that fail the ARKit gate before any
+fusion, and writes `mast3r_pose_provenance.json` into its output directory.

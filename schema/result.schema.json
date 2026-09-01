@@ -10,6 +10,7 @@
       "required": ["name", "modality", "frame_count"],
       "properties": {
         "name": { "type": "string" },
+        "pose_convention": { "type": "string" },
         "modality": {
           "type": "string",
           "enum": ["lidar", "video_only"],
@@ -130,6 +131,51 @@
               "state": { "type": "string", "enum": ["unmeasured", "occluded"] },
               "reason": { "type": "string" },
               "provenance": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "trajectory": {
+          "type": ["object", "null"],
+          "description": "Pose-refinement acceptance evidence and returned-pose provenance.",
+          "properties": {
+            "accepted": { "type": "boolean" },
+            "rejected": { "type": "boolean" },
+            "pose_source": { "type": "string" },
+            "pose_convention": { "type": "string" },
+            "objective_before": { "type": "number" },
+            "objective_after": { "type": "number" },
+            "loop_residual_before": { "type": ["number", "null"] },
+            "loop_residual_after": { "type": ["number", "null"] },
+            "loop_closure_gap_before": { "type": "number" },
+            "loop_closure_gap_after": { "type": "number" },
+            "candidate_loop_closure_gap_after": { "type": "number" },
+            "rejection_reasons": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "mast3r_slam": {
+          "type": "object",
+          "description": "MASt3R-SLAM pose provenance and pre-fusion ARKit divergence gate.",
+          "properties": {
+            "pose_source": { "type": "string" },
+            "pose_provenance_path": { "type": "string" },
+            "fusion_allowed": { "type": ["boolean", "null"] },
+            "loop_closure": {
+              "type": "object",
+              "properties": {
+                "status": { "type": "string" },
+                "candidate_count": { "type": ["integer", "null"] },
+                "accepted_count": { "type": ["integer", "null"] }
+              }
+            },
+            "alignment": {
+              "type": "object",
+              "properties": {
+                "method": { "enum": ["se3", "sim3"] },
+                "translation_rmse_m": { "type": "number" },
+                "rotation_rmse_degrees": { "type": "number" },
+                "scale_divergence_fraction": { "type": "number" },
+                "timestamp_offset_seconds": { "type": "number" }
+              }
             }
           }
         },
