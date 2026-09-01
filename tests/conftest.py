@@ -17,10 +17,18 @@ CAMERA_MATRIX = np.array(
 
 
 def _write_synthetic_video(path, width=VIDEO_WIDTH, height=VIDEO_HEIGHT, n_frames=2, fps=30):
-    # 'mp4v' fails to open under macOS's AVFoundation backend (no FFMPEG in
-    # opencv-python-headless); 'avc1' (H.264) is what AVFoundation can encode.
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
-    writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
+    # AVFoundation supports H.264 while the Linux OpenCV wheel commonly only
+    # exposes MPEG-4 Part 2 encoding.  Prefer avc1 but keep fixtures portable.
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height)
+    )
+    if not writer.isOpened():
+        writer.release()
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+    if not writer.isOpened():
+        raise RuntimeError("OpenCV could not create a synthetic MP4 fixture")
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     for _ in range(n_frames):
         writer.write(frame)

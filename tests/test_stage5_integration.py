@@ -167,6 +167,11 @@ def test_contract_reports_one_frame_short_video_without_shifting_sidecars(
     writer = cv2.VideoWriter(
         str(video_path), cv2.VideoWriter_fourcc(*"avc1"), 30, (64, 48)
     )
+    if not writer.isOpened():
+        writer.release()
+        writer = cv2.VideoWriter(
+            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (64, 48)
+        )
     assert writer.isOpened()
     writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
     writer.release()
