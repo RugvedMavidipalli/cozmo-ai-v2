@@ -21,6 +21,12 @@ from .geometry import estimate_gravity
 from .geometry_diagnostics import GeometryDiagnostics
 from .ingest import display_rotation, load_capture, iter_frames
 from .keyframes import select_damage_keyframes
+from .measurements import (
+    MeasurementContext,
+    ScaleValidation,
+    measure_scene,
+    validate_reference_scale,
+)
 from .occupancy import build_surface_grid, find_openings, occluded_spans
 from .openings import fuse_openings
 from .planes import (
@@ -90,9 +96,11 @@ def run(args: argparse.Namespace) -> int:
     6. Wall refinement -- clean up and finalize the wall positions.
     7. Rooms -- split the space into separate rooms.
     8. Surfaces -- work out where the doors and windows are.
-    9. Damage -- look for water, fire, and mold damage.
-    10. Scope -- turn any damage found into a list of repair line items.
-    11. Export -- write out all the result files.
+    9. Measurements -- derive metric quantities from TLS plane geometry and
+       intersections, with explicit area/thickness conventions.
+    10. Damage -- look for water, fire, and mold damage.
+    11. Scope -- turn any damage found into a list of repair line items.
+    12. Export -- write out all the result files.
 
     See `docs/architecture.md` for more detail on each of these.
 
@@ -389,7 +397,63 @@ def run(args: argparse.Namespace) -> int:
         f"{len(roomformer_openings)} RoomFormer)"
     )
 
-    # Stage 9: damage
+    uncertainty = UncertaintyModel(
+        coverage=args.coverage,
+        calibration_path=args.calibration,
+        has_depth=bundle.has_depth,
+    )
+    if not uncertainty.calibrated:
+        warnings.append(
+            "confidence intervals are uncalibrated: no ground-truth fit was supplied"
+        )
+
+    reference_validation: ScaleValidation | None = None
+    reference_observed = getattr(args, "reference_observed_m", None)
+    reference_known = getattr(args, "reference_known_m", None)
+    if reference_observed is not None or reference_known is not None:
+        reference_validation = validate_reference_scale(
+            reference_observed,
+            reference_known,
+            reference_type=getattr(args, "reference_type", "user"),
+        )
+        if reference_validation.status == "advisory":
+            warnings.append("door reference is advisory only and was not used to calibrate scale")
+        elif reference_validation.status == "validated":
+            warnings.append(
+                "known reference scale was validated but not applied; explicitly apply the returned factor"
+            )
+        else:
+            warnings.append("known reference scale could not be validated")
+
+    # Stage 9: measurements.  This pass consumes structured plane geometry,
+    # not the room raster or a locally reconstructed wall graph.  Its primary
+    # room area is the observed interior wall-face area; centerline and outer
+    # areas are explicit offsets.  Phase 1 rooms remain compatible but are
+    # explicitly unmeasured until a bounded face is supplied.
+    with timings.stage("measurements"):
+        measurement_context = MeasurementContext.from_uncertainty(
+            uncertainty,
+            has_depth=bundle.has_depth,
+            pose_provenance="refined" if drift_report is not None else "raw",
+            default_wall_thickness_m=getattr(args, "wall_thickness", 0.15),
+            pose_uncertainty_m=drift.median_spread,
+        )
+        scene_measurements = measure_scene(
+            walls,
+            rooms,
+            frame=frame,
+            gravity=gravity,
+            context=measurement_context,
+            default_wall_thickness_m=measurement_context.default_wall_thickness_m,
+        )
+    measured_walls = sum(1 for value in scene_measurements.walls.values() if value.length.value is not None)
+    measured_rooms = sum(
+        1 for value in scene_measurements.rooms.values()
+        if value.interior_face_area.value is not None
+    )
+    print(f"  {measured_walls} wall lengths, {measured_rooms} primary room areas")
+
+    # Stage 10: damage
     regions = []
     overlay_paths = []
     if not args.no_damage:
@@ -422,33 +486,34 @@ def run(args: argparse.Namespace) -> int:
                     "annotated images"
                 )
 
-    # Stage 10: scope
+    # Stage 11: scope
     with timings.stage("scope"):
         engine = ScopeEngine(args.rules)
         wall_lengths = {
-            (wall.name or f"wall_{wall.index}"): wall.length for wall in walls
+            (wall.name or f"wall_{wall.index}"): (
+                scene_measurements.walls[wall.index].length.value
+                if wall.index in scene_measurements.walls
+                and scene_measurements.walls[wall.index].length.value is not None
+                else wall.length
+            )
+            for wall in walls
         }
         line_items, concealed = engine.build(regions, rooms, wall_lengths)
     print(f"  {len(line_items)} line items, {len(concealed)} concealed flags")
 
-    uncertainty = UncertaintyModel(
-        coverage=args.coverage,
-        calibration_path=args.calibration,
-        has_depth=bundle.has_depth,
-    )
-    if not uncertainty.calibrated:
-        warnings.append(
-            "confidence intervals are uncalibrated: no ground-truth fit was supplied"
-        )
-
-    # Stage 11: export
+    # Stage 12: export
     with timings.stage("export"):
         result = _assemble(
             bundle, gravity, frame, walls, openings, rooms, regions, concealed,
             line_items, drift, drift_report, surface_grids, uncertainty,
-            timings, warnings, engine, reconstruction.contract_report,
-            opening_rejections,
-            geometry_diagnostics,
+            timings,
+            warnings,
+            engine,
+            fusion_report=reconstruction.contract_report,
+            opening_rejections=opening_rejections,
+            geometry_diagnostics=geometry_diagnostics,
+            scene_measurements=scene_measurements,
+            reference_validation=reference_validation,
         )
         export.write_json(result, out_dir / "result.json")
         problems = export.validate(result, REPO_ROOT / "schema" / "result.schema.json")
@@ -751,6 +816,8 @@ def _assemble(
     line_items, drift, drift_report, surface_grids, uncertainty,
     timings, warnings, engine, fusion_report=None, opening_rejections=None,
     geometry_diagnostics=None,
+    scene_measurements=None,
+    reference_validation=None,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -780,6 +847,9 @@ def _assemble(
         timings: How long each stage took.
         warnings: Any warnings collected while running.
         engine: The scope engine that was used.
+        scene_measurements: Stage 9 plane-geometry measurements, or `None`
+            for callers that still use the Phase 1 assembly signature.
+        reference_validation: Optional explicit known-reference scale check.
 
     Returns:
         The full result, shaped exactly as `result.json` expects it.
@@ -797,11 +867,28 @@ def _assemble(
             if wall.index in surface_grids
             else []
         )
-        length = uncertainty.wall_length(
-            wall.length, wall.residual_rms, wall.inlier_count,
-            drift=drift_by_wall.get(wall.index, drift.median_spread),
-            inferred_fraction=wall.inferred_fraction,
+        measured_wall = (
+            scene_measurements.walls.get(wall.index)
+            if scene_measurements is not None
+            else None
         )
+        if measured_wall is not None:
+            length_doc = measured_wall.length.to_dict()
+            vertical_extent_doc = measured_wall.inlier_vertical_extent.to_dict()
+            thickness_doc = measured_wall.thickness.to_dict()
+            geometry_source = measured_wall.geometry_source
+            opposing_face_id = measured_wall.opposing_face_id
+        else:
+            length = uncertainty.wall_length(
+                wall.length, wall.residual_rms, wall.inlier_count,
+                drift=drift_by_wall.get(wall.index, drift.median_spread),
+                inferred_fraction=wall.inferred_fraction,
+            )
+            length_doc = length.to_dict()
+            vertical_extent_doc = None
+            thickness_doc = None
+            geometry_source = "phase1_wall_segment"
+            opposing_face_id = None
         wall_docs.append(
             {
                 "id": wall.index,
@@ -810,7 +897,7 @@ def _assemble(
                 "start": wall.start.tolist(),
                 "end": wall.end.tolist(),
                 "normal": wall.normal.tolist(),
-                "length": length.to_dict(),
+                "length": length_doc,
                 "height": (
                     uncertainty.ceiling_height(
                         gravity.room_height, wall.residual_rms, wall.residual_rms,
@@ -824,6 +911,11 @@ def _assemble(
                 "residual_rms_mm": round(wall.residual_rms * 1000, 2),
                 "support_points": wall.inlier_count,
                 "tags": wall.tags,
+                "inlier_vertical_extent": vertical_extent_doc,
+                "thickness": thickness_doc,
+                "wall_thickness": thickness_doc,
+                "geometry_source": geometry_source,
+                "opposing_face_id": opposing_face_id,
             }
         )
 
@@ -897,25 +989,90 @@ def _assemble(
     room_docs = []
     adjacency = []
     for room in rooms:
+        measured_room = (
+            scene_measurements.rooms.get(room.id)
+            if scene_measurements is not None
+            else None
+        )
+        primary_area = (
+            measured_room.interior_face_area.to_dict()
+            if measured_room is not None
+            else uncertainty.floor_area(
+                room.area, room.perimeter, drift.median_spread or 0.02
+            ).to_dict()
+        )
+        room_areas = (
+            {
+                "interior_face": measured_room.interior_face_area.to_dict(),
+                "wall_centerline": measured_room.wall_centerline_area.to_dict(),
+                "outer_footprint": measured_room.outer_footprint_area.to_dict(),
+            }
+            if measured_room is not None
+            else None
+        )
+        height_statistics = (
+            measured_room.floor_to_ceiling_height.to_dict()
+            if measured_room is not None
+            else None
+        )
+        legacy_ceiling_height = (
+            measured_room.floor_to_ceiling_height.mean.to_dict()
+            if measured_room is not None
+            and measured_room.floor_to_ceiling_height.mean.value is not None
+            else (
+                uncertainty.ceiling_height(
+                    room.height, 0.01, 0.01, 5000, 5000
+                ).to_dict()
+                if room.height is not None and gravity.ceiling_observed
+                else None
+            )
+        )
+        measured_polygon = (
+            measured_room.boundary
+            if measured_room is not None and measured_room.boundary
+            else (room.polygon.tolist() if room.polygon is not None else [])
+        )
+        measured_perimeter = (
+            float(
+                np.linalg.norm(
+                    np.diff(
+                        np.vstack([np.asarray(measured_polygon), measured_polygon[:1]]),
+                        axis=0,
+                    ),
+                    axis=1,
+                ).sum()
+            )
+            if len(measured_polygon) >= 2
+            else room.perimeter
+        )
         room_docs.append(
             {
                 "id": room.id,
                 "name": room.name,
-                "area": uncertainty.floor_area(
-                    room.area, room.perimeter, drift.median_spread or 0.02
-                ).to_dict(),
-                "ceiling_height": (
-                    uncertainty.ceiling_height(
-                        room.height, 0.01, 0.01, 5000, 5000
-                    ).to_dict()
-                    if room.height is not None and gravity.ceiling_observed
-                    else None
-                ),
-                "perimeter": round(room.perimeter, 3),
+                "area": primary_area,
+                "ceiling_height": legacy_ceiling_height,
+                "perimeter": round(measured_perimeter, 3),
                 "centroid": room.centroid.tolist(),
-                "polygon": room.polygon.tolist() if room.polygon is not None else [],
+                "polygon": measured_polygon,
                 "wall_ids": room.wall_indices,
                 "neighbours": room.neighbours,
+                "areas": room_areas,
+                "interior_face_area": (
+                    measured_room.interior_face_area.to_dict()
+                    if measured_room is not None else primary_area
+                ),
+                "wall_centerline_area": (
+                    measured_room.wall_centerline_area.to_dict()
+                    if measured_room is not None else None
+                ),
+                "outer_footprint_area": (
+                    measured_room.outer_footprint_area.to_dict()
+                    if measured_room is not None else None
+                ),
+                "floor_to_ceiling_height": height_statistics,
+                "area_convention": (
+                    measured_room.area_convention if measured_room is not None else None
+                ),
             }
         )
         for neighbour in room.neighbours:
@@ -1007,6 +1164,14 @@ def _assemble(
             },
             "fusion": fusion_report or {},
             "opening_rejections": list(opening_rejections or []),
+            "scale_validation": (
+                reference_validation.to_dict() if reference_validation is not None else None
+            ),
+            "measurement_conventions": (
+                next(iter(scene_measurements.rooms.values())).area_convention
+                if scene_measurements is not None and scene_measurements.rooms
+                else None
+            ),
             "warnings": warnings,
             "geometry": (
                 geometry_diagnostics.to_dict()
@@ -1024,6 +1189,20 @@ def _opening_sigma(opening, key: str) -> float:
         return max(0.0, float(value))
     except (AttributeError, TypeError, ValueError):
         return 0.0
+
+
+def _run_validate_scale(args: argparse.Namespace) -> int:
+    """CLI entry point for an explicit, non-silent reference check."""
+    validation = validate_reference_scale(
+        args.observed_m,
+        args.known_m,
+        reference_type=args.reference_type,
+        tolerance_m=args.tolerance_m,
+    )
+    import json
+
+    print(json.dumps(validation.to_dict(), indent=2))
+    return 0 if validation.status in {"validated", "advisory"} else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1130,7 +1309,17 @@ def main(argv: list[str] | None = None) -> int:
              "this confidence before masking/fusion; e.g. 0.6",
     )
     runner.add_argument("--coverage", type=float, default=0.90)
-    runner.add_argument("--no-refine", action="store_true", help="use the selected raw SLAM/ARKit poses")
+    runner.add_argument(
+        "--wall-thickness", type=float, default=0.15,
+        help="explicit default wall thickness (metres) for centerline/outer areas when opposing faces are not observed",
+    )
+    runner.add_argument(
+        "--reference-type", choices=["marker", "tape", "user", "door"], default="user",
+        help="known-reference type used with --reference-observed-m/--reference-known-m",
+    )
+    runner.add_argument("--reference-observed-m", type=float)
+    runner.add_argument("--reference-known-m", type=float)
+    runner.add_argument("--no-refine", action="store_true", help="use raw ARKit/SLAM poses")
     runner.add_argument("--no-loop-closure", action="store_true")
     runner.add_argument("--no-damage", action="store_true")
     runner.add_argument("--no-sam", action="store_true", help="use local GrabCut masks")
@@ -1145,6 +1334,18 @@ def main(argv: list[str] | None = None) -> int:
              "images (off by default -- --debug-furniture alone only prints counts)",
     )
     runner.set_defaults(func=run)
+
+    reference = subparsers.add_parser(
+        "validate-scale",
+        help="validate an explicit marker, tape, or user-supplied reference scale",
+    )
+    reference.add_argument(
+        "--reference-type", choices=["marker", "tape", "user", "door"], required=True,
+    )
+    reference.add_argument("--observed-m", type=float, required=True)
+    reference.add_argument("--known-m", type=float, required=True)
+    reference.add_argument("--tolerance-m", type=float)
+    reference.set_defaults(func=_run_validate_scale)
 
     args = parser.parse_args(argv)
     return args.func(args)

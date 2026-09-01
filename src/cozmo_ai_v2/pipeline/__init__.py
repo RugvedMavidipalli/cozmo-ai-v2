@@ -1,4 +1,4 @@
-"""Production reconstruction pipeline stages."""
+"""Public reconstruction pipeline contracts and stages."""
 
 from .frame_contract import (
     FrameContract,
@@ -10,8 +10,25 @@ from .frame_contract import (
 )
 from .ingest import FrameAssociation, VideoAvailability
 from .diagnostics import TSDFVariant, compare_tsdf_parameters
-
 from .openings import NormalizedOpening, fuse_openings
+from .measurements import (
+    HeightStatistics,
+    Measurement,
+    MeasurementContext,
+    MeasurementEvidence,
+    RoomMeasurement,
+    ScaleValidation,
+    SceneMeasurements,
+    WallMeasurement,
+    build_measurements,
+    compute_measurements,
+    door_scale_advisory,
+    measure_geometry,
+    measure_scene,
+    validate_reference_scale,
+    validate_scale,
+)
+from .planes import TLSPlane, TLSPlaneModel
 
 __all__ = [
     "FrameContract",
@@ -26,4 +43,21 @@ __all__ = [
     "compare_tsdf_parameters",
     "NormalizedOpening",
     "fuse_openings",
+    "HeightStatistics",
+    "Measurement",
+    "MeasurementContext",
+    "MeasurementEvidence",
+    "RoomMeasurement",
+    "ScaleValidation",
+    "SceneMeasurements",
+    "WallMeasurement",
+    "build_measurements",
+    "compute_measurements",
+    "door_scale_advisory",
+    "measure_geometry",
+    "measure_scene",
+    "validate_reference_scale",
+    "validate_scale",
+    "TLSPlane",
+    "TLSPlaneModel",
 ]
