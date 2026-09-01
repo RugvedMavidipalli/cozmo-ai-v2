@@ -3,7 +3,7 @@ import json
 import cv2
 import numpy as np
 
-from cozmo_ai_v2.cli import run_densify
+from cozmo_ai_v2.cli import _densify_indices, run_densify
 from cozmo_ai_v2.depth.capture import require_lidar_capture
 from cozmo_ai_v2.depth.densify import densify_capture
 
@@ -84,3 +84,10 @@ def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path
 
     assert exit_code == 1
     assert "error" in capsys.readouterr().err.lower()
+
+
+def test_densify_indices_sample_real_depth_frame_ids(stray_capture):
+    capture = require_lidar_capture(stray_capture)
+
+    assert _densify_indices(capture, 1) is None
+    assert _densify_indices(capture, 2) == [0]
