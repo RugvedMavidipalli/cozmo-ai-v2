@@ -76,6 +76,32 @@ def test_densify_capture_end_to_end(stray_capture, tmp_path):
         assert (output_dir / "dense_qc" / f"{index:06d}.png").exists()
 
 
+def test_densify_capture_records_alignment_rejection_and_continues(stray_capture, tmp_path):
+    capture = require_lidar_capture(stray_capture)
+
+    depth0 = cv2.imread(str(stray_capture / "depth" / "000000.png"), cv2.IMREAD_UNCHANGED)
+    depth1 = cv2.imread(str(stray_capture / "depth" / "000001.png"), cv2.IMREAD_UNCHANGED)
+    # The second prediction is anti-correlated with its LiDAR depth, causing
+    # the robust scale/shift fit to reject it with a negative scale.
+    model = FakeDepthModel(
+        [_full_res_ramp(depth0), np.fliplr(_full_res_ramp(depth1))],
+        bias=0.0,
+    )
+    output_dir = tmp_path / "out"
+
+    densify_capture(capture, model, output_dir)
+
+    manifest = json.loads((output_dir / "densify_manifest.json").read_text())
+    assert manifest["frame_count"] == 2
+    assert manifest["frames"][0]["status"] == "qc_approved"
+    rejected = manifest["frames"][1]
+    assert rejected["index"] == 1
+    assert rejected["status"] == "rejected"
+    assert rejected["qc_approved"] is False
+    assert "outside the plausible range" in rejected["qc_reason"]
+    assert not (output_dir / "dense_depth" / "000001.png").exists()
+
+
 def test_cli_densify_reports_missing_torch(lidar_stray_scanner_dataset, tmp_path, capsys):
     exit_code = run_densify(
         lidar_stray_scanner_dataset, tmp_path / "out", "metric3d_vit_small",

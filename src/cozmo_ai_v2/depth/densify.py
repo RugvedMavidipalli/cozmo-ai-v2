@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from ..camera import extract_calibration_4, parse_camera_matrix
-from .align import ScaleShiftFit, fit_scale_shift
+from .align import AlignmentError, ScaleShiftFit, fit_scale_shift
 from .capture import LidarCaptureInput, _sidecar_frame_count, iter_capture_frames
 from ..pipeline.ingest import VideoAvailability
 from .fusion import FusionResult, fuse_local_residual
