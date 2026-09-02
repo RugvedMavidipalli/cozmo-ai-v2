@@ -694,6 +694,12 @@ def run(args: argparse.Namespace) -> int:
                     "  [debug-furniture] pass --furniture-overlays to also save "
                     "annotated images"
                 )
+    elif getattr(args, "stage_manifest", None) is not None:
+        args.stage_manifest.unavailable(
+            "damage",
+            "disabled by --no-damage; geometry and scope remain available",
+            outputs=[Path(args.out) / "result.json"],
+        )
 
     # Stage 11: scope
     with timings.stage("scope"):
