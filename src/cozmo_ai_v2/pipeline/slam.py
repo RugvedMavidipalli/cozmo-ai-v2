@@ -482,7 +482,14 @@ def resample_trajectory(
     if np.any(np.diff(timestamps) <= 0.0):
         raise SlamResultError("MASt3R-SLAM timestamps must be strictly increasing for resampling")
     if target_timestamps[0] < timestamps[0] or target_timestamps[-1] > timestamps[-1]:
-        raise SlamResultError("MASt3R-SLAM trajectory does not span all capture timestamps")
+        raise SlamResultError(
+            "MASt3R-SLAM trajectory does not span all capture timestamps "
+            f"(trajectory={len(timestamps)} poses over "
+            f"[{timestamps[0]:.6f}, {timestamps[-1]:.6f}]s; "
+            f"capture={len(target_timestamps)} frames over "
+            f"[{target_timestamps[0]:.6f}, {target_timestamps[-1]:.6f}]s; "
+            "safe extrapolation is disabled)"
+        )
     resampled = np.empty((len(target_timestamps), 4, 4), dtype=float)
     for index, timestamp in enumerate(target_timestamps):
         upper = int(np.searchsorted(timestamps, timestamp, side="left"))

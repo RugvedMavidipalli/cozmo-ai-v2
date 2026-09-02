@@ -67,6 +67,10 @@ class Timings(dict):
     stores the result automatically.
     """
 
+    def __init__(self, stage_manifest=None):
+        super().__init__()
+        self.stage_manifest = stage_manifest
+
     @contextmanager
     def stage(self, name: str, verbose: bool = True):
         """Times a block of code and stores how long it took under `name`.
@@ -84,11 +88,28 @@ class Timings(dict):
         if verbose:
             print(f"  {name} ...", end="", flush=True)
         start = time.time()
-        yield
-        elapsed = time.time() - start
-        self[name] = round(elapsed, 2)
-        if verbose:
-            print(f" {elapsed:.1f}s")
+        manifest_stage = (
+            self.stage_manifest.stage(name)
+            if self.stage_manifest is not None
+            else None
+        )
+        try:
+            if manifest_stage is None:
+                yield
+            else:
+                with manifest_stage:
+                    yield
+        except BaseException:
+            elapsed = time.time() - start
+            self[name] = round(elapsed, 2)
+            if verbose:
+                print(f" failed after {elapsed:.1f}s")
+            raise
+        else:
+            elapsed = time.time() - start
+            self[name] = round(elapsed, 2)
+            if verbose:
+                print(f" {elapsed:.1f}s")
 
 
 def _launch_mast3r_for_capture(
@@ -158,7 +179,7 @@ def run(args: argparse.Namespace) -> int:
         0 if everything went well. 1 if the final result fails a schema
         check (a sign something is actually wrong with the output).
     """
-    timings = Timings()
+    timings = Timings(getattr(args, "stage_manifest", None))
     warnings: list[str] = []
     geometry_diagnostics = GeometryDiagnostics()
     out_dir = Path(args.out or f"out/{Path(args.capture).name}")
@@ -343,6 +364,14 @@ def run(args: argparse.Namespace) -> int:
     import open3d as o3d
 
     contract_report = reconstruction.contract_report or {}
+    if getattr(args, "stage_manifest", None) is not None:
+        population = contract_report.get("population")
+        if isinstance(population, dict):
+            args.stage_manifest.update_last(
+                "fusion",
+                operation="fusion",
+                population=population,
+            )
     rejected_count = len(contract_report.get("rejected_frames", []))
     fallback_count = len(contract_report.get("fallback_frames", []))
     availability = contract_report.get("video_availability") or {}
@@ -496,6 +525,7 @@ def run(args: argparse.Namespace) -> int:
     with timings.stage("surfaces"):
         surface_grids = {}
         geometry_openings = []
+        geometry_opening_status = "completed"
         if gravity.ceiling_observed and ceiling is not None:
             for wall in walls:
                 if wall.length < 0.6:
@@ -507,11 +537,14 @@ def run(args: argparse.Namespace) -> int:
                 geometry_openings.extend(find_openings(surface))
         else:
             warnings.append("ceiling not observed; wall opening heights are unavailable")
+            geometry_opening_status = "unavailable"
 
         opening_rejections = []
         roomformer_openings = []
+        roomformer_status = "not_requested"
         predictions_path = getattr(args, "roomformer_predictions", None)
         if predictions_path:
+            roomformer_status = "completed"
             try:
                 from .roomformer import RoomFormerSDTQAdapter
 
@@ -525,13 +558,21 @@ def run(args: argparse.Namespace) -> int:
                 opening_rejections.extend(roomformer_adapter.rejections)
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 warnings.append(f"RoomFormer opening predictions unavailable: {exc}")
+                roomformer_status = "unavailable"
 
         rgb_openings = []
+        rgb_opening_status = "not_requested"
+        rgb_opening_reason = ""
         if getattr(args, "rgb_openings", False):
+            rgb_opening_status = "completed"
             with timings.stage("rgb openings"):
                 if not bundle.has_depth:
-                    warnings.append("RGB opening detection skipped: calibrated depth is unavailable")
+                    rgb_opening_status = "unavailable"
+                    rgb_opening_reason = "calibrated depth is unavailable"
+                    warnings.append(f"RGB opening detection skipped: {rgb_opening_reason}")
                 elif not getattr(args, "grounding_dino_model", None) or not getattr(args, "sam2_checkpoint", None) or not getattr(args, "sam2_config", None):
+                    rgb_opening_status = "unavailable"
+                    rgb_opening_reason = "local Grounding DINO, SAM2 checkpoint, and SAM2 config paths were not supplied"
                     warnings.append(
                         "RGB opening detection skipped: provide local Grounding DINO, SAM2 checkpoint, and SAM2 config paths"
                     )
@@ -574,11 +615,52 @@ def run(args: argparse.Namespace) -> int:
                             for item in rgb_result.rejected
                         )
                     except ModelUnavailable as exc:
+                        rgb_opening_status = "unavailable"
+                        rgb_opening_reason = str(exc)
                         warnings.append(f"RGB opening detection unavailable: {exc}")
                     except (OSError, ValueError, RuntimeError) as exc:
+                        rgb_opening_status = "failed"
+                        rgb_opening_reason = str(exc)
                         warnings.append(f"RGB opening detection failed: {exc}")
 
         openings = fuse_openings(geometry_openings + roomformer_openings + rgb_openings)
+        opening_stage = {
+            "status": "completed",
+            "geometry": {
+                "status": geometry_opening_status,
+                "candidate_count": len(geometry_openings),
+            },
+            "roomformer": {
+                "status": roomformer_status,
+                "candidate_count": len(roomformer_openings),
+            },
+            "rgb": {
+                "status": rgb_opening_status,
+                "candidate_count": len(rgb_openings),
+                "rejection_count": sum(
+                    item.get("provenance") == ["rgb"]
+                    for item in opening_rejections
+                    if isinstance(item, dict)
+                ),
+                "reason": rgb_opening_reason or None,
+            },
+            "accepted_count": len(openings),
+            "rejected_count": len(opening_rejections),
+        }
+        if getattr(args, "stage_manifest", None) is not None:
+            args.stage_manifest.update_last(
+                "surfaces",
+                operation="surfaces",
+                outputs=[Path(args.out) / "result.json", Path(args.out) / "openings.csv"],
+                opening_counts=opening_stage,
+            )
+            if rgb_opening_status in {"unavailable", "failed"}:
+                args.stage_manifest.update_last(
+                    "rgb openings",
+                    operation="rgb openings",
+                    status=rgb_opening_status,
+                    reason=rgb_opening_reason,
+                )
     print(
         f"  {len(openings)} openings "
         f"({len(geometry_openings)} geometry, {len(rgb_openings)} RGB, "
@@ -673,6 +755,12 @@ def run(args: argparse.Namespace) -> int:
                     "  [debug-furniture] pass --furniture-overlays to also save "
                     "annotated images"
                 )
+    elif getattr(args, "stage_manifest", None) is not None:
+        args.stage_manifest.unavailable(
+            "damage",
+            "disabled by --no-damage; geometry and scope remain available",
+            outputs=[Path(args.out) / "result.json"],
+        )
 
     # Stage 11: scope
     with timings.stage("scope"):
@@ -699,10 +787,13 @@ def run(args: argparse.Namespace) -> int:
             engine,
             fusion_report=reconstruction.contract_report,
             opening_rejections=opening_rejections,
+            opening_stage=opening_stage,
             geometry_diagnostics=geometry_diagnostics,
             scene_measurements=scene_measurements,
             reference_validation=reference_validation,
             structural_planes=structural_planes,
+            plane_threshold=getattr(args, "plane_threshold", 0.03),
+            plane_min_inliers=getattr(args, "plane_min_inliers", 30),
         )
         if mast3r_integration is not None:
             alignment = mast3r_integration.alignment
@@ -730,7 +821,11 @@ def run(args: argparse.Namespace) -> int:
         if problems:
             warnings.extend(f"schema: {p}" for p in problems[:5])
         try:
-            export.render_floorplan(result, out_dir / "floorplan.svg")
+            export.render_floorplan(
+                result,
+                out_dir / "floorplan.svg",
+                min_label_length=0.0,
+            )
         except Exception as exc:
             warnings.append(f"floor plan render failed: {exc}")
         export.export_scene(
@@ -1072,10 +1167,13 @@ def _assemble(
     bundle, gravity, frame, walls, openings, rooms, regions, concealed,
     line_items, drift, drift_report, surface_grids, uncertainty,
     timings, warnings, engine, fusion_report=None, opening_rejections=None,
+    opening_stage=None,
     geometry_diagnostics=None,
     scene_measurements=None,
     reference_validation=None,
     structural_planes=None,
+    plane_threshold=0.03,
+    plane_min_inliers=30,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -1455,13 +1553,9 @@ def _assemble(
             "plane_extraction": {
                 "algorithm": "seeded_ransac_region_growing_tls_3d",
                 "refit": "total_least_squares_svd_perpendicular_residual",
-                "candidate_threshold": float(
-                    getattr(args, "plane_threshold", 0.03)
-                ),
-                "support_threshold": int(getattr(args, "plane_min_inliers", 30)),
-                "residual_threshold": float(
-                    getattr(args, "plane_threshold", 0.03)
-                ),
+                "candidate_threshold": float(plane_threshold),
+                "support_threshold": int(plane_min_inliers),
+                "residual_threshold": float(plane_threshold),
                 "plane_count": len(structural_plane_docs),
                 "kept_count": sum(not plane.quarantined for plane in structural_planes),
                 "quarantined_count": sum(plane.quarantined for plane in structural_planes),
@@ -1505,6 +1599,11 @@ def _assemble(
             },
             "fusion": fusion_report or {},
             "opening_rejections": list(opening_rejections or []),
+            "opening_stage": opening_stage or {
+                "status": "completed",
+                "accepted_count": len(opening_docs),
+                "rejected_count": len(opening_rejections or []),
+            },
             "scale_validation": (
                 reference_validation.to_dict() if reference_validation is not None else None
             ),
@@ -1546,25 +1645,13 @@ def _run_validate_scale(args: argparse.Namespace) -> int:
     return 0 if validation.status in {"validated", "advisory"} else 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    """The command-line entry point: reads the arguments the user typed
-    and runs the pipeline with them.
+def build_parser() -> argparse.ArgumentParser:
+    """Build the reconstruction CLI parser for direct and composed callers.
 
-    This is what actually gets called when you run
-    `python -m pipeline run <capture>`. It also loads the `.env` file
-    first, which is what makes the Anthropic API key available for the
-    damage-detection stage.
-
-    Args:
-        argv: The arguments to parse, or `None` to read them from the
-            command line as usual.
-
-    Returns:
-        The exit code from `run()`.
+    The start-to-finish command uses this parser to construct the exact same
+    reconstruction arguments as the established ``pipeline run`` entry point,
+    while supplying the pre-stage artifacts it created in the same process.
     """
-    from dotenv import load_dotenv
-
-    load_dotenv(REPO_ROOT / ".env")
 
     parser = argparse.ArgumentParser(prog="pipeline", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1756,6 +1843,16 @@ def main(argv: list[str] | None = None) -> int:
     reference.add_argument("--known-m", type=float, required=True)
     reference.add_argument("--tolerance-m", type=float)
     reference.set_defaults(func=_run_validate_scale)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The direct reconstruction CLI entry point."""
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+    parser = build_parser()
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -1,5 +1,14 @@
 # Architecture
 
+The user-facing command is `cozmo-ai-v2 pipeline INPUT --out OUT`. It is the
+single start-to-finish entry point: it detects the input tier, prepares the
+applicable pose/depth artifacts, invokes the established reconstruction
+runner, and refuses to report success until the schema and required exports
+exist. `stage_manifest.json` is written incrementally and records stage order,
+status/reason, duration, inputs/outputs, model identity, pose convention, and
+depth provenance. Older `prepare`, `densify`, `run`, and `pipeline run`
+commands remain available as lower-level debugging interfaces.
+
 One command, `python -m pipeline run <capture_dir>`, turns a handheld LiDAR
 walkthrough into a dimensioned floor plan, a 3D model, a damage assessment, and a
 restoration scope of work. This document is the map: what runs in what order, what

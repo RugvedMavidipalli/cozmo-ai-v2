@@ -126,6 +126,13 @@ def _densify_indices(capture, stride: int) -> list[int] | None:
     return sorted(indices)[::stride]
 
 
+def run_pipeline_command(args: argparse.Namespace) -> int:
+    """Run the complete capture-to-export pipeline in one invocation."""
+    from .pipeline.orchestrator import run_pipeline
+
+    return run_pipeline(args)
+
+
 def run_slam(
     input_path: Path,
     mast3r_slam_dir: Path,
@@ -333,6 +340,70 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Where to write pose provenance (default: MASt3R-SLAM results directory)",
     )
+
+    pipeline = subparsers.add_parser(
+        "pipeline",
+        help="Run every applicable capture stage and export a validated result in one command",
+    )
+    pipeline.add_argument("input", type=Path, help="Stray Scanner capture directory or standalone RGB video")
+    pipeline.add_argument("--out", type=Path, required=True, help="fresh output directory for this invocation")
+    pipeline.add_argument("--rules", default=str(Path(__file__).resolve().parents[2] / "rules.yaml"))
+    pipeline.add_argument("--cache-dir", default="cache/vlm")
+    pipeline.add_argument("--calibration", default=str(Path(__file__).resolve().parents[2] / "bench" / "calibration.json"))
+    pipeline.add_argument("--model", default="claude-opus-5")
+    pipeline.add_argument("--stride", type=int, default=4)
+    pipeline.add_argument("--voxel", type=float, default=0.02)
+    pipeline.add_argument("--sdf-trunc", type=float, default=None)
+    pipeline.add_argument("--max-depth", type=float, default=3.5)
+    pipeline.add_argument("--min-confidence", type=int, default=1)
+    pipeline.add_argument("--depth-source", choices=("auto", "dense", "raw"), default="auto")
+    pipeline.add_argument("--frame-association", choices=("pts", "index"), default="pts")
+    pipeline.add_argument("--pts-tolerance-s", type=float, default=None)
+    pipeline.add_argument("--dense-depth-dir", type=Path, default=None)
+    pipeline.add_argument("--densify-manifest", type=Path, default=None)
+    pipeline.add_argument("--metric3d-weights", type=Path, default=None, help="local Metric3D v2 checkpoint")
+    pipeline.add_argument("--metric3d-repository", type=Path, default=None, help="local Metric3D checkout")
+    pipeline.add_argument("--metric3d-variant", default="metric3d_vit_small")
+    pipeline.add_argument("--depth-device", default=None, help="Metric3D inference device")
+    pipeline.add_argument("--depth-output-scale", type=float, default=1.0)
+    pipeline.add_argument("--intrinsics", type=Path, default=None, help="RGB-only camera matrix/calibration sidecar")
+    pipeline.add_argument("--slam-poses", type=Path, default=None, help="precomputed pose table; otherwise MASt3R-SLAM runs for RGB-only")
+    pipeline.add_argument("--mast3r-slam-dir", type=Path, default=None)
+    pipeline.add_argument("--mast3r-config", default="config/base.yaml")
+    pipeline.add_argument("--mast3r-python", default=sys.executable)
+    pipeline.add_argument("--mast3r-save-as", default=None)
+    pipeline.add_argument("--mast3r-no-viz", action="store_true", default=True)
+    pipeline.add_argument("--mast3r-max-pose-gap", type=float, default=1.0)
+    pipeline.add_argument("--plane-threshold", type=float, default=0.03)
+    pipeline.add_argument("--plane-min-inliers", type=int, default=30)
+    pipeline.add_argument("--max-planes", type=int, default=80)
+    pipeline.add_argument("--plane-seed", type=int, default=0)
+    pipeline.add_argument("--damage-frames", type=int, default=40)
+    pipeline.add_argument("--min-views", type=int, default=2)
+    pipeline.add_argument("--no-damage", action="store_true")
+    pipeline.add_argument("--no-sam", action="store_true")
+    pipeline.add_argument("--rgb-openings", action="store_true")
+    pipeline.add_argument("--grounding-dino-model", default=None)
+    pipeline.add_argument("--sam2-checkpoint", default=None)
+    pipeline.add_argument("--sam2-config", default=None)
+    pipeline.add_argument("--rgb-device", default="cuda")
+    pipeline.add_argument("--opening-frames", type=int, default=40)
+    pipeline.add_argument("--rgb-box-threshold", type=float, default=0.30)
+    pipeline.add_argument("--rgb-text-threshold", type=float, default=0.25)
+    pipeline.add_argument("--rgb-min-confidence", type=float, default=0.35)
+    pipeline.add_argument("--roomformer-predictions", default=None)
+    pipeline.add_argument("--roomformer-min-confidence", type=float, default=0.25)
+    pipeline.add_argument("--min-detection-confidence", type=float, default=0.0)
+    pipeline.add_argument("--coverage", type=float, default=0.90)
+    pipeline.add_argument("--wall-thickness", type=float, default=0.15)
+    pipeline.add_argument("--reference-type", choices=["marker", "tape", "user", "door"], default="user")
+    pipeline.add_argument("--reference-observed-m", type=float, default=None)
+    pipeline.add_argument("--reference-known-m", type=float, default=None)
+    pipeline.add_argument("--no-refine", action="store_true")
+    pipeline.add_argument("--no-loop-closure", action="store_true")
+    pipeline.add_argument("--debug-furniture", action="store_true")
+    pipeline.add_argument("--furniture-overlays", action="store_true")
+    pipeline.set_defaults(func=run_pipeline_command)
     return parser
 
 
@@ -371,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
             args.metrics_path,
             args.pose_manifest,
         )
+    if args.command == "pipeline":
+        return run_pipeline_command(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

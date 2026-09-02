@@ -55,6 +55,34 @@ def _resolve_mast3r_slam_dir(path: Path) -> Path:
     return root
 
 
+def _expected_trajectory_path(root: Path, video_path: Path, save_as: str | None) -> Path:
+    results_dir = root / "logs" / save_as if save_as else root / "logs"
+    return results_dir / f"{video_path.stem}.txt"
+
+
+def _partial_trajectory_summary(path: Path) -> str:
+    """Describe a partial upstream output without treating it as usable."""
+    if not path.is_file():
+        return "no trajectory file was produced"
+    try:
+        rows = [line.split() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except OSError as exc:
+        return f"trajectory file could not be inspected: {exc}"
+    timestamps = []
+    for row in rows:
+        try:
+            if len(row) == 8:
+                timestamps.append(float(row[0]))
+        except ValueError:
+            continue
+    if not timestamps:
+        return f"trajectory file exists but has no parseable pose rows ({path})"
+    return (
+        f"partial trajectory {path} has {len(timestamps)} pose row(s) over "
+        f"[{min(timestamps):.6f}, {max(timestamps):.6f}]s"
+    )
+
+
 def detect_mast3r_slam_capabilities(path: Path) -> Mast3rSlamCapabilities:
     """Report whether an upstream checkout advertises a pose-prior CLI flag.
 
@@ -173,8 +201,11 @@ def run_rgb_video(
         tuple(command), root, completed.returncode, capabilities, pose_prior_mode
     )
     if completed.returncode != 0:
+        trajectory_path = _expected_trajectory_path(root, video_path, save_as)
         raise Mast3rSlamError(
-            f"MASt3R-SLAM exited with status {completed.returncode}: "
+            f"MASt3R-SLAM exited with status {completed.returncode}; "
+            f"{_partial_trajectory_summary(trajectory_path)}; "
+            f"expected trajectory: {trajectory_path}; command: "
             f"{' '.join(invocation.command)}"
         )
     return invocation

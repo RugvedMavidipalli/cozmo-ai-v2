@@ -133,6 +133,17 @@ def test_resample_trajectory_rejects_unobserved_gaps():
         resample_trajectory(sparse, np.array([0.0, 1.0, 2.0]), max_gap_seconds=0.5)
 
 
+def test_resample_trajectory_reports_incomplete_timestamp_coverage():
+    sparse = PoseTrajectory(
+        np.array([0.0]),
+        _trajectory([[0, 0, 0]]).poses,
+        "mast3r_slam",
+    )
+
+    with pytest.raises(SlamResultError, match="trajectory=1 poses.*capture=2 frames.*safe extrapolation"):
+        resample_trajectory(sparse, np.array([0.0, 1.0]))
+
+
 def test_integrate_results_records_arkit_provenance_and_loop_metrics(tmp_path):
     trajectory_path = tmp_path / "recording.txt"
     trajectory_path.write_text(

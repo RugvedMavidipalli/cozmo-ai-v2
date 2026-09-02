@@ -59,6 +59,14 @@ def test_densify_capture_end_to_end(stray_capture, tmp_path):
     assert manifest["video_availability"]["expected_frame_count"] == 2
     assert manifest["video_availability"]["decoded_frame_count"] == 2
     assert manifest["video_availability"]["pts_status"] == "used"
+    assert manifest["population"] == {
+        "input_frames": 2,
+        "selected_frames": 2,
+        "densified_frames": 2,
+        "qc_approved_frames": 2,
+        "rejected_frames": 0,
+        "missing_selected_frames": 0,
+    }
     assert len(manifest["frames"]) == 2
     for report in manifest["frames"]:
         assert report["scale"] > 0
@@ -100,6 +108,10 @@ def test_densify_capture_records_alignment_rejection_and_continues(stray_capture
     assert rejected["qc_approved"] is False
     assert "outside the plausible range" in rejected["qc_reason"]
     assert not (output_dir / "dense_depth" / "000001.png").exists()
+    assert manifest["population"]["selected_frames"] == 2
+    assert manifest["population"]["densified_frames"] == 1
+    assert manifest["population"]["qc_approved_frames"] == 1
+    assert manifest["population"]["rejected_frames"] == 1
 
 
 def test_densify_capture_can_emit_manifest_declared_scaled_rgb(stray_capture, tmp_path):

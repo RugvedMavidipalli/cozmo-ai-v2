@@ -43,6 +43,41 @@ The --no-damage mode is the recommended path for geometry work, privacy-
 sensitive runs, and CPU-only smoke testing. It skips both damage detection and
 scope generation; it does not skip reconstruction or export.
 
+### One-command start-to-finish CLI
+
+For a clean invocation that detects the input tier, prepares poses and depth,
+runs the reconstruction stages, and validates all exports, use:
+
+```console
+cozmo-ai-v2 pipeline INPUT --out OUT [options]
+```
+
+Stray Scanner inputs use their native ARKit odometry and raw LiDAR. If local
+Metric3D weights and checkout are supplied, the command also runs dense-depth
+scale/shift and QC internally:
+
+```console
+cozmo-ai-v2 pipeline /data/recordings-2 --out out/recordings-2 \
+  --metric3d-weights /models/metric_depth_vit_small_800k.pth \
+  --metric3d-repository /models/Metric3D --no-damage
+```
+
+Standalone RGB video inputs run MASt3R-SLAM and Metric3D internally. Supply
+`--mast3r-slam-dir`, `--mast3r-python`, and local Metric3D paths; `--intrinsics`
+is optional and otherwise an explicitly labelled uncalibrated pinhole prior is
+used. Every run writes `stage_manifest.json`, including unavailable optional
+features and required-stage failures. It also writes `ingest_qc.json`,
+`pose_provenance.json`, `result.json`, `floorplan.svg`, `scene.glb`,
+`cloud.ply`, `mesh.ply`, `planes.json`, `fusion_manifest.json`,
+`openings.csv`, and the scope CSV exports. Use a fresh `--out` directory for
+an auditable clean run; existing input data and model checkouts are never
+modified.
+
+Everything runs locally except two disclosed hosted calls (see
+[Disclosed external services](#disclosed-external-services)). Nothing calls our
+infrastructure — the keys are yours, and every response is cached to disk so a
+second run is offline and free.
+
 ## Prerequisites
 
 ### Python and platform

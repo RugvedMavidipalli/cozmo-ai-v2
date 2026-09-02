@@ -112,6 +112,7 @@ class _DenseEntry:
     reason: str = ""
     depth_unit: str = "mm"
     rgb_scale: tuple[float, float] = (1.0, 1.0)
+    provenance: str = DENSE_DEPTH_SOURCE
 
 
 def _normalise_indices(indices: list[int] | np.ndarray | None, count: int) -> tuple[int, ...]:
@@ -228,6 +229,7 @@ def _manifest_entries(manifest_path: Path | None, dense_dir: Path | None) -> dic
             reason=str(raw.get("qc_reason", "")),
             depth_unit=str(raw.get("depth_unit", payload.get("depth_unit", "mm"))),
             rgb_scale=manifest_rgb_scale,
+            provenance=str(payload.get("depth_provenance", DENSE_DEPTH_SOURCE)),
         )
     return entries
 
@@ -337,17 +339,17 @@ class FrameContract:
             except (FrameContractError, OSError, ValueError) as exc:
                 if self.depth_source_mode == "auto" and raw_depth is not None:
                     self.fallback_frames[index] = FrameRejection(
-                        index, f"dense frame rejected ({exc}); raw LiDAR used", DENSE_DEPTH_SOURCE
+                        index, f"dense frame rejected ({exc}); raw LiDAR used", entry.provenance
                     )
                 else:
-                    self._reject(index, f"dense frame rejected: {exc}", DENSE_DEPTH_SOURCE)
+                    self._reject(index, f"dense frame rejected: {exc}", entry.provenance)
                     return None
         elif self.depth_source_mode != "raw" and entry is not None:
             reason = entry.reason or "manifest entry is not qc_approved"
             if self.depth_source_mode == "auto" and raw_depth is not None:
-                self.fallback_frames[index] = FrameRejection(index, f"{reason}; raw LiDAR used", DENSE_DEPTH_SOURCE)
+                self.fallback_frames[index] = FrameRejection(index, f"{reason}; raw LiDAR used", entry.provenance)
             else:
-                self._reject(index, reason, DENSE_DEPTH_SOURCE)
+                self._reject(index, reason, entry.provenance)
                 return None
         elif self.depth_source_mode != "raw" and self.dense_depth_dir is not None:
             reason = "dense raster has no QC-approved manifest entry"
@@ -441,7 +443,7 @@ class FrameContract:
             pose=pose,
             intrinsics=self.bundle.intrinsics_for_size(width, height),
             provenance=FrameProvenance(
-                depth_source=DENSE_DEPTH_SOURCE,
+                depth_source=entry.provenance,
                 depth_path=str(entry.depth_path),
                 confidence_source=confidence_source,
                 confidence_path=confidence_path,
@@ -515,6 +517,23 @@ class FrameContract:
         """Return deterministic provenance and frame-decision metadata."""
         sources = sorted(set(self.depth_sources.values()))
         provenance = list(self.provenance_by_index.values())
+        requested = set(self.requested_indices)
+        dense_entries = [
+            entry
+            for index, entry in self._dense_entries.items()
+            if index in requested
+            and entry.depth_path is not None
+            and entry.depth_path.exists()
+        ]
+        dense_qc_rejected = sum(not entry.qc_approved for entry in dense_entries)
+        fused_dense = sum(
+            self.depth_sources.get(index) == DENSE_DEPTH_SOURCE
+            for index in self.integrated_indices
+        )
+        fused_raw = sum(
+            self.depth_sources.get(index) == RAW_LIDAR_SOURCE
+            for index in self.integrated_indices
+        )
         registration = {
             "policy": "dense_requires_native_or_manifest_declared_scaled_rgb_alignment; raw_rgb_area_resize_to_depth",
             "dense_depth": {
@@ -558,6 +577,19 @@ class FrameContract:
             },
             "requested_indices": list(self.requested_indices),
             "integrated_indices": sorted(self.integrated_indices),
+            "population": {
+                "input_frames": len(self.bundle),
+                "selected_frames": len(self.requested_indices),
+                "densified_frames": len(dense_entries),
+                "qc_approved_dense_frames": sum(entry.qc_approved for entry in dense_entries),
+                "fused_frames": len(self.integrated_indices),
+                "fused_dense_frames": fused_dense,
+                "fused_raw_frames": fused_raw,
+                "rejected_frames": len(self.rejected_frames),
+                "dense_qc_rejected_frames": dense_qc_rejected,
+                "rejected_frames_total": len(self.rejected_frames) + dense_qc_rejected,
+                "fallback_frames": len(self.fallback_frames),
+            },
             "video_availability": (
                 self.video_availability.to_dict()
                 if self.video_availability is not None
