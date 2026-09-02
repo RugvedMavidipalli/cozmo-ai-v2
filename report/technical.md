@@ -54,7 +54,7 @@ by the repository.
 
 | Tier | Input contract implemented in code | Runtime status |
 |---|---|---|
-| A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection/loader contracts plus a VM raw-LiDAR/ARKit stride-60 smoke; no device qualification is claimed [R2][R3][R13]. |
+| A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection/loader contracts plus a VM raw-LiDAR/ARKit stride-60 smoke; this is not device qualification [R2][R3][R13]. |
 | B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; no completed dense-depth result is retained or claimed. The recovered smoke is raw LiDAR only [R3][R13]. |
 | C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested; standalone-video and MASt3R-SLAM reconstruction remain unvalidated [R2][R3][R13]. |
 | Reject | Missing required files, an unsupported extension, an unrelated directory, or absent raw/dense depth produces an explicit detection/load error. | Unit-tested for detection; this is an input failure, not graceful reconstruction [R2][R3]. |
@@ -130,15 +130,16 @@ The fix loop has three evidence-backed steps:
    untracked zero-room artifact: the same 5,443-frame/90.74-second capture
    yields 0 rooms and 31 walls, with no geometry diagnostics. The old output
    cannot say whether wall loss, endpoint connectivity, polygonization, or
-   floor evidence was decisive [R10].
+   floor evidence was decisive [R10][R14].
 
    Recovery restored a separate raw-LiDAR/ARKit stride-60 smoke: 91 requested
    timestamps, 265,689 cloud points, 29 exported walls, 0 openings, and 0
    rooms, with schema errors 0. A corrected SceneCAD-density RoomFormer smoke
    loaded with 0 missing/0 unexpected keys, produced one image-space polygon,
-   and wrote 29 wall-dimension rows; the polygon remains a poor fit. These are
-   subset/smoke observations, not a closure fix or a before/after improvement
-   claim [R13].
+   and wrote 29 wall-dimension rows. Its overlay shows all 29 orange pipeline
+   traces and a length±tolerance legend; the green polygon remains a poor fit.
+   These are subset/smoke observations, not a closure fix or a before/after
+   improvement claim [R13].
 
 The first real PR-6-labeled run is more specific: it records 1 room from
 `observed_floor_components`, `fallback_used:true`, and zero candidate/accepted
@@ -205,7 +206,7 @@ standards-compliant estimator.
 
 Repository implementation links R1–R11 below point to commit
 `086e742c64edf132152bcd26b352c350561b2165` and were validated 2026-09-02.
-PR/source links in R13 are separately pinned. The full claim-to-evidence ledger
+PR/source links in R13–R14 are separately pinned. The full claim-to-evidence ledger
 and artifact hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R1] [`pipeline/cli.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L125-L148), [`docs/architecture.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/architecture.md#L22-L131).
@@ -224,7 +225,7 @@ and artifact hashes are in [`report/evidence_register.md`](evidence_register.md)
 
 [R8] Historical primary commits [`e325b718`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/e325b71834d0baac9168af13b9427486a8d0cbc9) and [`d814ed34`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/d814ed3407bc0b7e37a9f6a9e78429c6fc68d517). The associated untracked legacy JSON hashes (`ablations_rec1.json` `e1e729889a8c20dc2344d549c94a52dbe64f14ad8fcbbe92605bf4581fba58d2`, `gating_sweep.json` `2506cad3d41a654477bf34c06a406c4dbf948ecdfa43f77c66feb363747e7b12`, `depth_bias.json` `fb7083645c0eeef2bcb795249fc589614dd8ead28f56c8b49f41620d1c715c62`) are ledger-only because their producer config is not embedded.
 
-[R10] Local untracked zero-room artifact SHA-256 `69dab1895678e76b58a1595272bcbcffec3ed91be52192592ce433eeaa153903`; first PR-6 real-run artifact SHA-256 `d462e5bb5446c18dbb6103cc2576f81f79eba084c75c1b380e749be5ce4fa834`; rerun-1 SHA-256 `86e3e94e1acaca1587a6e29f7db6a6cde2f7b548f87fe8119e92fc84d36ab04f`; closure-1 SHA-256 `d45d20655136b532515937925f65bf86e07efc4dd7cbcc85cc63fc57a8884f1c`; closure-10 SHA-256 `7fcac6b78a8d040800ea039cf571bca0fd828a46c023fa652070aa2e183b5437`. The closure manifests are same-directory config artifacts with SHA-256 `9479360235dc5ef2bdbf29bd5e9e8fe03495baa140596991de2ae051e8d400a9`; no build SHA is embedded. [Draft PR #6](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/6) remains unmerged.
+[R10] Local untracked zero-room artifact `/Users/rugved/Desktop/projects/outputs/recordings-2/result.json` (artifact SHA intentionally withheld pending the exact worker-9/8 provenance handoff); first PR-6 real-run artifact SHA-256 `d462e5bb5446c18dbb6103cc2576f81f79eba084c75c1b380e749be5ce4fa834`; rerun-1 SHA-256 `86e3e94e1acaca1587a6e29f7db6a6cde2f7b548f87fe8119e92fc84d36ab04f`; closure-1 SHA-256 `d45d20655136b532515937925f65bf86e07efc4dd7cbcc85cc63fc57a8884f1c`; closure-10 SHA-256 `7fcac6b78a8d040800ea039cf571bca0fd828a46c023fa652070aa2e183b5437`. The closure manifests are same-directory config artifacts with SHA-256 `9479360235dc5ef2bdbf29bd5e9e8fe03495baa140596991de2ae051e8d400a9`; no build SHA is embedded. [Draft PR #6](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/6) remains unmerged.
 
 [R11] [`damage/fusion.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/fusion.py#L348-L430), [`cli.py` damage pass](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L718-L779), [`vlm.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/vlm.py#L16-L20), [`masks.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/masks.py#L34-L74).
 
@@ -259,3 +260,7 @@ smoke-only, not floorplan/closure validation. Prior source/stages/output trees
 and stopped-job partial files were deleted; dense/all-frame jobs are not
 restored. Commits `5c09dff9`/`88ad7982` are not VM-validated for any claimed
 output.
+
+[R14] Phase 1 recordings-2 baseline provenance, verified 2026-09-02: source
+HEAD [`30cfb4ce`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/30cfb4ce2f42e130f50ddb45a4bddfbcc396f595), exact command
+`PYTHONPATH=src /Users/rugved/Desktop/projects/cozmo-ai-v2/.venv/bin/python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2 --out out/recordings-2 --no-damage`; worker output was under `/Users/rugved/.ao/data/worktrees/cozmo-ai-v2/cozmo-ai-v2-8/out/recordings-2` and copied artifacts under `/Users/rugved/Desktop/projects/outputs/recordings-2`. The recordings-2 artifact hash is intentionally omitted pending worker-9/8 handoff; this is geometry-only baseline provenance, not GPU or release acceptance evidence.
