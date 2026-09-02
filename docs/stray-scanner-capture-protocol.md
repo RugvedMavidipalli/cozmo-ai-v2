@@ -16,8 +16,8 @@
 
 ## 3. Set the app and preflight the files
 
-- Open **Record new session**. On the recording screen tap the fps control until it reads **30 fps**. `[PROJECT]` This is the recommended setting; the app also offers 60, 15, 5, and 1 fps. Keep the app in portrait.
-- Make a **60-frame test**: tap Record, hold still until 60 RGB frames are captured (about 2 seconds at 30 fps), tap Stop, open the test recording, tap **Share**, and choose **Save to Files**. Confirm the resulting folder/ZIP opens and contains `rgb.mp4`, `depth/`, `confidence/`, `odometry.csv`, `imu.csv`, and `camera_matrix.csv`. Delete the test only after this check passes. If any item is absent, do not capture the property.
+- Open **Record new session**. On the recording screen tap the fps control until it reads **60 fps**. `[PROJECT]` Record the full capture at 60 frames per second; the app also offers 30, 15, 5, and 1 fps. Keep the app in portrait.
+- Make a **60-frame test**: tap Record, hold still until 60 RGB frames are captured (about 1 second at 60 fps), tap Stop, open the test recording, tap **Share**, and choose **Save to Files**. Confirm the resulting folder/ZIP opens and contains `rgb.mp4`, `depth/`, `confidence/`, `odometry.csv`, `imu.csv`, and `camera_matrix.csv`. Delete the test only after this check passes. If any item is absent, do not capture the property.
 - `[OFFICIAL]` Do not alter the data contract: `depth/000000.png` is 16-bit depth in millimetres; `confidence/000000.png` is a 0/1/2 confidence map; matching six-digit stems index RGB frames; odometry/IMU timestamps are seconds, odometry positions are metres, IMU acceleration is m/s2 and angular rate is rad/s, and `camera_matrix.csv` is a 3x3 pixel-intrinsics matrix.
 - `[PROJECT]` The final check is: nonblank timestamp rows in `odometry.csv` = `depth/*.png` count = `confidence/*.png` count; decoded RGB frames should be the same count. A mismatch, unreadable PNG, or missing terminal video frame means **FAIL and recapture**.
 
@@ -66,7 +66,7 @@ Expected outputs include `result.json`, `floorplan.svg`, `scene.glb`, `cloud.ply
 ## 10. Final 20-second pass/fail
 
 - `[ ] PASS` LiDAR device, 10 GB free, 80%/power, no interruptions
-- `[ ] PASS` 30 fps, portrait/no roll, lens about 1.4 m high, 1-3 m from surfaces
+- `[ ] PASS` 60 fps full capture, portrait/no roll, lens about 1.4 m high, 1-3 m from surfaces
 - `[ ] PASS` marker measured and seen at start and finish; all rooms/doors/corners/windows covered
 - `[ ] PASS` floor strip and ceiling edge shown; no people/pets/moving furniture; revisit completed
 - `[ ] PASS` folder/ZIP is original, required names/counts match, checksum recorded

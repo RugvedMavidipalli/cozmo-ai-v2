@@ -147,8 +147,8 @@ def render(output: Path) -> None:
         ),
         (
             "3 | APP SETTINGS + PREFLIGHT",
-            "Open <b>Record new session</b>. Tap the fps control until it reads <b>30 fps</b>. <b>[PROJECT]</b> 30 fps is recommended; the app also offers 60/15/5/1. Keep portrait.<br/>"
-            "Make a <b>60-frame test</b>: Record, hold still until 60 RGB frames (about 2 s at 30 fps), Stop, open the test, Share -> Save to Files. Confirm it opens and contains <font name='Courier'>rgb.mp4</font>, <font name='Courier'>depth/</font>, <font name='Courier'>confidence/</font>, <font name='Courier'>odometry.csv</font>, <font name='Courier'>imu.csv</font>, <font name='Courier'>camera_matrix.csv</font>. Delete test only after pass.<br/>"
+            "Open <b>Record new session</b>. Tap the fps control until it reads <b>60 fps</b>. <b>[PROJECT]</b> Record the full capture at 60 frames per second; the app also offers 30/15/5/1. Keep portrait.<br/>"
+            "Make a <b>60-frame test</b>: Record, hold still until 60 RGB frames (about 1 s at 60 fps), Stop, open the test, Share -> Save to Files. Confirm it opens and contains <font name='Courier'>rgb.mp4</font>, <font name='Courier'>depth/</font>, <font name='Courier'>confidence/</font>, <font name='Courier'>odometry.csv</font>, <font name='Courier'>imu.csv</font>, <font name='Courier'>camera_matrix.csv</font>. Delete test only after pass.<br/>"
             "<b>[OFFICIAL]</b> Contract: depth PNG = 16-bit millimetres; confidence PNG = 0/1/2; matching six-digit stems index RGB frames; odometry/IMU timestamps seconds, odometry positions metres, IMU accel m/s2 and angular rate rad/s, camera_matrix 3x3 pixel intrinsics.<br/>"
             "<b>[PROJECT]</b> Nonblank odometry timestamp rows = depth PNG count = confidence PNG count; decoded RGB count should match. Any mismatch, unreadable PNG, or terminal video frame loss = FAIL and recapture.",
             style["body_tight"], PALE_BLUE,
@@ -204,7 +204,7 @@ def render(output: Path) -> None:
         (
             "10 | FINAL 20-SECOND PASS/FAIL",
             check("LiDAR device; 10 GB free; 80%/power; no interruptions") + "<br/>"
-            + check("30 fps; portrait/no roll; lens 1.4 m high; 1-3 m surfaces") + "<br/>"
+            + check("60 fps full capture; portrait/no roll; lens 1.4 m high; 1-3 m surfaces") + "<br/>"
             + check("Measured marker at start/finish; all rooms, doors, corners, windows") + "<br/>"
             + check("Floor strip + ceiling edge; no people/pets/moving objects; revisit") + "<br/>"
             + check("Original folder/ZIP; names/counts match; checksum recorded") + "<br/>"
