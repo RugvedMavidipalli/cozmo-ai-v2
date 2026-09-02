@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -304,8 +305,9 @@ def segment_rooms(
             occupied_mask=grid.occupied >= wall_threshold,
             free_mask=free,
         )
+    topology_walls = _build_topology_walls(grid, free, walls, diagnostics)
     polygons = polygonize_wall_graph(
-        walls, min_area=min_area, diagnostics=diagnostics
+        topology_walls, min_area=min_area, diagnostics=diagnostics
     )
     accepted = []
     for polygon in polygons:
@@ -361,6 +363,7 @@ def segment_rooms(
         )
 
     _assign_graph_walls(rooms, walls)
+    _assign_inferred_line_walls(rooms, walls, topology_walls)
     _link_graph_neighbours(rooms, walls)
     if diagnostics is not None:
         diagnostics.record_room_segmentation(
@@ -368,6 +371,205 @@ def segment_rooms(
             fallback_used=fallback_used,
         )
     return rooms
+
+
+def _build_topology_walls(
+    grid: PlanGrid,
+    free: np.ndarray,
+    walls: list[WallSegment],
+    diagnostics: GeometryDiagnostics | None = None,
+) -> list[WallSegment]:
+    """Build room-only wall continuations from observed same-line fragments.
+
+    The metric wall list is intentionally left untouched.  Room extraction
+    can still use a wall line as a boundary when a capture observes the same
+    line in multiple finite fragments, provided the intervening band has
+    observed floor evidence.  The gap envelope is robust to one large missed
+    span, so a fixed recording-specific doorway width is never inferred.
+    """
+    active = [wall for wall in walls if not wall.quarantined and wall.length > 1e-6]
+    groups: list[list[WallSegment]] = []
+    for wall in active:
+        for group in groups:
+            representative = group[0]
+            if (
+                abs(float(representative.normal @ wall.normal)) >= 0.99
+                and abs(float(representative.offset - wall.offset)) <= 0.08
+            ):
+                group.append(wall)
+                break
+        else:
+            groups.append([wall])
+
+    positive_gaps: list[float] = []
+    intervals_by_group: list[tuple[list[WallSegment], list[tuple[float, float, WallSegment]]]] = []
+    for group in groups:
+        representative = group[0]
+        direction = representative.direction
+        intervals = sorted(
+            (
+                min(float(direction @ wall.start), float(direction @ wall.end)),
+                max(float(direction @ wall.start), float(direction @ wall.end)),
+                wall,
+            )
+            for wall in group
+        )
+        for (_, previous_end, _), (next_start, _, _) in zip(intervals, intervals[1:]):
+            if next_start > previous_end:
+                positive_gaps.append(next_start - previous_end)
+        intervals_by_group.append((group, intervals))
+
+    gap_limit = _robust_gap_limit(positive_gaps)
+    floor_cells = np.argwhere(free)
+    floor_plan = grid.to_plan(floor_cells) if len(floor_cells) else np.empty((0, 2))
+    topology_walls: list[WallSegment] = []
+    accepted_gaps = 0
+    candidate_gaps = 0
+    for group, intervals in intervals_by_group:
+        representative = group[0]
+        direction = representative.direction
+        normal = representative.normal
+        line_offset = float(representative.offset)
+        merged: list[tuple[float, float, list[WallSegment]]] = []
+        for lo, hi, wall in intervals:
+            if merged:
+                previous_lo, previous_hi, sources = merged[-1]
+                gap = lo - previous_hi
+                if gap > 0.0:
+                    candidate_gaps += 1
+                if (
+                    gap <= gap_limit
+                    and _gap_has_floor_evidence(
+                        floor_plan,
+                        normal,
+                        line_offset,
+                        direction,
+                        previous_hi,
+                        lo,
+                        grid.resolution,
+                    )
+                ):
+                    merged[-1] = (previous_lo, max(previous_hi, hi), [*sources, wall])
+                    if gap > 0.0:
+                        accepted_gaps += 1
+                    continue
+            merged.append((lo, hi, [wall]))
+
+        line_origin = normal * line_offset
+        for lo, hi, sources in merged:
+            topology_wall = deepcopy(max(sources, key=lambda wall: (wall.inlier_count, -wall.index)))
+            topology_wall.start = line_origin + direction * lo
+            topology_wall.end = line_origin + direction * hi
+            if len(sources) > 1:
+                topology_wall.tags = sorted(
+                    set(topology_wall.tags) | {"topology-line-continuation"}
+                )
+            topology_walls.append(topology_wall)
+
+    if diagnostics is not None:
+        diagnostics.polygonization["topology_continuity"] = {
+            "method": "observed_floor_same_line_fragments",
+            "source_wall_count": len(active),
+            "topology_wall_count": len(topology_walls),
+            "candidate_gap_count": candidate_gaps,
+            "accepted_gap_count": accepted_gaps,
+            "positive_gap_count": len(positive_gaps),
+            "gap_limit_m": round(float(gap_limit), 6),
+            "floor_evidence_band_m": 0.30,
+        }
+    return topology_walls
+
+
+def _robust_gap_limit(gaps: list[float]) -> float:
+    """Return a deterministic continuity envelope from the capture's gaps."""
+    if not gaps:
+        return 0.0
+    values = np.asarray(gaps, dtype=float)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return max(0.0, median + 1.5 * mad)
+
+
+def _gap_has_floor_evidence(
+    floor_plan: np.ndarray,
+    normal: np.ndarray,
+    line_offset: float,
+    direction: np.ndarray,
+    lo: float,
+    hi: float,
+    resolution: float,
+) -> bool:
+    """Check for observed walkable floor across a candidate line gap."""
+    if hi <= lo or not len(floor_plan):
+        return False
+    along = floor_plan @ direction
+    signed_distance = floor_plan @ normal - line_offset
+    band = max(0.30, 2.0 * float(resolution))
+    return bool(
+        np.any(
+            (along >= lo - 0.5 * resolution)
+            & (along <= hi + 0.5 * resolution)
+            & (np.abs(signed_distance) <= band)
+        )
+    )
+
+
+def _line_matches(first: WallSegment, second: WallSegment) -> bool:
+    """Return whether two finite walls share the same fitted plan line."""
+    return (
+        abs(float(first.normal @ second.normal)) >= 0.99
+        and abs(float(first.offset - second.offset)) <= 0.08
+    )
+
+
+def _assign_inferred_line_walls(
+    rooms: list[Room],
+    walls: list[WallSegment],
+    topology_walls: list[WallSegment],
+) -> None:
+    """Assign original wall fragments whose measured line bounds a room face.
+
+    Continuity walls are copies used only for polygonization.  This maps their
+    accepted boundary lines back to the original measured fragments so the
+    exported wall population and measurements remain unchanged.
+    """
+    from shapely.geometry import LineString
+
+    boundary_lines: list[tuple[Room, WallSegment]] = []
+    for room in rooms:
+        boundary = LineString(np.vstack([room.polygon, room.polygon[:1]]))
+        for topology_wall in topology_walls:
+            line = LineString([topology_wall.start, topology_wall.end])
+            shared = line.intersection(boundary).length
+            if shared >= min(0.15, 0.35 * topology_wall.length):
+                boundary_lines.append((room, topology_wall))
+
+    for wall in walls:
+        if wall.quarantined or wall.room_id is not None:
+            continue
+        candidates: list[tuple[float, Room]] = []
+        for room, topology_wall in boundary_lines:
+            if not _line_matches(wall, topology_wall):
+                continue
+            direction = topology_wall.direction
+            wall_lo = min(float(direction @ wall.start), float(direction @ wall.end))
+            wall_hi = max(float(direction @ wall.start), float(direction @ wall.end))
+            topology_lo = min(
+                float(direction @ topology_wall.start),
+                float(direction @ topology_wall.end),
+            )
+            topology_hi = max(
+                float(direction @ topology_wall.start),
+                float(direction @ topology_wall.end),
+            )
+            overlap = max(0.0, min(wall_hi, topology_hi) - max(wall_lo, topology_lo))
+            if overlap >= min(0.15, 0.35 * wall.length):
+                candidates.append((overlap, room))
+        if candidates:
+            _, room = max(candidates, key=lambda item: (item[0], -item[1].id))
+            wall.room_id = room.id
+            if wall.index not in room.wall_indices:
+                room.wall_indices.append(wall.index)
 
 
 def polygonize_wall_graph(
