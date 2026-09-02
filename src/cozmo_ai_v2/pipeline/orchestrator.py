@@ -359,6 +359,10 @@ def run_pipeline(args) -> int:
     try:
         with manifest.stage("input_detection", inputs=[input_path], outputs=[manifest.path]):
             detected = detect_input(input_path)
+            # Explicit dense artifacts apply to both native captures and plain
+            # RGB inputs. Discover them before ingest so the depth stage can
+            # either consume a QC-approved handoff or fail clearly.
+            dense_dir, dense_manifest = _dense_paths(args, detected)
             manifest.set_context(
                 input_tier=detected.kind.name.lower(),
                 pose={"status": "pending", "convention": "not_selected"},
@@ -368,7 +372,6 @@ def run_pipeline(args) -> int:
             probe_video(detected.video_path)
             if detected.kind is InputKind.STRAY_SCANNER:
                 raw_depth = detected.video_path.parent / "depth"
-                dense_dir, dense_manifest = _dense_paths(args, detected)
                 if not (raw_depth.is_dir() and any(raw_depth.glob("*.png"))) and not _has_approved_dense(dense_manifest):
                     raise PipelineOrchestrationError(
                         "Stray Scanner input has neither raw LiDAR depth nor a QC-approved dense artifact"
