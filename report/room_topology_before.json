@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "base_main_sha": "64102d088c754112707d86e59067342395e6b16c",
+  "temporary_unblock_sha": "48d9a646ae4fb1ed979ed6d9dd160f30b59e6721",
+  "evaluation": "downstream topology ranking; worker17 checkout is temporary evidence only",
+  "environment": {
+    "python": "3.11.16",
+    "platform": "macOS-26.5.1-x86_64-i386-64bit",
+    "machine": "x86_64",
+    "numpy": "1.26.4",
+    "open3d": "0.19.0",
+    "scipy": "1.17.1",
+    "shapely": "2.1.2",
+    "jsonschema": "4.26.0",
+    "uv": "0.12.7"
+  },
+  "ranking_rule": "Among concrete gates, rank the maximum normalized deficit: (minimum - actual)/minimum for minimums, (actual - maximum)/maximum for maximums, and (target - pass_fraction)/target for fractions; undefined metrics and absent references are excluded.",
+  "gates": {
+    "pipeline_completion": {
+      "threshold": "exit code == 0",
+      "input": "recordings-1 and recordings-2",
+      "command": "uv run python -m cozmo_ai_v2.pipeline run <capture> --out <output> --no-damage",
+      "temporary_unblock_result": "2/2 pass",
+      "normalized_deficit": 0.0,
+      "status": "PASS"
+    },
+    "room_consistency": {
+      "threshold": "no overlaps beyond 1% and no adjacency errors",
+      "input": "worker17 result.json files",
+      "command": "uv run python bench/run.py --result <output>/result.json --out <output>/benchmark.json",
+      "temporary_unblock_result": "0 overlaps, 0 adjacency errors, 0 rooms",
+      "normalized_deficit": 0.0,
+      "status": "PASS; vacuous topology"
+    },
+    "recordings_2_topology_golden": {
+      "threshold": "expected room count 3 +/- 1 (2..4), polygons, total area 10..200 m2, wall assignment >= 50%, overlap <= 10%",
+      "input": "recordings-2; input_tree_sha256=cd6e3e054c417a2e6b48093b032b8fd2e276c1d93ba63caa58c5e2e759b7a851; files=10890",
+      "command": "COZMO_RECORDING_REGRESSION=1 COZMO_RECORDING_RESULTS=/tmp/cozmo-fix-loop-18/worker17 uv run pytest -q 'tests/test_recording_geometry_regression.py::test_optional_recording_geometry_golden[recordings-2]'",
+      "result": "0 rooms; room-count shortfall 2 from lower bound; exit 1",
+      "normalized_deficit": 1.0,
+      "result_sha256": "a7d3b1e550eca9039c8fa73c9f7ec43ff10366c7c022762e27dcb1ad3c179ebb",
+      "pipeline_log_sha256": "10d0caa756e0754d87e88b1e8060452ace0c3e53d293c2161cbcda9969db586e",
+      "topology_log_sha256": "be58b84a9d66238ea52adecae3b5ce77deb0a66fd407cdaf8ad2d844820278b9",
+      "status": "FAIL"
+    },
+    "laser_accuracy": {
+      "threshold": "bench/run.py accuracy gates",
+      "input": "laser ground truth CSV",
+      "command": "uv run python bench/run.py --result <output>/result.json --truth bench/gt_<property>.csv --out <summary>",
+      "status": "NOT EVALUABLE; required GT missing"
+    },
+    "runtime_per_room": {
+      "threshold": "<= 300 seconds per room",
+      "input": "pipeline timings and room count",
+      "command": "uv run python -m cozmo_ai_v2.pipeline run <capture> --out <output> --no-damage",
+      "status": "NOT EVALUABLE; temporary unblock emits 0 rooms"
+    }
+  },
+  "selected_gate": "recordings_2_topology_golden",
+  "root_cause_hypothesis": "The existing room stage treats fragmented finite wall segments as a bounded graph, but the current capture has zero faces (66 endpoints in 56 components; p50 gap 0.403204 m and p90 gap 1.322834 m). Its fallback also rejects observed floor components because unobserved/occupied boundaries are not valid single-ring rooms.",
+  "evidence": [
+    "worker17 result diagnostics.geometry.polygonization.candidate_face_count=0",
+    "worker17 result diagnostics.geometry.endpoint_gaps.junction_counts={corner:10,dangling:46}",
+    "worker17 result diagnostics.geometry.room_segmentation.zero_room_reason=no-bounded-wall-faces; no-usable-observed-floor-components",
+    "worker17 result diagnostics.geometry.grid.free_component_count=155 and the largest observed component is not a simple room polygon"
+  ],
+  "intended_fix": "Build topology-only continuity from same-line wall fragments when the gap has observed floor evidence, using a robust per-capture gap envelope; preserve original wall measurements and unknown floor holes.",
+  "numeric_prediction": {
+    "metric": "recordings-2 topology gate pass fraction",
+    "after_prediction": 1.0,
+    "expected_room_count": 2
+  },
+  "artifacts": {
+    "worker17_pipeline_logs": [
+      "/tmp/cozmo-fix-loop-18/worker17/recordings-1.log",
+      "/tmp/cozmo-fix-loop-18/worker17/recordings-2.log"
+    ],
+    "worker17_results": "/tmp/cozmo-fix-loop-18/worker17",
+    "large_artifacts": "not committed; captures must be supplied at recordings-1/ and recordings-2/"
+  }
+}

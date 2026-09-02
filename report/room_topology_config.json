@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "evaluation": "worker17 temporary unblock versus the same checkout with this branch's independent topology patch applied",
+  "base_main_sha": "64102d088c754112707d86e59067342395e6b16c",
+  "temporary_unblock_sha": "48d9a646ae4fb1ed979ed6d9dd160f30b59e6721",
+  "pipeline_command": "uv run python -m cozmo_ai_v2.pipeline run <capture> --out <output> --no-damage",
+  "benchmark_command": "uv run python bench/run.py --result <output>/result.json --out <output>/benchmark.json",
+  "topology_command": "COZMO_RECORDING_REGRESSION=1 COZMO_RECORDING_RESULTS=<results-root> uv run pytest -q 'tests/test_recording_geometry_regression.py::test_optional_recording_geometry_golden[recordings-2]'",
+  "topology_parameters": {
+    "floor_threshold": 3,
+    "occupied_threshold": 6,
+    "minimum_face_area_m2": 1.4,
+    "line_offset_tolerance_m": 0.08,
+    "line_parallel_cosine": 0.99,
+    "gap_limit": "median positive same-line gap + 1.5 * MAD",
+    "floor_evidence_band_m": 0.30,
+    "minimum_gap_floor_evidence_cells": 1
+  },
+  "input_manifest": "relative path\\tbytes\\tsha256\\n; exclude only .DS_Store; tree hashes are in room_topology_before.json"
+}
