@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "base_sha": "64102d088c754112707d86e59067342395e6b16c",
+  "after_pipeline_producer_commit": "9ec4ea600268bf0abe5e7792ae769db726f80970",
+  "config_sha256": "7993e48b98a1d3062fba3e7737b171bf49f877c090827594fe93a93d013d6768",
+  "captures": {
+    "recordings-1": {
+      "input_path": "/Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-1",
+      "input_tree_sha256": "b86744f1298859e1120c750d675b6d6b3dc21517a3cd2e682d75728b1ca2b375",
+      "input_file_count": 7998,
+      "before": {
+        "output_path": "/private/tmp/cozmo-fix-loop-18/paired-recordings-1/before",
+        "command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-1 --out /private/tmp/cozmo-fix-loop-18/paired-recordings-1/before --no-damage",
+        "commit": "64102d088c754112707d86e59067342395e6b16c",
+        "exit_code": 1,
+        "result_present": false,
+        "pipeline_log_sha256": "36741325502cfd44f15ef4186679eaa60a736eca98f306a98cbd2845c5a3d95f",
+        "metrics_sha256": "299af3891a93b07ccec03cf61eba7f5d30e7a3ec331b029281103e629f3c7d5b"
+      },
+      "after": {
+        "output_path": "/private/tmp/cozmo-fix-loop-18/paired-recordings-1/after",
+        "command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-1 --out /private/tmp/cozmo-fix-loop-18/paired-recordings-1/after --no-damage",
+        "commit": "9ec4ea600268bf0abe5e7792ae769db726f80970",
+        "exit_code": 0,
+        "result_present": true,
+        "benchmark_command": "uv run python bench/run.py --result /private/tmp/cozmo-fix-loop-18/paired-recordings-1/after/result.json --out /private/tmp/cozmo-fix-loop-18/paired-recordings-1/after/benchmark.json",
+        "benchmark_exit_code": 0,
+        "benchmark": {
+          "room_consistency": {
+            "room_count": 0,
+            "overlaps": 0,
+            "adjacency_errors": 0,
+            "pass": true
+          }
+        },
+        "metrics_sha256": "1edd8f17964f52d29cb2a690c2a7ec08e88712462e67214828316aa21ea1e236",
+        "pipeline_log_sha256": "d02c4ca2b244289424cf295f88af5857788bb56a6010127abc022180633057be",
+        "benchmark_log_sha256": "a4fe42f5ce6d0841571f5039c6ab693a109ee7cc2dc9a279191207343ff2b916",
+        "result_sha256": "1f5cf94afa1aab3901c39dc48f889623c0ca4962bdf54988f6a9cb09e0af8a33",
+        "fusion_manifest_sha256": "68d586892cce8d7e1d60bfd8f4b3df528bfd6cae10c408a79158dd3683806e71",
+        "planes_sha256": "855f76d62dd7dcbe423b8647019a272297f7464a8c437cb452e8dfa7918bd23d",
+        "floorplan_sha256": "7082e406efb4c81e21b98adb12a33eb2e498e6abd103c1d219113cb78c1b0198",
+        "scene_sha256": "14f72c6ca2612cb3f1df93322ea938bfc2aa74929571964864b5a695c3d1211e",
+        "cloud_sha256": "8d392759fdf686595b0debb89161e1e3030196ab3701360b092246a97f502582",
+        "mesh_sha256": "60e83fb705bc9dd4ec61adea0ed66ca9871532d970e741effec47d47a3eea4a5",
+        "run_manifest_sha256": "1118eb4f8d84b80640913a506c682ec12e63d63b775dcb503ae0848c1fb6c9dd"
+      }
+    },
+    "recordings-2": {
+      "input_path": "/Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2",
+      "input_tree_sha256": "cd6e3e054c417a2e6b48093b032b8fd2e276c1d93ba63caa58c5e2e759b7a851",
+      "input_file_count": 10890,
+      "before": {
+        "output_path": "/private/tmp/cozmo-fix-loop-18/paired-recordings-2/before",
+        "command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2 --out /private/tmp/cozmo-fix-loop-18/paired-recordings-2/before --no-damage",
+        "commit": "64102d088c754112707d86e59067342395e6b16c",
+        "exit_code": 1,
+        "result_present": false,
+        "pipeline_log_sha256": "d3759a5c2c2f3960d72d5ee367ec61ecdda7470a59bb0006165fa77110a9a2be",
+        "metrics_sha256": "ad485128967636cb11e2429078de33f8bee94851ec4356c27538a2886ea48afa"
+      },
+      "after": {
+        "output_path": "/private/tmp/cozmo-fix-loop-18/paired-recordings-2/after",
+        "command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2 --out /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after --no-damage",
+        "commit": "9ec4ea600268bf0abe5e7792ae769db726f80970",
+        "exit_code": 0,
+        "result_present": true,
+        "benchmark_command": "uv run python bench/run.py --result /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after/result.json --out /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after/benchmark.json",
+        "benchmark_exit_code": 0,
+        "benchmark": {
+          "room_consistency": {
+            "room_count": 0,
+            "overlaps": 0,
+            "adjacency_errors": 0,
+            "pass": true
+          }
+        },
+        "metrics_sha256": "1eb79795ecaf551a046e0d4849e4afb0aba4adf525ca22ea807a5c440ebbd6da",
+        "pipeline_log_sha256": "d5a0eb97b9ef8760ebbae34fb49730fce0f7a04e043d1fba9ecba024c4d6c245",
+        "benchmark_log_sha256": "a4fe42f5ce6d0841571f5039c6ab693a109ee7cc2dc9a279191207343ff2b916",
+        "result_sha256": "b1642dca76a181b81b0b4f54582ab0a5f2bd2c2f734b5a3afa0843d3bd4e1e02",
+        "fusion_manifest_sha256": "19b7e795e91008ab8487d09d8d84228115a618f84b4c58885a2a4820bcddfdf0",
+        "planes_sha256": "99cad976aca148cac118817b695ae361067924cfe5eb631f3a2fc07e9131652c",
+        "floorplan_sha256": "55c2cbd1427c522561c837220ad0fd5aa23d48424386edfd8296a0780554cbbc",
+        "scene_sha256": "7b76130012347204d1066f6d91133fbc9e34e22da6d626550a4e89ffeee423d8",
+        "cloud_sha256": "0664f106fd16e337dd6b329e5802f46363530b080b7e9693143ba33048857868",
+        "mesh_sha256": "872891a4c0aff1f3c17be5f375a1afd9f4cabeef6585ad87b6b1b8d0108e037d",
+        "run_manifest_sha256": "ac3bdc24390e7b4134ff78f9127e736747963ac68b7e33ab2a0d62019f3568d6"
+      }
+    }
+  },
+  "gate_results": {
+    "pipeline_completion": {
+      "threshold": "exit code == 0",
+      "before": "0/2 pass (0.0%)",
+      "after": "2/2 pass (100.0%)",
+      "absolute_movement": 1.0,
+      "relative_movement": "undefined from zero baseline",
+      "prediction": 1.0,
+      "prediction_error": 0.0,
+      "status": "PASS"
+    },
+    "room_consistency": {
+      "threshold": "no overlaps beyond 1% and no adjacency errors",
+      "before": "not evaluable: no result.json",
+      "after": "0 overlaps, 0 adjacency errors, 0 rooms",
+      "status": "PASS but vacuous; no room topology claim"
+    },
+    "recordings_2_topology_golden": {
+      "command": "COZMO_RECORDING_REGRESSION=1 COZMO_RECORDING_RESULTS=/tmp/cozmo-fix-loop-18/golden-results uv run pytest -q 'tests/test_recording_geometry_regression.py::test_optional_recording_geometry_golden[recordings-2]'",
+      "threshold": "expected room count 3 +/- 1 (range 2..4), polygons, total area >= 10 m2 and <= 200 m2, wall assignment >= 50%, overlap <= 10%",
+      "before": "not evaluable: no result.json",
+      "after": "0 rooms; room-count shortfall 2 from lower bound; test exit 1",
+      "topology_log_sha256": "43c00dbffea942532f9aa78ad9a63b2d0ce5afc25ee7285a64e200a3bb663954",
+      "status": "FAIL; pre-existing room extraction reports no-bounded-wall-faces and no-usable-observed-floor-components"
+    }
+  },
+  "artifact_root": "/private/tmp/cozmo-fix-loop-18",
+  "reproduce": [
+    "uv run python tools/fix_loop.py --capture /path/to/recordings-1 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-1",
+    "uv run python tools/fix_loop.py --capture /path/to/recordings-2 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-2"
+  ]
+}
