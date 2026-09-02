@@ -12,10 +12,11 @@ hashes are recorded in the [evidence register](evidence_register.md); the
 separate VM outputs are identified by validation-root path and command file.
 Neither is release acceptance evidence without the stated qualification.
 
-PR-8 is merged and its code changes are included as implemented design. The
-worker’s later correction reports that the validation source/stages and output
-artifacts were deleted; only a summary and inventory remain. Therefore no GPU
-run metric or external-run outcome is admitted as validation [R13].
+PR-8 is merged and its code changes are included as implemented design. A
+post-recovery smoke handoff is available, but it is limited to raw LiDAR and
+91 stride-60 timestamps; no dense or all-frame result is restored. RoomFormer
+preprocessing/overlay behavior is smoke-only and not a room-closure result
+[R13].
 
 ## 1. Architecture and runtime contracts
 
@@ -53,9 +54,9 @@ by the repository.
 
 | Tier | Input contract implemented in code | Runtime status |
 |---|---|---|
-| A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection and loader contracts; no end-to-end device validation is claimed [R2][R3]. |
-| B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; no GPU E2E result is retained or claimed [R3][R13]. |
-| C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested; standalone-video and GPU/SLAM reconstruction are unvalidated because the producing run artifacts were deleted [R2][R3][R13]. |
+| A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection/loader contracts plus a VM raw-LiDAR/ARKit stride-60 smoke; no device qualification is claimed [R2][R3][R13]. |
+| B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; no completed dense-depth result is retained or claimed. The recovered smoke is raw LiDAR only [R3][R13]. |
+| C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested; standalone-video and MASt3R-SLAM reconstruction remain unvalidated [R2][R3][R13]. |
 | Reject | Missing required files, an unsupported extension, an unrelated directory, or absent raw/dense depth produces an explicit detection/load error. | Unit-tested for detection; this is an input failure, not graceful reconstruction [R2][R3]. |
 
 The frame association default is PTS, with an explicit index mode. Video
@@ -105,7 +106,8 @@ implementation default is `calibrated:false`, `scale:1.0`, and
 `coverage_target:0.90`; no laser reference set is checked in, so no accuracy or
 interval-coverage gate is scored [R6][R7].
 
-No measured accuracy number is promoted here from the untracked baseline or
+No measured accuracy number is promoted here from the untracked baseline,
+recovered smoke, or
 historical sensor JSON files: their producing build/configuration is not
 embedded. They remain listed, hashed, and explicitly excluded from acceptance
 claims in the evidence register. The only calibration state asserted for this
@@ -130,6 +132,14 @@ The fix loop has three evidence-backed steps:
    cannot say whether wall loss, endpoint connectivity, polygonization, or
    floor evidence was decisive [R10].
 
+   Recovery restored a separate raw-LiDAR/ARKit stride-60 smoke: 91 requested
+   timestamps, 265,689 cloud points, 29 exported walls, 0 openings, and 0
+   rooms, with schema errors 0. A corrected SceneCAD-density RoomFormer smoke
+   loaded with 0 missing/0 unexpected keys, produced one image-space polygon,
+   and wrote 29 wall-dimension rows; the polygon remains a poor fit. These are
+   subset/smoke observations, not a closure fix or a before/after improvement
+   claim [R13].
+
 The first real PR-6-labeled run is more specific: it records 1 room from
 `observed_floor_components`, `fallback_used:true`, and zero candidate/accepted
 wall-graph faces. Rerun-1 and closure-1 also record one fallback room and zero
@@ -145,7 +155,7 @@ coverage plus variable unvalidated trials—not closure or success [R10].
 
 - **Metric accuracy is unvalidated.** There is no checked-in laser truth,
   calibrated result, device qualification, or standards-compliance result.
-  No GPU E2E result is retained for this report; benchmark gates that require
+  The recovered smoke is not an accuracy result; benchmark gates that require
   references remain unscored [R6][R7][R13].
 - **Recordings-2 topology remains an acceptance risk.** Zero rooms are directly
   observed in one run; the unmerged closure trials are variable and must not be
@@ -157,16 +167,23 @@ coverage plus variable unvalidated trials—not closure or success [R10].
 - **Standalone video is a contract, not a validated product path.** Detection
   accepts a plain video, but reconstruction still needs poses, intrinsics, and
   raw or QC-approved dense depth. No completed standalone-video or MASt3R-SLAM
-  result is retained or claimed [R2][R3][R13].
-- **GPU E2E evidence was deleted before this freeze.** The validation root now
-  retains only `cache`, `data`, `external`, `inventory`, the validation summary,
-  and `venv`; the source checkouts, `stages/`, result files, overlays, and
-  partial all-frame outputs are absent. The VM is idle, but this is not a
-  completed validation artifact [R13].
-- **RoomFormer follow-up is unvalidated.** The corrected rerun and dimensional
-  overlay did not run. Commit `5c09dff9`/`88ad7982` is not VM-validated, and no
-  floorplan or closure output is claimed. A new source-PR8 checkout and a
-  reconstruction rerun are required before RoomFormer can be evaluated [R13].
+  result is claimed [R2][R3][R13].
+- **GPU evidence is bounded and asymmetric.** Recovery provides only a raw
+  LiDAR/ARKit stride-60 smoke: 91 requested timestamps, 36.43 s runtime,
+  1.05 GiB peak RSS, 265,689 points, 29 walls, 0 openings, and 0 rooms; no
+  GPU model stage ran. No dense or all-frame result is available [R13].
+- **RoomFormer remains smoke-only.** The corrected SceneCAD preprocessing and
+  separate overlay ran in 6.16 s with 482 MiB peak GPU/1.58 GiB peak RSS,
+  clean checkpoint load, one image-space polygon, and 29 wall-dimension rows.
+  Visual inspection shows all 29 orange pipeline traces and their
+  length±tolerance legend, while the green polygon is a poor fit; no room
+  closure or geometry acceptance follows. Commit `5c09dff9`/`88ad7982` is not
+  VM-validated; the corrected preprocessing is in open PR #9, not merged
+  [R13].
+- **Deleted and stopped artifacts stay excluded.** The earlier validation
+  source/stages/output trees and partial all-frame files were deleted. A new
+  source-PR8 checkout and reconstruction rerun are required before dense,
+  all-frame, or full RoomFormer evaluation [R13].
 - **Damage model performance is unmeasured.** The code names a default VLM
   model and attempts hosted SAM 2 only with a token, falling back to local
   GrabCut on failure; those names and branches are implementation facts, not
@@ -210,14 +227,28 @@ hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R11] [`damage/fusion.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/fusion.py#L348-L430), [`cli.py` damage pass](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L718-L779), [`vlm.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/vlm.py#L16-L20), [`masks.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/masks.py#L34-L74).
 
-[R13] Validation-state correction, verified 2026-09-01T16:47Z: the worker
-reports that `/home/ubuntu/cozmo-validation-20260901/source`, `source-pr8`,
-`source-pr3`, and the entire `stages/` directory were deleted after the prior
-handoff. The root retains only `cache`, `data`, `external`, `inventory`,
-`validation-summary-20260901.md`, and `venv`; no `cloud.ply`, `result.json`,
-RoomFormer overlay, or partial all-frame output remains under `/home/ubuntu`.
-The prior run metrics and outcomes are therefore historical and are not cited
-as validation here. The corrected RoomFormer rerun and dimensional overlay did
-not run; commits `5c09dff9`/`88ad7982` are not VM-validated. PR-8 implementation
-source remains [`2074694e`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/2074694e3152cbd31c58825d676699d8dbf065fc), but no GPU, performance,
-accuracy, device-certification, or full-pipeline result is claimed from it.
+[R13] Post-recovery handoff, verified 2026-09-01T16:47Z: open, clean,
+no-CI [PR #9](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/9) at
+[`88ad7982`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/88ad798202961ee6a58f5e1952ab12c60578a9da); PR #8 remains merged at
+[`2074694e`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/2074694e3152cbd31c58825d676699d8dbf065fc). The recovery validation root is
+`/home/ubuntu/cozmo-validation-20260901`. PR #9 adds square extent, 5% padding,
+count/max normalization, no vertical flip, and a separate model-hypothesis
+overlay over pipeline wall measurements. Full VM tests used
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m pytest tests`
+and reported 133 passed, 2 skipped, 4.33 s. Recovery E2E smoke command:
+`stages/roomformer_recovery_raw_stride60_pr8/command.txt`; raw LiDAR/ARKit,
+91 requested stride-60 timestamps (not all frames/dense), 36.43 s, 1.05 GiB
+peak RSS, no GPU model stage, schema errors 0, 91 fused frames, 265,689
+points, 29 walls, 0 openings, 0 rooms; warnings include 3 terminal sidecars,
+no ceiling/heights, and uncalibrated CIs. Corrected RoomFormer command:
+`stages/roomformer_recovery_contract_dimensions_pr8/command.txt`; recovery
+cloud, 6.16 s, 482 MiB peak GPU/1.58 GiB peak RSS, clean load (0 missing/0
+unexpected), one image-space polygon, and 29 wall-dimension CSV rows. Outputs:
+`density_scenecad_contract.png`, `roomformer_overlay_dimensions.png`,
+`roomformer_wall_dimensions.csv`, and `roomformer_overlay_metadata.json` in
+that stage. Visual inspection found all 29 orange pipeline traces and their
+length±tolerance legend, but the green polygon remains a poor fit; this is
+smoke-only, not floorplan/closure validation. Prior source/stages/output trees
+and stopped-job partial files were deleted; dense/all-frame jobs are not
+restored. Commits `5c09dff9`/`88ad7982` are not VM-validated for any claimed
+output.
