@@ -1,7 +1,8 @@
 # Capture-to-scope: final technical report
 
-**Evidence cutoff:** 2026-09-02 · **source commit:** `086e742c`
-([`origin/main`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/tree/086e742c64edf132152bcd26b352c350561b2165))
+**Evidence cutoff:** 2026-09-02 · **code-audit commit:** `086e742c`
+([pinned source](https://github.com/RugvedMavidipalli/cozmo-ai-v2/tree/086e742c64edf132152bcd26b352c350561b2165)) ·
+**current `origin/main`:** [`64102d08`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/64102d088c754112707d86e59067342395e6b16c)
 
 This report separates **implemented design**, **unit/synthetic-test evidence**,
 **measured local outputs**, **design targets**, and **unvalidated integrations**.
@@ -11,9 +12,10 @@ hashes are recorded in the [evidence register](evidence_register.md); the
 separate VM outputs are identified by validation-root path and command file.
 Neither is release acceptance evidence without the stated qualification.
 
-The finalized GPU validation is a separately pinned PR-8 run, not a claim
-about the current all-frame job: its source SHA, command files, environment,
-and output paths are recorded in [R13].
+PR-8 is merged and its code changes are cited only as implemented design.
+Completed GPU/VM E2E evidence is unavailable under this report's freeze; the
+in-progress all-frame job and unfinalized validation artifacts are excluded
+[R13].
 
 ## 1. Architecture and runtime contracts
 
@@ -52,8 +54,8 @@ by the repository.
 | Tier | Input contract implemented in code | Runtime status |
 |---|---|---|
 | A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection and loader contracts; no end-to-end device validation is claimed [R2][R3]. |
-| B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; PR-8 GPU E2E measured on a full-duration stride-60 subset: 91 samples, 69 fused frames, 33 walls, 11 openings, 0 rooms. This is not all-frame or device acceptance [R3][R13]. |
-| C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested. The full-video MASt3R-SLAM run failed the Sim(3) safety gate; it was not fused or loop-closed. Standalone-video reconstruction remains unvalidated [R2][R3][R13]. |
+| B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; PR-8’s merged code changes are design evidence only. No completed GPU E2E result is included [R3][R13]. |
+| C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested; standalone-video reconstruction and GPU/SLAM validation are unavailable under this freeze [R2][R3][R13]. |
 | Reject | Missing required files, an unsupported extension, an unrelated directory, or absent raw/dense depth produces an explicit detection/load error. | Unit-tested for detection; this is an input failure, not graceful reconstruction [R2][R3]. |
 
 The frame association default is PTS, with an explicit index mode. Video
@@ -103,10 +105,6 @@ implementation default is `calibrated:false`, `scale:1.0`, and
 `coverage_target:0.90`; no laser reference set is checked in, so no accuracy or
 interval-coverage gate is scored [R6][R7].
 
-The PR-8 E2E output likewise reports uncalibrated confidence intervals. Its
-GPU measurements are throughput/resource observations, not accuracy or
-interval-coverage evidence [R6][R13].
-
 No measured accuracy number is promoted here from the untracked baseline or
 historical sensor JSON files: their producing build/configuration is not
 embedded. They remain listed, hashed, and explicitly excluded from acceptance
@@ -131,12 +129,6 @@ The fix loop has three evidence-backed steps:
    yields 0 rooms and 31 walls, with no geometry diagnostics. The old output
    cannot say whether wall loss, endpoint connectivity, polygonization, or
    floor evidence was decisive [R10].
-
-   A separately pinned PR-8 GPU run on a 91-sample full-duration temporal
-   subset produced a schema-valid result with 69 fused frames, 33 walls, 11
-   measured openings from 13 RGB observations, and 0 closed rooms. This
-   establishes a traceable integration result for that subset, not an
-   improvement over the local artifacts or a room-closure fix [R13].
 
 The first real PR-6-labeled run is more specific: it records 1 room from
 `observed_floor_components`, `fallback_used:true`, and zero candidate/accepted
@@ -164,24 +156,12 @@ coverage plus variable unvalidated trials—not closure or success [R10].
   and wall-opening heights are unavailable [R10].
 - **Standalone video is a contract, not a validated product path.** Detection
   accepts a plain video, but reconstruction still needs poses, intrinsics, and
-  raw or QC-approved dense depth. The finalized full-video MASt3R-SLAM run
-  processed 30-fps RGB at 2.756 FPS for 16m46s, but failed the ARKit Sim(3)
-  safety gate: 27 matches/26 inliers, translation RMSE 0.794 m, rotation RMSE
-  158.38°, and scale 2.60345. It was not fused or loop-closed [R2][R3][R13].
-- **GPU validation is bounded.** The finalized VM was Ubuntu 22.04 with an
-  NVIDIA L4 (23,034 MiB), driver 580.126.20, CUDA 12.4, Python 3.10.12, 28
-  vCPUs, and 121 GiB RAM. Metric3D covered the full 90.7 s capture only at
-  stride 60: 91 samples, 69 QC-approved and 22 rejected; its runtime was
-  24:08.48, with 986 MiB peak GPU and 34.3 GiB peak RSS. The PR-8 E2E stage
-  ran in 88.8 s with 2,812 MiB peak GPU and 2.7 GiB peak RSS; its schema-valid
-  output had 247,929 points, a 250,685-vertex/456,132-triangle mesh, and 22
-  depth rejections. The incomplete all-frame stride-1 job is excluded [R13].
-- **External floorplan smoke is non-validating.** RoomFormer loaded cleanly
-  and emitted one image-space polygon from an old 69-frame cloud, but the
-  ad-hoc runner did not meet the official SceneCAD density contract and the
-  cloud had no bounded rooms. PR-3 separately failed export with
-  `NameError: args is not defined` at `pipeline/cli.py:1459`; neither is a
-  valid floorplan result [R13].
+  raw or QC-approved dense depth. No completed standalone-video, GPU, or
+  MASt3R-SLAM result is included under this evidence freeze [R2][R3][R13].
+- **GPU E2E validation is unavailable.** PR-8 is merged, but only its code
+  changes are cited as implemented design. The worker’s validation artifacts
+  did not arrive as a finalized reproducible handoff before freeze; the
+  current all-frame Metric3D job is incomplete and excluded [R13].
 - **Damage model performance is unmeasured.** The code names a default VLM
   model and attempts hosted SAM 2 only with a token, falling back to local
   GrabCut on failure; those names and branches are implementation facts, not
@@ -225,26 +205,11 @@ hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R11] [`damage/fusion.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/fusion.py#L348-L430), [`cli.py` damage pass](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L718-L779), [`vlm.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/vlm.py#L16-L20), [`masks.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/masks.py#L34-L74).
 
-[R13] Finalized GPU-VM validation packet (accessed 2026-09-02): validation
-root `/home/ubuntu/cozmo-validation-20260901`, main source
-[`086e742c`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/086e742c64edf132152bcd26b352c350561b2165),
-PR-8 source
+[R13] PR-8 implementation/design source (accessed 2026-09-02): merged
+[`PR #8`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/8) at
 [`2074694e`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/2074694e3152cbd31c58825d676699d8dbf065fc),
-dataset and environment manifest, and exact command/output paths recorded
-under that root. Metric3D command/output:
-`stages/metric3d_full_duration_stride60_halfres_pr8/{command.txt,...}`;
-PR-8 E2E command/output:
-`stages/pipeline_pr8_dense_rgb_openings_fixed/{command.txt,...}`;
-MASt3R output:
-`external/MASt3R-SLAM/logs/validation_full_30fps_main/rgb.{txt,ply}`;
-RoomFormer smoke command/output:
-`stages/roomformer_scenecad_on_dense_cloud/{command.txt,...}`. Dependency
-versions were pinned to [MASt3R-SLAM
-`e6f4e3d`](https://github.com/rmurai0610/MASt3R-SLAM/commit/e6f4e3d474fad0e11f561482012be864ba8c3f17),
-[Metric3D `eb5b6f`](https://github.com/YvanYin/Metric3D/commit/eb5b6fac0dc155e4e52f576e304fbf11655ff339),
-[GroundingDINO `856dde`](https://github.com/IDEA-Research/GroundingDINO/commit/856dde20aee659246248e20734ef9ba5214f5e44),
-[SAM2 `2b90b9`](https://github.com/facebookresearch/sam2/commit/2b90b9f5ceec907a1c18123530e92e794ad901a4),
-and [RoomFormer `e88a7e`](https://github.com/ywyue/RoomFormer/commit/e88a7e3a81e384e15ea5bdc02d893267a2b6cac1).
-MASt3R failed the safety gate; RoomFormer was smoke-only; PR-3 detached
-`12ddb6b2` failed export; PR-6 was excluded. The current all-frame Metric3D
-stride-1 job was incomplete at cutoff and is excluded.
+which is an ancestor of current `origin/main` [`64102d08`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/64102d088c754112707d86e59067342395e6b16c). No GPU/VM run artifact is
+accepted in this report: the worker validation root and in-progress all-frame
+job are excluded because no finalized reproducible handoff was available at
+freeze. No performance, accuracy, device, or full-pipeline validation claim
+is made from PR-8.
