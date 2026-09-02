@@ -21,10 +21,11 @@ components. That is outside this export-crash fix and is not silently hidden.
 No laser GT, footprint scalar, damage/scope references, or runtime reference
 is present, so those gates remain honestly unevaluable.
 
-Reproduce both sides and regenerate all machine-readable outputs with:
+Reproduce both sides for both captures (use distinct output roots) with:
 
 ```text
-uv run python tools/fix_loop.py --capture /path/to/recordings-1 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run
+uv run python tools/fix_loop.py --capture /path/to/recordings-1 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-1
+uv run python tools/fix_loop.py --capture /path/to/recordings-2 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-2
 ```
 
 Captured outputs, logs, manifests, and hashes are under `/private/tmp/cozmo-fix-loop-18`;

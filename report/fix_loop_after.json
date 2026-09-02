@@ -64,6 +64,7 @@
         "command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2 --out /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after --no-damage",
         "commit": "9ec4ea600268bf0abe5e7792ae769db726f80970",
         "exit_code": 0,
+        "result_present": true,
         "benchmark_command": "uv run python bench/run.py --result /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after/result.json --out /private/tmp/cozmo-fix-loop-18/paired-recordings-2/after/benchmark.json",
         "benchmark_exit_code": 0,
         "benchmark": {
@@ -115,5 +116,8 @@
     }
   },
   "artifact_root": "/private/tmp/cozmo-fix-loop-18",
-  "reproduce": "uv run python tools/fix_loop.py --capture /path/to/recordings-1 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run"
+  "reproduce": [
+    "uv run python tools/fix_loop.py --capture /path/to/recordings-1 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-1",
+    "uv run python tools/fix_loop.py --capture /path/to/recordings-2 --base-sha 64102d088c754112707d86e59067342395e6b16c --output-root /tmp/new-paired-run/recordings-2"
+  ]
 }
