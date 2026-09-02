@@ -168,7 +168,8 @@ coverage plus variable unvalidated trials—not closure or success [R10].
 - **Metric accuracy is unvalidated.** There is no checked-in laser truth,
   calibrated result, device qualification, or standards-compliance result.
   The recovered smoke is not an accuracy result; benchmark gates that require
-  references remain unscored [R6][R7][R13].
+  references remain unscored. Although scans were taken magic plan exist
+  although need to be compared [R6][R7][R13].
 - **Recordings-2 topology remains an acceptance risk.** Zero rooms are directly
   observed in one run; the unmerged closure trials are variable and must not be
   presented as a fix. A final acceptance run needs a pinned build, exact
