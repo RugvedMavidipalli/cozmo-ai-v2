@@ -25,6 +25,18 @@ This README describes origin/main at the time it was audited. It does not claim
 production accuracy, a minimum device qualification, a guaranteed runtime, or
 a completed external-model run. See Known limitations and Validation status.
 
+> **RoomFormer boundary (important):** the RoomFormer integration in this
+> repository is **adapter-only**. The `cozmo-ai-v2 pipeline` command does not
+> load RoomFormer checkpoints and does not run RoomFormer. Users must run
+> RoomFormer SD-TQ externally, produce precomputed JSON, and pass it with
+> `--roomformer-predictions`. Without that JSON, room extraction uses the
+> deterministic fitted wall graph and, when no usable face is accepted, its
+> connected observed-floor fallback. Pixel-only hints are `unmeasured` until
+> metric wall mapping and evidence validation have been completed. See the
+> [RoomFormer external adapter guide](docs/RoomFormer.md) for the exact
+> upstream revision, setup, density-map contract, output boundary, and
+> handoff instructions.
+
 ## Current capabilities and boundaries
 
 | Area | Current status |
@@ -35,7 +47,7 @@ a completed external-model run. See Known limitations and Validation status.
 | Standalone RGB MASt3R-SLAM launch | Implemented as cozmo-ai-v2 run; it writes into the external checkout's logs/ tree and does not itself produce result.json. |
 | Damage intelligence | Optional. It uses Anthropic for selected keyframes when ANTHROPIC_API_KEY is available, then uses Replicate SAM 2 when REPLICATE_API_TOKEN is available or local GrabCut otherwise. |
 | Local RGB opening models | Optional and local-only when explicitly enabled. The adapters require a local Hugging Face-compatible Grounding DINO directory, an installed sam2 package, a local SAM2 checkpoint, and a package-local SAM2 config. |
-| RoomFormer | Adapter-only. This repository reads precomputed RoomFormer SD-TQ JSON; it does not run RoomFormer or load its checkpoints. Pixel-only hints remain unmeasured. |
+| RoomFormer | Adapter-only. The pipeline reads precomputed RoomFormer SD-TQ JSON; it does not load RoomFormer checkpoints or run RoomFormer. Without JSON, deterministic wall-graph/fallback room extraction is used. Pixel-only hints remain unmeasured until metric mapping/evidence validation. |
 | Accuracy and performance | Not qualified here. No unsupported historical accuracy or runtime figures are part of this guide. Intervals remain uncalibrated until calibration is fit against real ground truth. |
 | RGB-only full reconstruction | Not a merged one-command capability. Standalone RGB tracking is available; full reconstruction needs a pose table, calibration, and usable depth artifact. |
 
@@ -556,25 +568,18 @@ accept a missing file, download weights, or choose a checkpoint for you.
 
 ### RoomFormer SD-TQ
 
-Follow the official
-[RoomFormer repository](https://github.com/ywyue/RoomFormer) if you need to
-generate predictions. RoomFormer is not imported by this project and its
-environment/checkpoint requirements are not folded into pyproject.toml. Export
-a JSON file and pass it as:
+RoomFormer is an external model and its environment/checkpoint requirements
+are not folded into `pyproject.toml`. The pipeline's adapter reads only
+precomputed JSON. It does not import upstream RoomFormer, load a checkpoint, or
+infer a room polygon. Follow the [RoomFormer external adapter guide](docs/RoomFormer.md),
+which documents the pinned upstream checkout, official setup/checkpoint source,
+the project density-map helper, the exact manual conversion boundary, and the
+`--roomformer-predictions` handoff.
 
-~~~bash
-uv run python -m cozmo_ai_v2.pipeline run <capture-dir> \
-  --out out/<capture-name> \
-  --roomformer-predictions <ROOMFORMER_PREDICTIONS.json> \
-  --no-damage
-~~~
-
-The adapter accepts common containers such as openings, predictions, instances,
-detections, or objects, and recognizes door/window labels. For a metric opening,
-a prediction needs a wall association plus metric u_range/v_range (or
-equivalent offset/size fields). Pixel-only boxes are kept as state:
-"unmeasured"; they do not create metric dimensions or cut the floor plan.
-Rejections are recorded under diagnostics.opening_rejections.
+For the short form, a pipeline run with no JSON still uses deterministic
+wall-graph/fallback room extraction. A supplied pixel-only hint remains
+`state: "unmeasured"`; it does not create metric dimensions or cut the floor
+plan until it has been mapped to a metric wall and its evidence validated.
 
 ### Grounding DINO + SAM2 for RGB openings
 
@@ -1012,9 +1017,13 @@ quantities as unmeasured.
 --rgb-openings needs all three local paths: Grounding DINO model directory,
 SAM2 checkpoint, and SAM2 config under the installed sam2 package. The
 Grounding DINO adapter is local-files-only. RoomFormer JSON needs a recognized
-door/window label; a pixel-only prediction is deliberately unmeasured. Read
+door/window label; it must be precomputed externally and passed with
+`--roomformer-predictions`. A pixel-only prediction is deliberately
+unmeasured. RoomFormer JSON is opening evidence only; it does not replace the
+pipeline's deterministic wall-graph/fallback room extraction. Read
 diagnostics.opening_rejections and the warning text rather than assuming a
-model ran.
+model ran. See [docs/RoomFormer.md](docs/RoomFormer.md) for coordinate and
+conversion troubleshooting.
 
 ### Schema failure
 
@@ -1167,6 +1176,8 @@ and schema-valid outputs whose provenance is safe to share.
   damage detection and fusion design.
 - [docs/track-c-scope-generation.md](docs/track-c-scope-generation.md) —
   rule-driven scope generation.
+- [docs/RoomFormer.md](docs/RoomFormer.md) — external RoomFormer SD-TQ setup,
+  density-map contract, manual JSON boundary, and troubleshooting.
 - [schema/result.schema.json](schema/result.schema.json) — machine-readable
   result contract.
 - [rules.yaml](rules.yaml) — versioned scope rules and citations.
