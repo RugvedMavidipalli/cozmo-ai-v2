@@ -203,9 +203,10 @@ standards-compliant estimator.
 
 ## Sources
 
-All repository links below point to commit `086e742c64edf132152bcd26b352c350561b2165`
-and were validated 2026-09-02. The full claim-to-evidence ledger and artifact
-hashes are in [`report/evidence_register.md`](evidence_register.md).
+Repository implementation links R1–R11 below point to commit
+`086e742c64edf132152bcd26b352c350561b2165` and were validated 2026-09-02.
+PR/source links in R13 are separately pinned. The full claim-to-evidence ledger
+and artifact hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R1] [`pipeline/cli.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L125-L148), [`docs/architecture.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/architecture.md#L22-L131).
 
@@ -232,15 +233,21 @@ no-CI [PR #9](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/9) at
 [`88ad7982`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/88ad798202961ee6a58f5e1952ab12c60578a9da); PR #8 remains merged at
 [`2074694e`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/2074694e3152cbd31c58825d676699d8dbf065fc). The recovery validation root is
 `/home/ubuntu/cozmo-validation-20260901`. PR #9 adds square extent, 5% padding,
-count/max normalization, no vertical flip, and a separate model-hypothesis
-overlay over pipeline wall measurements. Full VM tests used
+count/max normalization rather than log normalization, no vertical flip, and a
+separate model-hypothesis overlay over pipeline wall measurements. It uses
+official RoomFormer commit
+[`e88a7e3a`](https://github.com/ywyue/RoomFormer/commit/e88a7e3a81e384e15ea5bdc02d893267a2b6cac1)
+and checkpoint SHA-256 `b0604af4e3e37bf5530484c7e6cc57a5568118eb2247d7842f1aa833ff43d13e`.
+Full VM tests used
 `PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m pytest tests`
-and reported 133 passed, 2 skipped, 4.33 s. Recovery E2E smoke command:
+and reported 133 passed, 2 skipped, 4.33 s. Exact recovery E2E command:
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m cozmo_ai_v2.pipeline run /home/ubuntu/cozmo-validation-20260901/data/recordings-2 --out /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --stride 60 --voxel 0.04 --max-depth 3.5 --min-confidence 1 --depth-source raw --frame-association pts --pose-source arkit --no-refine --no-loop-closure --no-damage --no-sam`; command record:
 `stages/roomformer_recovery_raw_stride60_pr8/command.txt`; raw LiDAR/ARKit,
 91 requested stride-60 timestamps (not all frames/dense), 36.43 s, 1.05 GiB
 peak RSS, no GPU model stage, schema errors 0, 91 fused frames, 265,689
 points, 29 walls, 0 openings, 0 rooms; warnings include 3 terminal sidecars,
-no ceiling/heights, and uncalibrated CIs. Corrected RoomFormer command:
+no ceiling/heights, and uncalibrated CIs. Exact corrected RoomFormer command:
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src TORCH_HOME=/home/ubuntu/cozmo-validation-20260901/cache/torch /home/ubuntu/cozmo-validation-20260901/venv/bin/python /home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/scripts/run_roomformer_overlay.py --input-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --output-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_contract_dimensions_pr8 --roomformer-repository /home/ubuntu/cozmo-validation-20260901/external/RoomFormer --checkpoint /home/ubuntu/cozmo-validation-20260901/external/RoomFormer/weights/checkpoints/roomformer_scenecad.pth --device cuda --grid-size 256 --display-scale 6`; command record:
 `stages/roomformer_recovery_contract_dimensions_pr8/command.txt`; recovery
 cloud, 6.16 s, 482 MiB peak GPU/1.58 GiB peak RSS, clean load (0 missing/0
 unexpected), one image-space polygon, and 29 wall-dimension CSV rows. Outputs:

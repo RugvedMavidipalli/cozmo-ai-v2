@@ -27,6 +27,20 @@ without treating them as a release or as a reproducible build.
 
 ## Reproducibility notes
 
+R13 exact recovery commands, retained under the VM validation root, were:
+
+```text
+PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m cozmo_ai_v2.pipeline run /home/ubuntu/cozmo-validation-20260901/data/recordings-2 --out /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --stride 60 --voxel 0.04 --max-depth 3.5 --min-confidence 1 --depth-source raw --frame-association pts --pose-source arkit --no-refine --no-loop-closure --no-damage --no-sam
+
+PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src TORCH_HOME=/home/ubuntu/cozmo-validation-20260901/cache/torch /home/ubuntu/cozmo-validation-20260901/venv/bin/python /home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/scripts/run_roomformer_overlay.py --input-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --output-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_contract_dimensions_pr8 --roomformer-repository /home/ubuntu/cozmo-validation-20260901/external/RoomFormer --checkpoint /home/ubuntu/cozmo-validation-20260901/external/RoomFormer/weights/checkpoints/roomformer_scenecad.pth --device cuda --grid-size 256 --display-scale 6
+```
+
+The recovery source is PR #9 head `88ad798202961ee6a58f5e1952ab12c60578a9da`,
+open/unmerged, and the official RoomFormer source is
+[`e88a7e3a`](https://github.com/ywyue/RoomFormer/commit/e88a7e3a81e384e15ea5bdc02d893267a2b6cac1);
+the checkpoint SHA-256 is
+`b0604af4e3e37bf5530484c7e6cc57a5568118eb2247d7842f1aa833ff43d13e`.
+
 The local artifact hashes above were recomputed with:
 
 ```text
