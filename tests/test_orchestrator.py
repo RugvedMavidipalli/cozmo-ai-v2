@@ -5,9 +5,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from cozmo_ai_v2.cli import build_parser
-from cozmo_ai_v2.pipeline.orchestrator import run_pipeline
+from cozmo_ai_v2.pipeline.orchestrator import (
+    PipelineOrchestrationError,
+    _selected_indices,
+    run_pipeline,
+)
 from cozmo_ai_v2.pipeline.stage_manifest import StageManifest
 
 
@@ -50,6 +55,21 @@ def _write_dense_artifact(root: Path, count: int, width: int = 64, height: int =
     return dense, manifest
 
 
+def test_selected_indices_use_full_configured_population_without_a_hidden_cap():
+    values = list(range(5443))
+
+    selected = _selected_indices(values, 4)
+
+    assert len(selected) == 1361
+    assert selected[:3] == [0, 4, 8]
+    assert selected[-1] == 5440
+
+
+def test_selected_indices_reject_non_positive_stride():
+    with pytest.raises(PipelineOrchestrationError, match="at least 1"):
+        _selected_indices([0, 1], 0)
+
+
 def test_stage_manifest_records_order_and_terminal_status(tmp_path):
     manifest = StageManifest(tmp_path / "input.mp4", tmp_path / "out")
     with manifest.stage("input_detection"):
@@ -81,6 +101,19 @@ def test_stage_manifest_updates_running_stage_provenance(tmp_path):
     assert item["model"]["adapter"] == "Metric3Dv2Model"
     assert item["pose"]["source"] == "arkit"
     assert item["depth_provenance"].startswith("metric3d_v2")
+
+
+def test_stage_manifest_updates_the_requested_opening_operation(tmp_path):
+    manifest = StageManifest(tmp_path / "input.mp4", tmp_path / "out")
+    with manifest.stage("surfaces"):
+        with manifest.stage("rgb openings"):
+            pass
+
+    manifest.update_last("surfaces", operation="surfaces", opening_counts={"accepted_count": 3})
+
+    payload = json.loads(manifest.path.read_text())
+    assert payload["stages"][0]["opening_counts"]["accepted_count"] == 3
+    assert "opening_counts" not in payload["stages"][1]
 
 
 def test_one_command_hands_off_rgb_pose_and_depth_artifacts(

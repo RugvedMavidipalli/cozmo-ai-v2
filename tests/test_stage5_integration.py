@@ -84,6 +84,19 @@ def test_contract_uses_qc_dense_depth_and_rgb_intrinsics(stray_capture, tmp_path
     assert report["contract_parameters"]["min_confidence"] == 1
     assert report["registration_alignment"]["dense_depth"]["shape_mismatch"] == "reject_unless_manifest_declared_scale"
     assert report["frame_provenance"][0]["depth_resolution"] == [64, 48]
+    assert report["population"] == {
+        "input_frames": 2,
+        "selected_frames": 2,
+        "densified_frames": 2,
+        "qc_approved_dense_frames": 2,
+        "fused_frames": 0,
+        "fused_dense_frames": 0,
+        "fused_raw_frames": 0,
+        "rejected_frames": 0,
+        "dense_qc_rejected_frames": 0,
+        "rejected_frames_total": 0,
+        "fallback_frames": 0,
+    }
 
 
 def test_contract_uses_manifest_declared_scaled_dense_rgb(stray_capture, tmp_path):

@@ -88,6 +88,27 @@ def test_run_rgb_video_reports_external_failure(synthetic_video, tmp_path):
         run_rgb_video(synthetic_video, mast3r_slam_dir, run_process=fake_run)
 
 
+def test_run_rgb_video_reports_partial_trajectory_on_external_failure(synthetic_video, tmp_path):
+    mast3r_slam_dir = tmp_path / "MASt3R-SLAM"
+    trajectory_dir = mast3r_slam_dir / "logs" / "office"
+    trajectory_dir.mkdir(parents=True)
+    (mast3r_slam_dir / "main.py").write_text("# test entry point\n")
+    (trajectory_dir / f"{synthetic_video.stem}.txt").write_text(
+        "0.0 0 0 0 0 0 0 1\n"
+    )
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 120)
+
+    with pytest.raises(Mast3rSlamError, match="partial trajectory .*1 pose row.*expected trajectory"):
+        run_rgb_video(
+            synthetic_video,
+            mast3r_slam_dir,
+            save_as="office",
+            run_process=fake_run,
+        )
+
+
 def test_pose_priors_fall_back_to_post_run_alignment_when_unsupported(synthetic_video, tmp_path):
     mast3r_slam_dir = tmp_path / "MASt3R-SLAM"
     mast3r_slam_dir.mkdir()

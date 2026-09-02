@@ -517,6 +517,23 @@ class FrameContract:
         """Return deterministic provenance and frame-decision metadata."""
         sources = sorted(set(self.depth_sources.values()))
         provenance = list(self.provenance_by_index.values())
+        requested = set(self.requested_indices)
+        dense_entries = [
+            entry
+            for index, entry in self._dense_entries.items()
+            if index in requested
+            and entry.depth_path is not None
+            and entry.depth_path.exists()
+        ]
+        dense_qc_rejected = sum(not entry.qc_approved for entry in dense_entries)
+        fused_dense = sum(
+            self.depth_sources.get(index) == DENSE_DEPTH_SOURCE
+            for index in self.integrated_indices
+        )
+        fused_raw = sum(
+            self.depth_sources.get(index) == RAW_LIDAR_SOURCE
+            for index in self.integrated_indices
+        )
         registration = {
             "policy": "dense_requires_native_or_manifest_declared_scaled_rgb_alignment; raw_rgb_area_resize_to_depth",
             "dense_depth": {
@@ -560,6 +577,19 @@ class FrameContract:
             },
             "requested_indices": list(self.requested_indices),
             "integrated_indices": sorted(self.integrated_indices),
+            "population": {
+                "input_frames": len(self.bundle),
+                "selected_frames": len(self.requested_indices),
+                "densified_frames": len(dense_entries),
+                "qc_approved_dense_frames": sum(entry.qc_approved for entry in dense_entries),
+                "fused_frames": len(self.integrated_indices),
+                "fused_dense_frames": fused_dense,
+                "fused_raw_frames": fused_raw,
+                "rejected_frames": len(self.rejected_frames),
+                "dense_qc_rejected_frames": dense_qc_rejected,
+                "rejected_frames_total": len(self.rejected_frames) + dense_qc_rejected,
+                "fallback_frames": len(self.fallback_frames),
+            },
             "video_availability": (
                 self.video_availability.to_dict()
                 if self.video_availability is not None

@@ -28,6 +28,7 @@ from .slam import (
     SlamResultError,
     parse_mast3r_trajectory,
     resample_trajectory,
+    write_pose_failure_manifest,
 )
 from .stage_manifest import StageManifest
 
@@ -188,6 +189,38 @@ def _has_approved_dense(manifest_path: Path | None) -> bool:
     )
 
 
+def _validated_stride(value: object) -> int:
+    """Return the configured frame stride without silently changing it."""
+    try:
+        stride = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PipelineOrchestrationError(f"frame stride must be an integer, got {value!r}") from exc
+    if stride < 1:
+        raise PipelineOrchestrationError(f"frame stride must be at least 1, got {stride}")
+    return stride
+
+
+def _selected_indices(values: list[int], stride: object) -> list[int]:
+    """Select the full configured population in deterministic source order."""
+    return values[::_validated_stride(stride)]
+
+
+def _record_densify_population(manifest: StageManifest, densify_manifest: Path | None) -> None:
+    """Attach model population accounting to the durable depth stage record."""
+    if densify_manifest is None or not densify_manifest.is_file():
+        return
+    payload = json.loads(densify_manifest.read_text(encoding="utf-8"))
+    population = payload.get("population")
+    if not isinstance(population, dict):
+        return
+    manifest.update_last(
+        "depth",
+        operation="depth",
+        population=population,
+        selected_frame_indices=payload.get("selected_frame_indices", []),
+    )
+
+
 def _model_options(args) -> tuple[str, Path | None, Path | None, str | None]:
     weights = getattr(args, "metric3d_weights", None)
     repository = getattr(args, "metric3d_repository", None)
@@ -232,11 +265,13 @@ def _generate_monocular_dense(
         raise PipelineOrchestrationError(f"could not open RGB video for depth: {video_path}")
     reports = []
     index = 0
+    decoded_frame_count = 0
     try:
         while True:
             ok, bgr = capture.read()
             if not ok:
                 break
+            decoded_frame_count += 1
             if indices is not None and index not in indices:
                 index += 1
                 continue
@@ -277,9 +312,21 @@ def _generate_monocular_dense(
         capture.release()
     if not reports or not any(report.get("qc_approved") for report in reports):
         raise PipelineOrchestrationError("Metric3D produced no QC-approved dense frames")
+    selected_population = (
+        sorted(indices) if indices is not None else list(range(decoded_frame_count))
+    )
     manifest = {
         "capture": str(video_path),
         "frame_count": len(reports),
+        "selected_frame_indices": selected_population,
+        "population": {
+            "input_frames": decoded_frame_count,
+            "selected_frames": len(selected_population),
+            "densified_frames": sum("depth_path" in report for report in reports),
+            "qc_approved_frames": sum(bool(report.get("qc_approved")) for report in reports),
+            "rejected_frames": sum(report.get("status") == "rejected" for report in reports),
+            "missing_selected_frames": max(0, len(selected_population) - len(reports)),
+        },
         "frames": reports,
         "model": _stage_model(model),
         "depth_provenance": "metric3d_v2_monocular_uncalibrated",
@@ -410,16 +457,17 @@ def run_pipeline(args) -> int:
                             "RGB-only input requires --mast3r-slam-dir or --slam-poses"
                         )
                     save_as = getattr(args, "mast3r_save_as", None) or f"cozmo-{out_dir.name}"
-                    invocation = run_rgb_video(
-                        detected.video_path,
-                        Path(checkout),
-                        getattr(args, "mast3r_config", "config/base.yaml"),
-                        python_executable=getattr(args, "mast3r_python", sys.executable),
-                        save_as=save_as,
-                        no_viz=getattr(args, "mast3r_no_viz", True),
-                    )
-                    trajectory_path = Path(invocation.cwd) / "logs" / save_as / f"{detected.video_path.stem}.txt"
+                    provenance = out_dir / "pose_provenance.json"
                     try:
+                        invocation = run_rgb_video(
+                            detected.video_path,
+                            Path(checkout),
+                            getattr(args, "mast3r_config", "config/base.yaml"),
+                            python_executable=getattr(args, "mast3r_python", sys.executable),
+                            save_as=save_as,
+                            no_viz=getattr(args, "mast3r_no_viz", True),
+                        )
+                        trajectory_path = Path(invocation.cwd) / "logs" / save_as / f"{detected.video_path.stem}.txt"
                         trajectory = parse_mast3r_trajectory(trajectory_path)
                         sampled = resample_trajectory(
                             trajectory,
@@ -427,10 +475,18 @@ def run_pipeline(args) -> int:
                             max_gap_seconds=getattr(args, "mast3r_max_pose_gap", 1.0),
                         )
                     except SlamResultError as exc:
-                        raise PipelineOrchestrationError(f"MASt3R-SLAM trajectory check failed: {exc}") from exc
+                        write_pose_failure_manifest(provenance, exc)
+                        raise PipelineOrchestrationError(
+                            f"MASt3R-SLAM trajectory check failed: {exc}; "
+                            f"wrote diagnostics to {provenance}"
+                        ) from exc
+                    except Mast3rSlamError as exc:
+                        write_pose_failure_manifest(provenance, exc)
+                        raise PipelineOrchestrationError(
+                            f"{exc}; wrote diagnostics to {provenance}"
+                        ) from exc
                     pose_path = out_dir / "preprocessing" / "slam_poses.json"
                     _write_pose_json(pose_path, sampled.timestamps, sampled.poses)
-                    provenance = out_dir / "pose_provenance.json"
                     provenance.write_text(json.dumps({
                         "status": "ok",
                         "pose_source": "mast3r_slam_rgb_only",
@@ -487,7 +543,7 @@ def run_pipeline(args) -> int:
                         for path in (input_path / "depth").glob("*.png")
                         if path.stem.isdigit()
                     )
-                    indices = depth_indices[::max(1, int(args.stride))]
+                    indices = _selected_indices(depth_indices, args.stride)
                     densify_capture(
                         lidar,
                         model,
@@ -503,7 +559,7 @@ def run_pipeline(args) -> int:
                 model = _model_or_error(args)
                 matrix = np.loadtxt(capture_root / "camera_matrix.csv", delimiter=",")
                 timestamps, _fps, _size = _video_timestamps(detected.video_path)
-                selected = set(range(0, len(timestamps), max(1, int(args.stride))))
+                selected = set(range(0, len(timestamps), _validated_stride(args.stride)))
                 dense_dir, dense_manifest = _generate_monocular_dense(
                     detected.video_path,
                     matrix,
@@ -513,6 +569,7 @@ def run_pipeline(args) -> int:
                     float(args.max_depth),
                 )
                 manifest.set_context(model=_stage_model(model), depth_provenance="metric3d_v2_monocular_uncalibrated")
+            _record_densify_population(manifest, dense_manifest)
         if depth_unavailable_reason:
             manifest.update_last(
                 "depth",

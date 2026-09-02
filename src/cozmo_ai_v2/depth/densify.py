@@ -99,6 +99,24 @@ def densify_capture(
     matrix = parse_camera_matrix(capture.camera_matrix_path)
     fx = extract_calibration_4(matrix)[0]
 
+    available_indices = sorted(
+        {
+            int(path.stem)
+            for path in capture.depth_dir.glob("*.png")
+            if path.stem.isdigit()
+        }
+        & {
+            int(path.stem)
+            for path in capture.confidence_dir.glob("*.png")
+            if path.stem.isdigit()
+        }
+    )
+    selected_indices = (
+        available_indices
+        if indices is None
+        else sorted({int(index) for index in indices if int(index) >= 0})
+    )
+
     dense_depth_dir = output_dir / "dense_depth"
     dense_depth_dir.mkdir(parents=True, exist_ok=True)
     dense_confidence_dir = output_dir / "dense_confidence"
@@ -194,6 +212,17 @@ def densify_capture(
     manifest = {
         "capture": str(capture.root),
         "frame_count": len(frame_reports),
+        "selected_frame_indices": selected_indices,
+        "population": {
+            "input_frames": expected_frame_count,
+            "selected_frames": len(selected_indices),
+            # A raster is written for both QC-approved and QC-rejected model
+            # outputs.  The separate QC count keeps the accounting honest.
+            "densified_frames": sum("depth_path" in report for report in frame_reports),
+            "qc_approved_frames": sum(bool(report.get("qc_approved")) for report in frame_reports),
+            "rejected_frames": sum(report.get("status") == "rejected" for report in frame_reports),
+            "missing_selected_frames": max(0, len(selected_indices) - len(frame_reports)),
+        },
         "video_availability": availability.to_dict(),
         "model": {
             "adapter": type(model).__name__,

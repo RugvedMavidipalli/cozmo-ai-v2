@@ -156,10 +156,12 @@ class StageManifest:
         self._write()
         return item
 
-    def update_last(self, name: str, **values) -> None:
+    def update_last(self, name: str, *, operation: str | None = None, **values) -> None:
         group = self.group_for(name)
         for item in reversed(self.stages):
-            if item["stage"] == group:
+            if item["stage"] == group and (
+                operation is None or item["operation"] == operation
+            ):
                 for key, value in values.items():
                     if key in {"inputs", "outputs"}:
                         value = _paths(value)
