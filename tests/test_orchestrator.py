@@ -69,6 +69,20 @@ def test_stage_manifest_records_order_and_terminal_status(tmp_path):
     assert payload["status"] == "completed"
 
 
+def test_stage_manifest_updates_running_stage_provenance(tmp_path):
+    manifest = StageManifest(tmp_path / "input.mp4", tmp_path / "out")
+    with manifest.stage("depth"):
+        manifest.set_context(
+            model={"adapter": "Metric3Dv2Model"},
+            pose={"source": "arkit"},
+            depth_provenance="metric3d_v2_scale_shift_lidar_residual",
+        )
+    item = json.loads(manifest.path.read_text())["stages"][0]
+    assert item["model"]["adapter"] == "Metric3Dv2Model"
+    assert item["pose"]["source"] == "arkit"
+    assert item["depth_provenance"].startswith("metric3d_v2")
+
+
 def test_one_command_hands_off_rgb_pose_and_depth_artifacts(
     synthetic_video, tmp_path, monkeypatch
 ):

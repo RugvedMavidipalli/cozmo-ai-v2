@@ -106,6 +106,17 @@ class StageManifest:
 
     def set_context(self, **values) -> None:
         self.context.update(values)
+        # Keep provenance attached to the stage that made the decision.  A
+        # model or pose is often selected after the stage context is opened;
+        # updating only the shared defaults would otherwise leave the durable
+        # stage record with stale ``not_recorded`` values.
+        for item in reversed(self.stages):
+            if item["status"] == "running":
+                for key in ("model", "pose", "depth_provenance"):
+                    if key in values:
+                        item[key] = values[key]
+                break
+        self._write()
 
     def record(
         self,
