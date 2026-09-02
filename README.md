@@ -1121,7 +1121,7 @@ and schema-valid outputs whose provenance is safe to share.
 
 - [docs/architecture.md](docs/architecture.md) — stage order, output inventory,
   and implementation map.
-- [Stray Scanner capture protocol](docs/stray-scanner-capture-protocol.md) —
+- [Stray Scanner -> cozmo-ai-v2 capture protocol](docs/stray-scanner-capture-protocol.md) —
   detailed capture/acquisition requirements and handoff checks; a one-page
   printable PDF is included alongside it.
 - [docs/benchmarking-and-usage.md](docs/benchmarking-and-usage.md) — detailed
