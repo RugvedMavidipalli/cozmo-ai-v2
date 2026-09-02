@@ -13,7 +13,6 @@ import hashlib
 import importlib.metadata
 import json
 import platform
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,6 +145,24 @@ def _run_side(
             record["benchmark"] = json.loads(benchmark_path.read_text())
     else:
         record["benchmark_status"] = "not run: pipeline produced no result.json"
+    artifacts = []
+    for artifact in sorted(side_dir.rglob("*")):
+        if not artifact.is_file() or artifact.name == "metrics.json":
+            continue
+        relative = artifact.relative_to(side_dir).as_posix()
+        artifacts.append(
+            {
+                "path": relative,
+                "bytes": artifact.stat().st_size,
+                "sha256": _sha256_file(artifact),
+            }
+        )
+    artifact_canonical = "".join(
+        f"{item['path']}\t{item['bytes']}\t{item['sha256']}\n"
+        for item in artifacts
+    ).encode()
+    record["artifacts"] = artifacts
+    record["artifact_tree_sha256"] = hashlib.sha256(artifact_canonical).hexdigest()
     (side_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
