@@ -1,470 +1,305 @@
-# Capture-to-scope: technical report
+# Capture-to-scope: final technical report
 
-Handheld walkthrough → dimensioned floor plan, per-surface damage intelligence,
-and an estimator-ready scope of work.
+**Evidence cutoff:** 2026-09-02 · **code-audit commit:** `086e742c`
+([pinned source](https://github.com/RugvedMavidipalli/cozmo-ai-v2/tree/086e742c64edf132152bcd26b352c350561b2165)) ·
+**current `origin/main`:** [`64102d08`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/64102d088c754112707d86e59067342395e6b16c)
 
-> **Status markers.** ✅ = measured on the sample captures. ⏳ = requires laser
-> ground truth not yet collected. Nothing here is estimated by hand — every ✅
-> number comes from `python -m pipeline run` or `tools/ablate.py`.
+This report separates **implemented design**, **unit/synthetic-test evidence**,
+**measured local outputs**, **design targets**, and **unvalidated integrations**.
+Every number is either in a cited repository/validation artifact or is a
+parameter in the pinned source. Local result files are untracked; authorized
+hashes are recorded in the [evidence register](evidence_register.md), while
+the separate VM outputs are identified by validation-root path and command
+file.
+Neither is release acceptance evidence without the stated qualification.
 
----
+PR-8 is merged and its code changes are included as implemented design. A
+post-recovery smoke handoff is available, but it is limited to raw LiDAR and
+91 stride-60 timestamps; no dense or all-frame result is restored. RoomFormer
+preprocessing/overlay behavior is smoke-only and not a room-closure result
+[R13].
 
-## 1. Architecture
+## 1. Architecture and runtime contracts
 
+The executable path is an ordered dataflow:
+
+```text
+capture → ingest → pose refinement → depth/pose contract → fusion
+        → provenance sampling → gravity/2-D walls → wall refinement
+        → room faces → openings/surfaces → measurements → damage → scope → export
 ```
-capture ─► ingest ─► pose graph ─► TSDF fusion ─► gravity ─► walls ─► rooms ─► plan + 3D
-             │       (ARKit odom                            (2D RANSAC) (watershed)
-             │        + ICP loops)                              │
-             │                                                  ▼
-             └─► keyframes ─► VLM ─► SAM ─► project ─► per-surface UV grid ─► regions
-                                                                                  │
-                                                       rules.yaml ─► concealed + scope
+
+This order is the `run()` implementation, not a product aspiration: ingest
+constructs a capture bundle; fusion emits the point cloud; geometry fits walls;
+room extraction consumes walls and observed floor; later stages consume those
+contracts and export `result.json`, geometry files, CSVs, and overlays
+[R1][R7]. The result schema requires capture, reconstruction, rooms, damage,
+scope, and diagnostics fields [R7].
+
+The invariant boundaries are deliberate. Ingest owns pose axes, units,
+intrinsics, timestamps, and optional IMU. The frame contract records the depth
+source, units, confidence/max-range policy, frame decisions, and video
+availability. Geometry uses gravity-aligned plan coordinates; its wall path is
+sequential RANSAC → Manhattan/off-axis handling → collinear cleanup → ray
+occlusion filtering → crossing/corner refinement. Room topology is formed from
+the wall graph and is retained only when observed-floor evidence exists
+[R3][R5]. Damage is accumulated on wall surface grids, and scope is downstream
+of the resulting regions; a damage call never changes the fitted geometry
+[R1][R11].
+
+## 2. Tier design and device/input matrix
+
+The tiers below describe code paths and required artifacts, not supported-device
+marketing. No named phone, camera, GPU, or accuracy certification is asserted
+by the repository.
+
+| Tier | Input contract implemented in code | Runtime status |
+|---|---|---|
+| A · raw LiDAR capture | A directory is detected as Stray Scanner only when it contains `rgb.mp4` and `camera_matrix.csv`; end-to-end loading additionally requires `odometry.csv` and either raw `depth/*.png` or a dense artifact. Confidence and IMU are optional. Raw depth is converted from millimetres to metres; poses are camera-to-world in OpenCV axes. | Unit-tested detection/loader contracts plus a VM raw-LiDAR/ARKit stride-60 smoke; this is not device qualification [R2][R3][R13]. |
+| B · dense-depth substitution | `load_capture` accepts a QC-probed dense-depth directory when raw depth is absent and deliberately marks `has_depth=False`. The frame contract requires a QC-approved dense entry at native RGB shape; invalid dense frames may fall back to the same-index raw LiDAR frame. | Implemented contract; no completed dense-depth result is retained or claimed. The recovered smoke is raw LiDAR only [R3][R13]. |
+| C · plain video / offline pose | A standalone `.mp4`, `.mov`, `.avi`, or `.mkv` is detected as `PLAIN_VIDEO`. The runner exposes `--slam-poses`, dense-depth, manifest, and pose-source options, but `pipeline run` still consumes a capture directory and requires a pose/depth/intrinsics contract. | Detection is unit-tested; standalone-video and MASt3R-SLAM reconstruction remain unvalidated [R2][R3][R13]. |
+| Reject | Missing required files, an unsupported extension, an unrelated directory, or absent raw/dense depth produces an explicit detection/load error. | Unit-tested for detection; this is an input failure, not graceful reconstruction [R2][R3]. |
+
+The frame association default is PTS, with an explicit index mode. Video
+decoding records terminal sidecar gaps rather than shifting later depth or pose
+indices [R3]. This makes a malformed or truncated capture visible in the
+diagnostics, but does not repair missing frames.
+
+## 3. Drift handling and quantitative error budget
+
+Drift is measured as the spread of per-visit median wall offsets. A visit is a
+continuous observation run; a gap greater than the implemented 3-second
+threshold separates visits. This measures coherent trajectory displacement,
+not just within-visit point scatter [R4]. Pose refinement uses the raw CSV
+trajectory as its prior. ICP supplies loop-closure evidence; the candidate is
+accepted only if the weighted graph objective and independent loop residual
+improve, the loop gap does not worsen by more than 0.05 m, and the maximum
+correction is within the 0.75 m bound. Otherwise raw poses are retained
+[R4].
+
+The engineering failure that motivated the current design is recorded in the
+historical commit: chained pairwise-ICP sequential edges reported 7.3 mm drift
+while stretching a 2.99 m storey to 4.48 m with metre-scale corrections. That is
+a commit record of the failed experiment, not a new run or a quality result
+[R8].
+
+The reportable interval model is explicit. For a plane fit with residual RMS
+`r`, support count `N`, and coherent revisit spread `d`:
+
+```text
+σ_plane = sqrt(max(r / sqrt(N), 0.002 m)^2 + d^2)
+wall half-width = z · 2σ_plane · (1 + 1.5·inferred_fraction) · scale · modality
 ```
 
-Six modules own one invariant each. `ingest` owns sensor conventions;
-`poses` owns the trajectory; `geometry`/`planes` own metric surfaces; `rooms`
-owns topology; `occupancy` owns *position on a surface*; `scope` owns domain
-logic. Damage never touches geometry code — it projects into the grid that
-`occupancy` already built for openings and occlusion. Full stage-by-stage
-detail: `docs/architecture.md`.
-
-**Stack.** Python 3.11, Open3D 0.19 (TSDF, ICP, pose graph), OpenCV, SciPy,
-scikit-image. Damage detection calls the Anthropic API (`claude-opus-5`) and
-Replicate (`meta/sam-2-large`); both are disclosed, both cache to disk by
-content hash, and both have local fallbacks. Runs on an Intel i9 with no GPU.
-
----
-
-## 2. Sensor conventions: measured, not assumed
-
-Two conventions had to be established before any geometry was meaningful, and
-**both textbook answers were wrong**. Each produced confident, plausible-looking,
-geometrically meaningless output.
-
-| Question | Textbook answer | Measured answer | Cost of the wrong choice |
-|---|---|---|---|
-| Pose handedness | Apply ARKit→OpenCV flip `diag(1,−1,−1,1)` | Poses are *already* camera-to-world in OpenCV convention | Frame alignment 4.2 cm → **25.9 cm** ✅ |
-| IMU→camera rotation | Identity | `rotZ(−90°)` | Gravity consistency 0.99 → **0.59**; storey height read **10 m** ✅ |
-
-`tools/conv_test.py` scores every plausible pose convention by nearest-neighbour
-agreement between nearby frames' point clouds. `tools/grav_test.py` scores every
-device→camera rotation by whether the accelerometer resolves to a *constant*
-world vector once rotated through the poses. It scores 0.992; the runner-up
-scores 0.87. Both scripts run on any new capture source, and the pipeline
-carries `gravity_consistency` into `result.json` and warns below 0.9 — a
-capture from a different app or device announces a convention mismatch rather
-than silently producing a floor plan of a wall.
-
-**Gravity is then refined against geometry**, not trusted from the IMU alone:
-the accelerometer fixes direction to within a degree or two, and a degree of
-tilt displaces a wall footprint by over a centimetre across a storey — more
-than the 2 cm budget can absorb. The IMU axis seeds a cone filter over surface
-normals, and the floor/ceiling normals inside that cone are averaged. On
-recordings-1 the refinement moves the axis 0.04° and recovers a 3.04 m storey
-with the camera 1.61 m above the floor. ✅
-
----
-
-## 3. Reconstruction and the error budget
-
-### 3.0 Resolving competing surfaces
-
-Sequential RANSAC produces two kinds of duplicate needing opposite treatment.
-**Fragments of one surface** — a wall split by a doorway, or seen on two visits
-a couple of centimetres apart — are merged, since both are evidence of the
-same plane and its extent. **Parallel clutter** — door reveals, trim, cabinet
-fronts a few centimetres in front, of which one wall on recordings-1 spawned
-five within 23 cm — is *suppressed*, not merged: averaging would drag the wall
-off its true position. Since RANSAC takes the largest consensus set first, the
-dominant plane in such a family is the wall.
-
-Separation is measured as the candidate's greatest distance from the target's
-line, not a difference of plane offsets — within a 15° tolerance two segments
-can share an offset at their midpoints and diverge by half a metre at their
-ends. Runs are also gated on **observed coverage** (share of a run's own
-surface area actually seen), which is scale-free: real walls score 8–89%,
-spurious slivers on the same infinite line score 1–3%.
-
-| recordings-1 | before | after |
-|---|---:|---:|
-| walls | 64 | **43** |
-| same-facing duplicate pairs | 24 | **0** |
-| minimum support density | 60 pts/m | **352 pts/m** |
-| drift median | 23.3 mm | **12.7 mm** |
-
-*Caveat:* part of the drift improvement is a selection effect — the
-suppressed surfaces were the worst-fitting ones, so removing them improves
-the median of what remains as well as the geometry itself. The honest claim
-is that the *wall set* is clean, not that sensor accuracy improved 45%.
-
-One field is a documented trap: `WallSegment.height_range` looks like it
-should separate walls from low furniture, but `wall_band_mask` clips every
-candidate to the same height band before RANSAC runs, so it saturates at the
-band limits for walls and countertops alike.
-
-### 3.0a Occlusion filtering: a wall behind a wall
-
-`merge_collinear` removes surfaces too *close* to the camera (furniture in
-front of a wall); `filter_occluded_walls` handles the opposite geometry — a
-candidate plane too *far* away, whose points could only exist if light passed
-through an already-better-supported wall to reach them. It traces the ray
-from each supporting point back to its observing camera and drops the wall if
-a majority of those rays cross a stronger wall's solid span.
-
-Two drops on recordings-1 were traced by hand rather than trusted on faith,
-since both had real support (2,942 and 5,595 pts/m — denser than several kept
-walls): one turned out to be a sliver of an accepted wall's own far face,
-grazed through a doorway edge and fitted as if freestanding — too thin to be
-a real partition, a case `merge_collinear` can't catch since opposite-facing
-near-parallel planes are normally *its* signature for a shared wall. The
-other was a stray fragment with no such explanation. Full derivation:
-`docs/track-a-reconstruction.md`.
-
-| capture | walls before | occlusion-inconsistent removed |
-|---|---:|---:|
-| recordings-1 (current default config) | 38 | **5** ✅ |
-| recordings-2 *(earlier measurement, unverified against current build)* | 52 | 15 |
-
-The claim this stage supports is a cleaner, non-duplicated wall *set* — not a
-guaranteed drift win on every capture; recordings-2's original measurement
-showed drift *rising* after filtering (10.3 → 13.9 mm), since drift is only
-measured over walls that survive to be revisited, and removing genuine
-observations can shrink that population unfavourably as easily as favourably.
-
-### 3.0b Precision refinement: visits, crossings, corners
-
-Three refinements close the gap between "a plane was fitted" and "a wall was
-measured," each owning one error source: ✅
-
-**Offsets are re-placed at the median of per-visit offsets**, not the pooled
-mean — a pooled fit lets the visit that lingered longest, not the one that
-measured best, decide where the wall is. This cut median drift 11.8 → 9.9 mm
-on recordings-1 and put both captures under the 2 cm wall-gate budget.
-
-**Impossible crossings are resolved.** An interior–interior intersection has
-exactly two causes, separable by geometry: a T-junction overshoot (trim the
-short overhang back to the junction) and clutter cutting a wall at a shallow
-angle (drop the weaker surface — neither overhang is short). recordings-1 had
-13 such crossings; it now has 0.
-
-**Endpoints snap to corner intersections** — the corner, not wherever the
-last inlier fell, is where a tape measure is hooked, and only after this step
-do emitted lengths mean what the interval model assumes. Median
-endpoint-to-corner gap went 22.5 cm → 0.0 cm, 41 of 72 endpoints snapped
-exactly; the rest are free scan-boundary ends covered by the inferred-span
-machinery.
-
-Drift is measured *before* extent edits, since trimming/snapping move
-endpoints, never offsets. (An early version of the visit-offset fit appeared
-to worsen drift 2.5× from an estimator bug, not a geometry bug — full story
-in `docs/track-a-reconstruction.md`.)
-
-### 3.1 Why walls are fitted in 2D
-
-Once gravity is known, a vertical surface has **one** free orientation and
-**one** offset. Fitting in the gravity-aligned horizontal projection removes
-two degrees of freedom 3D RANSAC would otherwise estimate from noise, and
-pools every point across the wall's full height into a single fit. Wall
-extent then comes from **intersecting neighbouring wall lines**, never from
-observed point spread — furniture, doorways and grazing dropout all truncate
-what the sensor sees, while the corner where two planes meet is where a tape
-measure goes.
-
-### 3.2 Measuring drift honestly
-
-> Scatter is dominated by depth-sensor noise, and a plane fit averages it
-> down by √N. Drift does the opposite: it displaces an entire visit's points
-> *coherently*, so the fit lands between the visits and the scatter barely
-> moves. **Scatter is nearly blind to the error that actually breaks the gate.**
-
-`pipeline/drift.py` groups each wall's supporting points by *when* they were
-observed, splits into visits separated by >3 s, and reports the spread
-between per-visit plane offsets — the drift contribution to wall position,
-directly comparable against the 2 cm gate.
-
-On raw ARKit poses: **median 21.8 mm, p90 46.1 mm** over 24 revisited walls
-(recordings-1) ✅ — above the gate, which is why refinement is not optional.
-
-### 3.3 The pose graph, and a mistake that looked like success
-
-| variant (recordings-1) | drift median | p90 | storey height | max correction |
-|---|---:|---:|---:|---:|
-| raw ARKit | 21.8 mm | 46.1 mm | 2.990 m | — |
-| odometry only, no loops *(control)* | 21.8 mm | 46.1 mm | 2.990 m | 0.0 cm |
-| odometry + loop closure | 21.4 mm | 46.5 mm | 2.922 m | 24.5 cm |
-| **ICP sequential edges** *(rejected)* | **7.3 mm** | 29.6 mm | **4.482 m** | **324 cm** |
-
-The last row is instructive: building sequential edges from pairwise ICP cut
-measured drift 66% — and destroyed the reconstruction, stretching a 2.99 m
-storey to 4.48 m. A small systematic bias in registering two 256×192 depth
-frames compounds once chained over 253 keyframes; the optimiser found a
-self-consistent, badly wrong configuration, and the drift metric *approved*
-of it because every wall agreed with itself in the warped space — a metric
-that improves while the artefact degrades is worth more than one that only
-ever agrees with you.
-
-The fix follows from what each sensor is good at: **sequential edges come
-from ARKit** (weighted heavily — accurate to millimetres over the ~0.2 m
-between keyframes, better than pairwise ICP at this resolution);
-**loop-closure edges come from ICP**, weighted ~100× lower, carrying the only
-information ARKit doesn't already have. The control row proves the optimiser
-moves nothing on its own (0.0 cm with odometry edges alone). Loop candidates
-are gated on view direction, ICP fitness, then displacement — a correction,
-not a teleport — and `refine_trajectory` refuses its own output past a 75 cm
-correction, falling back to raw ARKit.
-
-### 3.4 Where the error actually comes from
-
-With the optimiser honest, loop closure buys **1.8%**. That's the important
-negative result: on these captures, trajectory drift is not the dominant
-error term, and further pose engineering would have been wasted effort.
-
-The residual was attributed to the depth sensor instead (`tools/depth_bias.py`).
-Depth scale error trends with range, beam smear with incidence, sensor
-self-assessment with confidence — separable signatures. Pooling 1.46 M
-observations across 30 walls, each re-centred on its own wall: ✅
-
-| range | 0.7 m | 1.5 m | 2.4 m | 3.4 m | 4.0 m | 5.4 m |
-|---|---:|---:|---:|---:|---:|---:|
-| median residual | −2.2 mm | +0.7 mm | −1.5 mm | −3.3 mm | **+4.3 mm** | **+11.6 mm** |
-
-**Range bias is real and nonlinear** — well-behaved to ~3.4 m, then
-systematically far, reaching +11.6 mm at 5.4 m; a linear fit understates it,
-the effect is a knee. **Incidence showed no clean trend**, so beam smear is
-not a leading term here and damage-fusion's incidence weighting is justified
-on mask quality, not depth accuracy. **ARKit's own confidence is informative
-by spread**: IQR tightens from 57.8 mm (low confidence) to 32.2 mm (high),
-and high-confidence returns are the overwhelming majority of the data, so
-tightening the gate costs less coverage than it first appears.
-
-Ungated depth changed drift only 3.3% on recordings-1 ✅ — an undamaged,
-well-lit property; the adversarial held-out room (mirrored closet, glass
-shower) is where confidence gating should separate sharply.
-
-### 3.5 Gating sweep — acting on the findings
-
-Discarding data to gain accuracy is a trade, not a free win. Measured, not
-assumed (`tools/gating_sweep.py`, recordings-1): ✅
-
-| min confidence | max depth | drift median | wall coverage | walls | Δ drift | Δ coverage |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 5.0 m *(old default)* | 22.8 mm | 116.6 m | 31 | — | — |
-| **1** | **3.5 m** *(new default)* | **20.9 mm** | **115.8 m** | **35** | **+8.2%** | **−0.7%** |
-| 2 | 3.5 m | 22.4 mm | 90.1 m | 29 | +1.7% | −22.7% |
-| 2 | 2.5 m | 13.5 mm | 57.8 m | 19 | +40.6% | −50.4% |
-
-**`--max-depth 3.5` is nearly free** — 8.2% less drift for 0.7% less
-coverage — and lands exactly where §3.4 predicted the bias knee; it's the
-default. Tightening confidence to level 2 costs a fifth of the wall coverage
-for less gain, so medium confidence stays default on well-lit properties; the
-flag exists because the adversarial room is where that should reverse. The
-last row is tempting and rejected: 40% less drift but half the wall coverage
-— an unreconstructed wall cannot be measured accurately, it simply isn't
-there.
-
----
-
-## 4. Damage: detection, fusion, and not double counting
-
-### 4.1 Single-frame output is a hypothesis, never a result
-
-The VLM is prompted as a restoration estimator and required to argue against
-itself: every detection fills a `distractor_considered` field naming the most
-plausible benign explanation and why it was rejected. The prompt encodes the
-specific discriminations the evaluation targets — soot deposits track airflow
-and heat sources while shadows track lighting geometry; reflections move with
-the camera; dark stone and polished tile read as wet; scuffs and patina are
-not restoration damage. Nothing from a single frame reaches the output;
-confirmation is geometric.
-
-Two upstream fixes this pass measurably changed detection quality: frames are
-now rotated to the model's natural viewing orientation from measured gravity
-(not a hardcoded guess) and sent at full native resolution rather than the
-~56×-smaller depth-raster crop previously shared with mask/fusion alignment.
-Before this, a ceiling-light lighting artifact was misread as a water stain
-when fed to the model sideways; re-run correctly oriented, the same frame
-produces "no damage called." Before/after evidence: `docs/track-b-damage-intelligence.md`.
-
-### 4.2 The fusion invariant
-
-Masks back-project through depth into the **surface's** fixed UV grid, where
-they vote. Three properties follow:
-
-1. **No double counting.** Final area is the area of cells that survived, not
-   a sum over observations. Measured: one patch viewed from 2→12 viewpoints
-   produces one region whose area *plateaus* at 6.35 m²; summation would have
-   given ~12×. ✅
-2. **Reflections are rejected by geometry, not a classifier.** A stain seen in
-   a mirror back-projects to the *reflected* scene's depth, far from the
-   mirror plane, and fails plane agreement: 47% of true-depth pixels land on
-   a surface, versus 6% at doubled depth and 0% at tripled. ✅
-3. **Stains spanning a corner split correctly**, because assignment is per
-   pixel, not per detection.
-
-Votes are weighted by incidence angle (grazing views discounted, dropped past
-75°), and a region must be seen from **≥2 independent viewpoints** — the
-single most important parameter in Track B, since view-dependent artefacts
-appear in one view and vanish in the next while a real stain persists.
-Regions that are genuinely co-dominant between two classes (e.g. water damage
-from firefighting a fire) are now classified `"combined"` rather than forced
-into one winner, and dispatched through every relevant scope handler.
-
----
-
-## 5. Scope: quantities that are not proportional to area
-
-> A 0.3 m² mold patch does not produce a 0.3 m² line item.
-
-It produces removal of the patch **plus a 30 cm margin on every side**,
-containment sized to the **room** (perimeter × height + ceiling), a HEPA air
-scrubber sized to the contained **volume**, PPE **per technician per day**,
-and two HEPA passes. Water behaves the same way: the flood cut is driven by
-the **height** of the waterline, not the stained area, and baseboard comes
-off in **whole runs**. A ceiling surface has no waterline to cut above, so it
-gets its own quantity path sized to affected area instead — a real gap this
-pass, previously a ceiling region silently produced only an antimicrobial
-line item and nothing else.
-
-Every rule lives in `rules.yaml` with its IICRC source (S500 water, S520
-mold, S700 fire); rules that are our own simplification say so in a `note`
-field. **Live modification is a config edit** — changing the flood cut from
-30 cm to 60 cm is one line in `rules.yaml` plus a re-run, no code change.
-
-Concealed damage is a separate rule set (`concealed:`) emitting a
-probability, a rule id, and a rationale per flag — insulation behind
-saturated drywall (p=0.72), pad and subfloor under wet carpet (p=0.85),
-smoke in cavities and HVAC beyond visible soot (p=0.70), among eight rules
-total. Probabilities are calibrated judgement, not measurements, and are
-labelled as such.
-
-The scope is now also exported as two CSVs (room/wall sketch geometry and
-line items) alongside the JSON, in the estimator-convention units `rules.yaml`
-already specifies — the structured, Xactimate-workflow-consumable format the
-assignment asks for, which previously didn't exist. Full rule content and
-export column layouts: `docs/track-c-scope-generation.md`.
-
----
-
-## 6. Calibrated uncertainty
-
-Every measurement ships an interval, built in two layers.
-
-**Physical.** Plane-offset uncertainty combines fit scatter averaged over
-supporting points with measured drift — and **drift is not averaged down**,
-because it is coherent within a visit; treating it as averageable random
-error is precisely what produces confident, wrong intervals. A wall length is
-a difference of two corners, each an intersection of two planes, so four
-plane offsets contribute; spans never observed widen the interval in
-proportion to how much of the wall was inferred.
-
-**Conformal.** A single scale factor is fitted against laser ground truth
-from the empirical quantile of normalised errors — no distributional
-assumption, and a few dozen measurements suffice. ⏳ Until that fit exists,
-every output carries `"calibrated": false`, the floor plan prints *"intervals
-uncalibrated"*, and the run warns. Overconfidence on a hard capture is an
-automatic red flag; the honest state is to say the intervals are not yet
-earned.
-
-**Graceful degradation.** A video-only capture is designed to multiply every
-interval by a measured no-LiDAR factor rather than failing or bluffing, but
-the path is not yet wired into the CLI — `ingest.load_capture` currently
-hard-fails on a capture with no depth or poses rather than degrading. This is
-the single highest-risk open item (§8) since it's an explicitly scored gate
-and a stated held-out test case.
-
----
-
-## 7. Accuracy gates
-
-<!-- GATE_TABLE -->
-
-⏳ Gates require laser ground truth. `bench/run.py` scores every gate,
-reports the error distribution, fits the conformal calibration, and runs
-head-to-head against an incumbent scan. This pass added scoring code for 6 of
-the 7 previously-uncovered gates, plus a room-overlap/adjacency
-self-consistency check that needs no ground truth and passes today (5 rooms,
-0 overlaps, 0 adjacency errors on recordings-1) — leaving only no-LiDAR
-wall-length unscoreable until §6's fallback exists. Reference:
-`docs/benchmarking-and-usage.md`.
-
-**Runtime** ✅ — geometry only, recordings-1: ~145 s for 5 rooms (~29 s/room),
-comfortably inside the 300 s gate and 90 s stretch. **With the real damage
-pass** (default 40 frames, full resolution as of this pass): ~617 s total
-(~123 s/room) — still inside the gate but with much less margin, and
-structurally risky, not just slow: damage cost scales with `--damage-frames`,
-not room count, so a 1–2 room capture carries the same absolute cost across
-fewer rooms and could plausibly breach it. Intel i9-9980HK, no GPU.
-
----
-
-## 8. Known failure modes
-
-1. **Pairwise-ICP odometry warps space** (§3.3). Diagnosed, fixed by trusting
-   ARKit for sequential edges, and guarded by a correction-magnitude rejection.
-2. **Room polygons follow observed floor.** Furniture shadows and the
-   sensor's poor floor coverage near walls bias area low. Mitigated by
-   treating the operator's own path as floor evidence and growing rooms to
-   their bounding walls; still the largest known source of floor-area error.
-3. **Duplicate parallel wall fragments** from doorway interruptions and
-   drift. Mitigated by `merge_collinear`, which compares normal *direction*
-   so the two faces of a partition never merge.
-4. **Occlusion detection over-triggers** on recordings-2, marking spans
-   inferred that were merely viewed at a grazing angle. Conservative in the
-   right direction (understates confidence) but noisy.
-5. **Water Class (1–4) is rarely inferable** from single frames. Returned
-   `null` rather than guessed.
-6. **No-LiDAR fallback is unwired.** Depth estimation, scale anchoring, and
-   widened intervals are designed but not in the CLI — see §6.
-7. **Loop closure has limited leverage on open trajectories.** recordings-2
-   ends 7.3 m from its start with few revisits; drift there is controlled by
-   odometry quality alone.
-8. **A sideways or low-resolution frame can fabricate damage.** Observed, not
-   hypothetical: a ceiling light's lighting gradient, fed to the model at the
-   wrong orientation, was read as a Category 2 water stain and produced real
-   scope line items. Fixed (§4.1), but the lesson — VLM damage calls are only
-   as trustworthy as the image geometry feeding them — has no general guard
-   beyond re-verifying on more captures.
-9. **Floor and ceiling damage is currently undetectable end to end.** Both
-   surfaces exist (`build_surface_refs`), but the pipeline only allocates a
-   fusion accumulator for walls — a detection assigned to the floor or
-   ceiling has nowhere to vote and is silently dropped before it can reach
-   the (now-fixed) ceiling scope logic in §5. Needs a horizontal-plane
-   occupancy grid; not yet built.
-
----
-
-## 9. With one more month and a team of two
-
-**Weeks 1–2 — close the metric gap.**
-Bundle-adjust planes jointly with poses instead of sequentially: make wall
-planes first-class variables in the graph so a wall seen on three visits
-becomes one constraint rather than three observations averaged afterwards.
-Add place recognition (learned descriptors) instead of pose-proximity loop
-proposal, which is what limits loop closure on open trajectories. Rectify
-room polygons from the wall arrangement rather than floor pixels (failure
-mode 2). Build the floor/ceiling occupancy grid so damage fusion can actually
-reach those surfaces (failure mode 9) and wire the no-LiDAR fallback in
-(failure mode 6) — both are designed, neither is built.
-
-**Weeks 2–3 — damage quality.**
-Fine-tune a segmentation head so masks stop depending on a hosted model — SAM2
-has never actually run in this project for lack of a configured API token,
-every mask to date is the GrabCut fallback. Build the adversarial set the
-evaluation implies (mirrors, glass, shadows, wet-look-dry) as a regression
-suite; failure mode 8 is exactly what it should catch automatically. Add
-material classification (drywall/tile/carpet/wood), which most
-concealed-damage rules currently assume rather than observe.
-
-**Weeks 3–4 — estimator trust.**
-Native Xactimate ESX export, building on this pass's CSV export as an
-intermediate step. A review UI showing, per line item, the rule that fired
-and the frames that produced it — the audit trail already exists
-(`derived_from`, `rule_id`, `contributing_frames`), it needs a surface.
-Calibration per capture modality and per property, not one global scale. A
-real automated regression suite: everything this pass was verified by hand,
-nothing guards it against a future regression.
-
-**Continuously.** Every self-captured property enters the benchmark with
-laser ground truth. The gate table runs in CI. The thing that decays fastest
-in a system like this is not accuracy but the *honesty* of its intervals, and
-only a growing ground-truth set keeps that in check.
+At the default 0.90 coverage target, the implementation uses `z = 1.645`.
+The no-LiDAR modality multiplier defaults to 3.0; a supplied calibration file
+can replace it. These are model parameters, not measured coverage claims
+[R6]. Drift is kept outside the `sqrt(N)` term because the code models it as
+coherent across a visit; inferred extent widens the corner-derived length
+interval [R6].
+
+## 4. Calibration analysis and evidence status
+
+Calibration is a separate, unearned state. `fit_calibration` requires paired
+predictions, known truths, and uncalibrated half-widths; it sets `scale` to the
+target empirical quantile of normalized errors. With no supplied truth fit, the
+implementation default is `calibrated:false`, `scale:1.0`, and
+`coverage_target:0.90`; no laser reference set is checked in, so no accuracy or
+interval-coverage gate is scored [R6][R7].
+
+No measured accuracy number is promoted here from the untracked baseline,
+recovered smoke, or
+historical sensor JSON files: their producing build/configuration is not
+embedded. They remain listed, hashed, and explicitly excluded from acceptance
+claims in the evidence register. The only calibration state asserted for this
+report is that implementation default [R6].
+
+## 5. Engineering fix-loop: from plausible output to diagnosable output
+
+The fix loop has three evidence-backed steps:
+
+1. **Pose failure.** The historical pairwise-ICP experiment made the drift
+   metric look better while corrupting scale. The implementation moved ARKit
+   to sequential edges, restricted ICP to revisits, and added acceptance
+   tests for objective/residual/gap regressions and no-loop fallback [R4][R8].
+2. **Geometry ambiguity.** Wall extraction now records lifecycle counts and
+   reasons, endpoint-gap quantiles, polygonization decisions, grid transforms,
+   room fallback, and zero-room reasons. Synthetic tests verify a bounded
+   square produces one wall-graph room and an empty grid reports
+   `no-bounded-wall-faces` and `no-observed-free-cells` [R5].
+3. **Recordings-2 topology failure.** The required failure is present in the
+   untracked zero-room artifact: the same 5,443-frame/90.74-second capture
+   yields 0 rooms and 31 walls; `result.json` itself has no geometry
+   diagnostics [R10]. A read-only replay over its saved walls confirms the
+   immediate mechanism: polygonization at the implemented 0.08 m gap threshold
+   returns 0 faces; endpoint-gap median/p75/p90/max are 0.545/1.152/1.734/2.592
+   m, with only 5 incidences within 0.08 m. There is no face through 0.75 m and
+   one face at 0.80 m. The saved grid has 23,959 occupied cells, 35,191 accepted
+   free cells, and 154 free components; its largest free union is a roughly
+   6,512-piece MultiPolygon, while fallback accepts one simple Polygon. The
+   replay confirms non-closure but does not isolate whether pose, depth,
+   filtering, or corner logic caused the gaps [R17]. Worker-9's audit could not
+   recover the producing checkout, build/configuration, or terminal invocation;
+   the Phase-1 snapshot and previously reported command are context only, not
+   reproducible producer provenance [R14][R16].
+
+   Recovery restored a separate raw-LiDAR/ARKit stride-60 smoke: 91 requested
+   timestamps, 265,689 cloud points, 29 exported walls, 0 openings, and 0
+   rooms, with schema errors 0. A corrected SceneCAD-density RoomFormer smoke
+   loaded with 0 missing/0 unexpected keys, produced one image-space polygon,
+   and wrote 29 wall-dimension rows. Its overlay shows all 29 orange pipeline
+   traces and a length±tolerance legend; the green polygon remains a poor fit.
+   These are subset/smoke observations, not a closure fix or a before/after
+   improvement claim [R13].
+
+The first real PR-6-labeled run is more specific: it records 1 room from
+`observed_floor_components`, `fallback_used:true`, and zero candidate/accepted
+wall-graph faces. Rerun-1 and closure-1 also record one fallback room and zero
+graph faces. A later closure-10 artifact, paired with a same-directory
+`fusion_manifest`, records the raw-LiDAR/`min_confidence=1`/`max_depth=3.5`/
+refined-ARKit/PTS configuration and 2 accepted graph faces/2 rooms; it also
+records a terminal RGB/sidecar shortfall and no ceiling. The labeled outputs
+have no producing build SHA, the runs are not identical evaluation conditions,
+and PR-6 is still **draft and unmerged**. The correct conclusion is diagnostic
+coverage plus variable unvalidated trials—not closure or success [R10].
+
+## 6. Known failure modes and limitations
+
+- **Metric accuracy is unvalidated.** There is no checked-in laser truth,
+  calibrated result, device qualification, or standards-compliance result.
+  The recovered smoke is not an accuracy result; benchmark gates that require
+  references remain unscored [R6][R7][R13].
+- **Recordings-2 topology remains an acceptance risk.** Zero rooms are directly
+  observed in one run; the unmerged closure trials are variable and must not be
+  presented as a fix. A final acceptance run needs a pinned build, exact
+  invocation, clean output, and truth/inspection criteria [R10].
+- **Incomplete vertical evidence propagates.** The unvalidated recordings-2
+  outputs and closure-10 trial warn that no ceiling plane was found, so heights
+  and wall-opening heights are unavailable [R10].
+- **Standalone video is a contract, not a validated product path.** Detection
+  accepts a plain video, but reconstruction still needs poses, intrinsics, and
+  raw or QC-approved dense depth. No completed standalone-video or MASt3R-SLAM
+  result is claimed [R2][R3][R13].
+- **GPU evidence is bounded and asymmetric.** Recovery provides only a raw
+  LiDAR/ARKit stride-60 smoke: 91 requested timestamps, 36.43 s runtime,
+  1.05 GiB peak RSS, 265,689 points, 29 walls, 0 openings, and 0 rooms; no
+  GPU model stage ran. No dense or all-frame result is available [R13].
+- **RoomFormer remains smoke-only.** The corrected SceneCAD preprocessing and
+  separate overlay ran in 6.16 s with 482 MiB peak GPU/1.58 GiB peak RSS,
+  clean checkpoint load, one image-space polygon, and 29 wall-dimension rows.
+  Visual inspection shows all 29 orange pipeline traces and their
+  length±tolerance legend, while the green polygon is a poor fit; no room
+  closure or geometry acceptance follows. Commit `5c09dff9`/`88ad7982` is not
+  VM-validated; the corrected preprocessing is in open PR #9, not merged
+  [R13].
+- **Deleted and stopped artifacts stay excluded.** The earlier validation
+  source/stages/output trees and partial all-frame files were deleted. A new
+  source-PR8 checkout and reconstruction rerun are required before dense,
+  all-frame, or full RoomFormer evaluation [R13].
+- **Damage model performance is unmeasured.** The code names a default VLM
+  model and attempts hosted SAM 2 only with a token, falling back to local
+  GrabCut on failure; those names and branches are implementation facts, not
+  accuracy evidence. Current damage accumulation allocates vote grids only for
+  walls, so floor/ceiling detections have no accumulation target [R11].
+- **Capture integrity can still limit output.** The audit measured native 4:3
+  RGB/depth, aligned labels/depth/confidence, and no MP4 orientation metadata;
+  OpenCV decoded 5,442 frames while sidecars contain 5,443. No per-frame input
+  manifest exists, so these are integrity limitations rather than proof of the
+  graph failure's cause [R17].
+
+The next evidence needed is narrow: run the pinned closure candidate and the
+plain-video/dense path with recorded environments, collect laser references,
+score the benchmark gates, and resolve the wall-only damage limitation. Until
+then, the honest deliverable is a traceable reconstruction pipeline with
+explicit uncertainty and failure diagnostics—not a certified measurement or
+standards-compliant estimator.
+
+## Sources
+
+Repository implementation links R1–R11 below point to commit
+`086e742c64edf132152bcd26b352c350561b2165` and were validated 2026-09-02.
+PR/source links in R13-R17 are separately pinned. The full claim-to-evidence ledger
+and authorized artifact hashes are in [`report/evidence_register.md`](evidence_register.md).
+
+[R1] [`pipeline/cli.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L125-L148), [`docs/architecture.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/architecture.md#L22-L131).
+
+[R2] [`detect.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/detect.py#L7-L57), [`test_detect.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/tests/test_detect.py#L6-L59).
+
+[R3] [`ingest.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/ingest.py#L11-L31), [`frame_contract.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/frame_contract.py#L482-L605).
+
+[R4] [`poses.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/poses.py#L111-L157), [`drift.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/drift.py#L11-L95), [`test_pose_refinement_acceptance.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/tests/test_pose_refinement_acceptance.py#L4-L83).
+
+[R5] [`planes.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/planes.py#L662-L846), [`rooms.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/rooms.py#L275-L410), [`test_geometry_diagnostics.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/tests/test_geometry_diagnostics.py#L64-L190).
+
+[R6] [`uncertainty.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/uncertainty.py#L9-L18), [`uncertainty.py` model](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/uncertainty.py#L75-L232), [`fit_calibration`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/uncertainty.py#L382-L430), [`benchmarking-and-usage.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/benchmarking-and-usage.md#L45-L117).
+
+[R7] [`result.schema.json`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/schema/result.schema.json#L1-L70).
+
+[R8] Historical primary commits [`e325b718`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/e325b71834d0baac9168af13b9427486a8d0cbc9) and [`d814ed34`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/d814ed3407bc0b7e37a9f6a9e78429c6fc68d517). The associated untracked legacy JSON hashes (`ablations_rec1.json` `e1e729889a8c20dc2344d549c94a52dbe64f14ad8fcbbe92605bf4581fba58d2`, `gating_sweep.json` `2506cad3d41a654477bf34c06a406c4dbf948ecdfa43f77c66feb363747e7b12`, `depth_bias.json` `fb7083645c0eeef2bcb795249fc589614dd8ead28f56c8b49f41620d1c715c62`) are ledger-only because their producer config is not embedded.
+
+[R10] Local untracked zero-room artifact `/Users/rugved/Desktop/projects/outputs/recordings-2/result.json` (SHA-256 `69dab1895678e76b58a1595272bcbcffec3ed91be52192592ce433eeaa153903`); its producing commit/config/invocation is unavailable per the audit. The first PR-6 real-run, rerun-1, closure-1, closure-10, and same-directory manifest are listed with hashes and configuration status in the evidence register. [Draft PR #6](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/6) remains unmerged.
+
+[R11] [`damage/fusion.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/fusion.py#L348-L430), [`cli.py` damage pass](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L718-L779), [`vlm.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/vlm.py#L16-L20), [`masks.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/damage/masks.py#L34-L74).
+
+[R13] Post-recovery handoff, verified 2026-09-01T16:47Z: open, clean,
+no-CI [PR #9](https://github.com/RugvedMavidipalli/cozmo-ai-v2/pull/9) at
+[`88ad7982`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/88ad798202961ee6a58f5e1952ab12c60578a9da); PR #8 remains merged at
+[`2074694e`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/2074694e3152cbd31c58825d676699d8dbf065fc). The recovery validation root is
+`/home/ubuntu/cozmo-validation-20260901`. PR #9 adds square extent, 5% padding,
+count/max normalization rather than log normalization, no vertical flip, and a
+separate model-hypothesis overlay over pipeline wall measurements. It uses
+official RoomFormer commit
+[`e88a7e3a`](https://github.com/ywyue/RoomFormer/commit/e88a7e3a81e384e15ea5bdc02d893267a2b6cac1)
+and checkpoint SHA-256 `b0604af4e3e37bf5530484c7e6cc57a5568118eb2247d7842f1aa833ff43d13e`.
+Full VM tests used
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m pytest tests`
+and reported 133 passed, 2 skipped, 4.33 s. Exact recovery E2E command:
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src /home/ubuntu/cozmo-validation-20260901/venv/bin/python -m cozmo_ai_v2.pipeline run /home/ubuntu/cozmo-validation-20260901/data/recordings-2 --out /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --stride 60 --voxel 0.04 --max-depth 3.5 --min-confidence 1 --depth-source raw --frame-association pts --pose-source arkit --no-refine --no-loop-closure --no-damage --no-sam`; command record:
+`stages/roomformer_recovery_raw_stride60_pr8/command.txt`; raw LiDAR/ARKit,
+91 requested stride-60 timestamps (not all frames/dense), 36.43 s, 1.05 GiB
+peak RSS, no GPU model stage, schema errors 0, 91 fused frames, 265,689
+points, 29 walls, 0 openings, 0 rooms; warnings include 3 terminal sidecars,
+no ceiling/heights, and uncalibrated CIs. Exact corrected RoomFormer command:
+`PYTHONPATH=/home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/src TORCH_HOME=/home/ubuntu/cozmo-validation-20260901/cache/torch /home/ubuntu/cozmo-validation-20260901/venv/bin/python /home/ubuntu/cozmo-validation-20260901/source-pr8-roomformer/scripts/run_roomformer_overlay.py --input-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_raw_stride60_pr8 --output-dir /home/ubuntu/cozmo-validation-20260901/stages/roomformer_recovery_contract_dimensions_pr8 --roomformer-repository /home/ubuntu/cozmo-validation-20260901/external/RoomFormer --checkpoint /home/ubuntu/cozmo-validation-20260901/external/RoomFormer/weights/checkpoints/roomformer_scenecad.pth --device cuda --grid-size 256 --display-scale 6`; command record:
+`stages/roomformer_recovery_contract_dimensions_pr8/command.txt`; recovery
+cloud, 6.16 s, 482 MiB peak GPU/1.58 GiB peak RSS, clean load (0 missing/0
+unexpected), one image-space polygon, and 29 wall-dimension CSV rows. Outputs:
+`density_scenecad_contract.png`, `roomformer_overlay_dimensions.png`,
+`roomformer_wall_dimensions.csv`, and `roomformer_overlay_metadata.json` in
+that stage. Visual inspection found all 29 orange pipeline traces and their
+length±tolerance legend, but the green polygon remains a poor fit; this is
+smoke-only, not floorplan/closure validation. Prior source/stages/output trees
+and stopped-job partial files were deleted; dense/all-frame jobs are not
+restored. Commits `5c09dff9`/`88ad7982` are not VM-validated for any claimed
+output.
+
+[R16] The exact recordings-2 producer command, checkout, configuration, and
+environment are unavailable. The previously reported `python -m ... run ...`
+command is context only. Replay defaults (`stride=4`, `voxel=0.02 m`,
+`max-depth=3.5 m`, `min-confidence=1`, 0.90 coverage, refinement enabled, and
+loop closure enabled) are not proven producer settings; an empty `damage[]`
+does not prove `--no-damage`, and observed `rules_version:3` does not identify
+the production rules file. Preserved audit command:
+`PYTHONPATH=/tmp/cozmo-audit-30cf/src pytest -q /tmp/cozmo-audit-30cf/tests`
+→ 60 passed. Read-only replay/diagnostic snippets have no preserved here-doc or
+transcript, so their metrics are measured observations with incomplete command
+provenance, not reproducible-run evidence.
+
+[R17] Worker-9 recordings-2 audit, verified 2026-09-02: measured read-only
+replay over the saved 31 walls at the 0.08 m graph threshold returned 0 faces;
+endpoint-gap median/p75/p90/max were 0.545/1.152/1.734/2.592 m, with 5
+incidences within threshold, no face through 0.75 m, and one at 0.80 m. Grid
+replay measured 23,959 occupied cells, 35,191 accepted free cells, 154 free
+components, and a largest free union of roughly 6,512 MultiPolygon pieces;
+fallback accepts one simple Polygon. Wall-stage replay counts were
+82 -> 42 -> 36 -> 31, with 6 quarantined, 13 clutter-in-front, and 5
+trimmed-at-junction tags. Pose/gravity comparisons (CSV c2w without an added
+flip ~4.80 cm versus alternatives ~24.59/70.41/99.44 cm; rotZ(-90) consistency
+~0.990 versus identity ~0.406) are internal consistency diagnostics, not
+absolute accuracy. Native RGB/depth and aligned labels/depth/confidence were
+measured; OpenCV decoded 5,442 frames versus 5,443 sidecars. Read-only replay
+snippets have incomplete command provenance and no immutable per-frame input
+manifest; these observations do not establish a causal root or accuracy.
+
+[R14] Recordings-2 audit handoff, verified 2026-09-02: Phase-1 commit
+[`30cfb4ce`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/30cfb4ce2f42e130f50ddb45a4bddfbcc396f595) is the audited/replay snapshot, not a verified producer of `/Users/rugved/Desktop/projects/outputs/recordings-2`. Integrated reader history includes [`897f1421`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/897f142140e15196430ab5408bec1999ee14b8dc) and merge [`d2021b83`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/d2021b83e2f0cf9e6a2e44a5214959b750d646c6). The result hash is now known, but the audit found no producing commit/config/invocation: `result.json` has none, the output was uncommitted, and no terminal transcript survives. The previously reported command and output paths are context only and are not reproducible producer evidence. Current input hashes and the measured result summary are recorded in the evidence register; no immutable per-frame input manifest exists. This baseline is not GPU or release acceptance evidence.
