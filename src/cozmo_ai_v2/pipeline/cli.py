@@ -67,6 +67,10 @@ class Timings(dict):
     stores the result automatically.
     """
 
+    def __init__(self, stage_manifest=None):
+        super().__init__()
+        self.stage_manifest = stage_manifest
+
     @contextmanager
     def stage(self, name: str, verbose: bool = True):
         """Times a block of code and stores how long it took under `name`.
@@ -84,11 +88,28 @@ class Timings(dict):
         if verbose:
             print(f"  {name} ...", end="", flush=True)
         start = time.time()
-        yield
-        elapsed = time.time() - start
-        self[name] = round(elapsed, 2)
-        if verbose:
-            print(f" {elapsed:.1f}s")
+        manifest_stage = (
+            self.stage_manifest.stage(name)
+            if self.stage_manifest is not None
+            else None
+        )
+        try:
+            if manifest_stage is None:
+                yield
+            else:
+                with manifest_stage:
+                    yield
+        except BaseException:
+            elapsed = time.time() - start
+            self[name] = round(elapsed, 2)
+            if verbose:
+                print(f" failed after {elapsed:.1f}s")
+            raise
+        else:
+            elapsed = time.time() - start
+            self[name] = round(elapsed, 2)
+            if verbose:
+                print(f" {elapsed:.1f}s")
 
 
 def _launch_mast3r_for_capture(
@@ -158,7 +179,7 @@ def run(args: argparse.Namespace) -> int:
         0 if everything went well. 1 if the final result fails a schema
         check (a sign something is actually wrong with the output).
     """
-    timings = Timings()
+    timings = Timings(getattr(args, "stage_manifest", None))
     warnings: list[str] = []
     geometry_diagnostics = GeometryDiagnostics()
     out_dir = Path(args.out or f"out/{Path(args.capture).name}")
@@ -730,7 +751,11 @@ def run(args: argparse.Namespace) -> int:
         if problems:
             warnings.extend(f"schema: {p}" for p in problems[:5])
         try:
-            export.render_floorplan(result, out_dir / "floorplan.svg")
+            export.render_floorplan(
+                result,
+                out_dir / "floorplan.svg",
+                min_label_length=0.0,
+            )
         except Exception as exc:
             warnings.append(f"floor plan render failed: {exc}")
         export.export_scene(
@@ -1546,25 +1571,13 @@ def _run_validate_scale(args: argparse.Namespace) -> int:
     return 0 if validation.status in {"validated", "advisory"} else 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    """The command-line entry point: reads the arguments the user typed
-    and runs the pipeline with them.
+def build_parser() -> argparse.ArgumentParser:
+    """Build the reconstruction CLI parser for direct and composed callers.
 
-    This is what actually gets called when you run
-    `python -m pipeline run <capture>`. It also loads the `.env` file
-    first, which is what makes the Anthropic API key available for the
-    damage-detection stage.
-
-    Args:
-        argv: The arguments to parse, or `None` to read them from the
-            command line as usual.
-
-    Returns:
-        The exit code from `run()`.
+    The start-to-finish command uses this parser to construct the exact same
+    reconstruction arguments as the established ``pipeline run`` entry point,
+    while supplying the pre-stage artifacts it created in the same process.
     """
-    from dotenv import load_dotenv
-
-    load_dotenv(REPO_ROOT / ".env")
 
     parser = argparse.ArgumentParser(prog="pipeline", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1756,6 +1769,16 @@ def main(argv: list[str] | None = None) -> int:
     reference.add_argument("--known-m", type=float, required=True)
     reference.add_argument("--tolerance-m", type=float)
     reference.set_defaults(func=_run_validate_scale)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The direct reconstruction CLI entry point."""
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+    parser = build_parser()
 
     args = parser.parse_args(argv)
     return args.func(args)

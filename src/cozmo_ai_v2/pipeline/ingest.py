@@ -16,6 +16,7 @@ ARKIT_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 # Measured against recordings-2: CSV poses are camera-to-world transforms in
 # OpenCV camera axes. The pipeline intentionally uses them without a flip.
 STRAY_ODOMETRY_CONVENTION = "camera_to_world_opencv_csv_no_arkit_to_cv_flip"
+SLAM_POSE_CONVENTION = "camera_to_world_opencv_x_right_y_down_z_forward"
 
 # ARKit's three depth-confidence levels, from least to most trustworthy.
 CONFIDENCE_LOW = 0
@@ -862,6 +863,7 @@ def _load_slam_capture(
         rgb_intrinsics=rgb_matrix,
         pose_source="slam",
         pose_path=str(pose_path),
+        pose_convention=SLAM_POSE_CONVENTION,
     )
 
 

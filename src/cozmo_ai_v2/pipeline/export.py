@@ -379,6 +379,20 @@ def render_floorplan(
             _line(drawing, project(start + direction * cursor), project(end),
                   PALETTE["wall"], 5)
 
+        # Expose every measured opening in the human-facing artifact.  The
+        # JSON remains authoritative; this compact label repeats its metric
+        # interval, confidence, and source where a reviewer can see it.
+        for opening in openings_by_wall.get(wall["name"], []):
+            if opening.get("state", opening.get("measurement_state", "measured")) != "measured":
+                continue
+            width_doc = opening.get("width")
+            u_offset = opening.get("u_offset")
+            if not isinstance(width_doc, dict) or u_offset is None:
+                continue
+            u_mid = float(u_offset) + float(width_doc.get("value", 0.0)) / 2.0
+            anchor = project(start + direction * u_mid + np.asarray(wall["normal"]) * 0.12)
+            _opening_dimension(drawing, opening, anchor, placer)
+
     if show_damage:
         _damage_overlay(drawing, result, walls, project)
 
@@ -501,6 +515,8 @@ def _dimension(
     label = f"{measurement['value'] * 100:.0f} cm"
     if half:
         label += f" ±{half * 100:.0f} cm"
+    if wall.get("confidence") is not None:
+        label += f" · c {float(wall['confidence']):.2f}"
     if wall.get("inferred_fraction", 0) > 0.15:
         label += " *"
 
@@ -511,6 +527,33 @@ def _dimension(
             label, insert=anchor, fill=PALETTE["text"], font_size="11px",
             font_family=FONT, text_anchor="middle",
             transform=f"rotate({angle:.1f} {anchor[0]:.1f} {anchor[1]:.1f})",
+        )
+    )
+
+
+def _opening_dimension(drawing, opening: dict, anchor, placer: _LabelPlacer) -> None:
+    """Draw a compact measured opening label with its provenance."""
+    width = opening["width"]
+    label = f"{opening.get('kind', 'opening')} {float(width['value']):.2f} m"
+    if width.get("half_width"):
+        label += f" ±{float(width['half_width']):.2f}"
+    height = opening.get("height")
+    if isinstance(height, dict) and height.get("value") is not None:
+        label += f" × {float(height['value']):.2f} m"
+    if opening.get("confidence") is not None:
+        label += f" · c {float(opening['confidence']):.2f}"
+    if opening.get("source"):
+        label += f" · {opening['source']}"
+    if not placer.place(anchor[0], anchor[1], label, 8.5):
+        return
+    drawing.add(
+        drawing.text(
+            label,
+            insert=anchor,
+            fill=PALETTE["text"],
+            font_size="8.5px",
+            font_family=FONT,
+            text_anchor="middle",
         )
     )
 
@@ -651,6 +694,9 @@ def _legend(drawing, height, result, placer: _LabelPlacer) -> None:
         # worth surfacing directly on the drawing since it changes how much
         # to trust those numbers.
         footer.append("intervals uncalibrated (no ground truth fitted)")
+    warnings = result.get("diagnostics", {}).get("warnings", [])
+    if warnings:
+        footer.append(f"{len(warnings)} pipeline warning(s); see result.json")
 
     for offset, note in enumerate(reversed(footer)):
         drawing.add(
