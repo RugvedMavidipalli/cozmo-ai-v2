@@ -147,10 +147,7 @@ def render(output: Path) -> None:
         ),
         (
             "3 | APP SETTINGS + PREFLIGHT",
-            "Open <b>Record new session</b>. Tap the fps control until it reads <b>60 fps</b>. <b>[PROJECT]</b> Record the full capture at 60 frames per second; the app also offers 30/15/5/1. Keep portrait.<br/>"
-            "Make a <b>60-frame test</b>: Record, hold still until 60 RGB frames (about 1 s at 60 fps), Stop, open the test, Share -> Save to Files. Confirm it opens and contains <font name='Courier'>rgb.mp4</font>, <font name='Courier'>depth/</font>, <font name='Courier'>confidence/</font>, <font name='Courier'>odometry.csv</font>, <font name='Courier'>imu.csv</font>, <font name='Courier'>camera_matrix.csv</font>. Delete test only after pass.<br/>"
-            "<b>[OFFICIAL]</b> Contract: depth PNG = 16-bit millimetres; confidence PNG = 0/1/2; matching six-digit stems index RGB frames; odometry/IMU timestamps seconds, odometry positions metres, IMU accel m/s2 and angular rate rad/s, camera_matrix 3x3 pixel intrinsics.<br/>"
-            "<b>[PROJECT]</b> Nonblank odometry timestamp rows = depth PNG count = confidence PNG count; decoded RGB count should match. Any mismatch, unreadable PNG, or terminal video frame loss = FAIL and recapture.",
+            "Open <b>Record new session</b>. Tap the fps control until it reads <b>60 fps</b>. <b>[PROJECT]</b> Record the full capture at 60 frames per second; the app also offers 30/15/5/1. Keep portrait.",
             style["body_tight"], PALE_BLUE,
         ),
         (
@@ -163,7 +160,7 @@ def render(output: Path) -> None:
         (
             "5 | EXACT ROUTE",
             "<b>[PROJECT]</b> Use this route exactly.<br/>"
-            "<b>1.</b> Start at marker. Tap Record. Hold full marker motionless <b>3 s</b>.<br/>"
+            "<b>1.</b> Tap Record.<br/>"
             "<b>2.</b> Walk clockwise, wall on left. Advance no more than <b>0.5 m every 2 s</b>; pause <b>2 s at every corner</b>. Keep knee-to-head wall band visible.<br/>"
             "<b>3.</b> Doorway: approach level; hold <b>2 s</b> with both jambs, header, threshold visible; cross without height/orientation change; hold <b>2 s just inside</b>; sweep room clockwise.<br/>"
             "<b>4.</b> Each room: every wall/corner; centre holds <b>2 s level + 2 s down for floor strip + 2 s up for ceiling edge</b>; each window <b>2 s face-on</b> with jambs, sill, header.<br/>"
@@ -176,7 +173,7 @@ def render(output: Path) -> None:
         (
             "6 | DURATION + SPLIT",
             "<b>[PROJECT]</b> Target <b>30-120 s</b> per connected floor/area. Hard operator cap: <b>5 min</b> per continuous capture. This is a project safety rule, not an App Store limit; it limits drift, interruption, and terminal loss.<br/>"
-            "If it will exceed 5 min, cross floors, or enter a disconnected area, stop at a marker and start a new capture with its own marker/folder. <b>Never join folders.</b>",
+            "If it will exceed 5 min, crosses floors, or enters a disconnected area, stop and start a new recording. <b>Never join folders.</b>",
             style["body"], PALE_BLUE,
         ),
         (
@@ -188,8 +185,7 @@ def render(output: Path) -> None:
         (
             "8 | STOP + EXPORT + HANDOFF",
             "<b>[OFFICIAL]</b> After Stop, recording detail -> <b>Share</b> -> Save to Files or AirDrop; keep app ZIP unchanged. Original-folder route: cable -> Finder -> device -> <b>Files</b> -> <b>Stray Scanner</b> -> drag dataset folder (Windows: iTunes). Files route: Browse -> On My iPhone/iPad -> Stray Scanner -> Share/Save.<br/>"
-            "<b>[PROJECT]</b> Name only the delivered top folder <font name='Courier'>site_floor_area_YYYYMMDD-HHMM</font>; retain app hash in note. Do not rename children, rotate/transcode video, resize PNGs, reorder files, or rearrange folders. <font name='Courier'>distortion/</font> is optional; all other listed items are required.<br/>"
-            "Before transfer, recheck required names and equal counts. ZIP: <font name='Courier'>unzip -t capture.zip</font>, then <font name='Courier'>shasum -a 256 capture.zip</font>; send original ZIP + checksum. Do not unzip/repack unless asked.",
+            "<b>[PROJECT]</b> Name only the delivered top folder <font name='Courier'>site_floor_area_YYYYMMDD-HHMM</font>; retain app hash in note. Do not rename children, rotate/transcode video, resize PNGs, reorder files, or rearrange folders. <font name='Courier'>distortion/</font> is optional; all other listed items are required.",
             style["body_tight"], colors.white,
         ),
         (

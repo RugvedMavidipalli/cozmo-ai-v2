@@ -17,9 +17,6 @@
 ## 3. Set the app and preflight the files
 
 - Open **Record new session**. On the recording screen tap the fps control until it reads **60 fps**. `[PROJECT]` Record the full capture at 60 frames per second; the app also offers 30, 15, 5, and 1 fps. Keep the app in portrait.
-- Make a **60-frame test**: tap Record, hold still until 60 RGB frames are captured (about 1 second at 60 fps), tap Stop, open the test recording, tap **Share**, and choose **Save to Files**. Confirm the resulting folder/ZIP opens and contains `rgb.mp4`, `depth/`, `confidence/`, `odometry.csv`, `imu.csv`, and `camera_matrix.csv`. Delete the test only after this check passes. If any item is absent, do not capture the property.
-- `[OFFICIAL]` Do not alter the data contract: `depth/000000.png` is 16-bit depth in millimetres; `confidence/000000.png` is a 0/1/2 confidence map; matching six-digit stems index RGB frames; odometry/IMU timestamps are seconds, odometry positions are metres, IMU acceleration is m/s2 and angular rate is rad/s, and `camera_matrix.csv` is a 3x3 pixel-intrinsics matrix.
-- `[PROJECT]` The final check is: nonblank timestamp rows in `odometry.csv` = `depth/*.png` count = `confidence/*.png` count; decoded RGB frames should be the same count. A mismatch, unreadable PNG, or missing terminal video frame means **FAIL and recapture**.
 
 ## 4. Hold the device this way
 
@@ -31,7 +28,7 @@
 
 `[PROJECT]` Use this route exactly:
 
-1. Start at the marker. Tap Record. Hold the full marker in view, motionless, for **3 seconds**.
+1.  Tap Record.
 2. Walk clockwise with the wall on your left. Advance no more than **0.5 m every 2 seconds**; pause **2 seconds at every corner**. Keep a visible wall band from roughly knee to head.
 3. At each doorway: approach level; hold **2 seconds** with both jambs, header, and floor threshold visible; cross without changing height or portrait orientation; hold **2 seconds just inside**; then sweep that room clockwise.
 4. In each room, capture every wall and corner. At the room centre hold **2 seconds level**, **2 seconds pitched down** to show a floor strip, and **2 seconds pitched up** to show the wall/ceiling edge. At every window hold **2 seconds face-on** showing both jambs plus sill and header.
@@ -40,7 +37,7 @@
 ## 6. Duration and split rules
 
 - `[PROJECT]` Target **30-120 seconds** per connected floor/area. Hard operator cap: **5 minutes** for one continuous capture. This is a project safety rule, not an App Store limit; it limits accumulated drift, interruptions, and terminal frame loss.
-- If the route will exceed 5 minutes, crosses floors, or enters a disconnected area, stop at a marker and start a new capture. Give each run its own marker and folder. **One pipeline run = one continuous coordinate frame; never join two folders.**
+- If the route will exceed 5 minutes, crosses floors, or enters a disconnected area, stop and start a new recording. **One pipeline run = one continuous coordinate frame; never join two folders.**
 
 ## 7. Avoid / restart
 
@@ -50,7 +47,6 @@
 
 - `[OFFICIAL]` After Stop, open the recording detail and tap **Share**. Prefer **Save to Files** or AirDrop and keep the app-created ZIP unchanged. For an original folder, connect by cable: Finder > device > **Files** > **Stray Scanner**, then drag the dataset folder; on Windows use iTunes. Files app route: Browse > On My iPhone/iPad > Stray Scanner > Share/Save to Files.
 - Name only the delivered top-level capture folder `site_floor_area_YYYYMMDD-HHMM`; retain the app hash in the handoff note. Do not rename children, rotate video, transcode video, resize PNGs, reorder files, or rearrange folders. `distortion/` is optional; everything else above is required.
-- Before transfer, confirm the required-file checklist and equal counts again. If handing off a ZIP, test it with `unzip -t capture.zip` and record `shasum -a 256 capture.zip`; send the original ZIP and checksum together. Do not unzip/repack unless the receiver requests the folder.
 
 ## 9. Process on current main
 
