@@ -39,7 +39,6 @@ a completed external-model run. See Known limitations and Validation status.
 | Accuracy and performance | Not qualified here. No unsupported historical accuracy or runtime figures are part of this guide. Intervals remain uncalibrated until calibration is fit against real ground truth. |
 | RGB-only full reconstruction | Not a merged one-command capability. Standalone RGB tracking is available; full reconstruction needs a pose table, calibration, and usable depth artifact. |
 
-<<<<<<< HEAD
 The --no-damage mode is the recommended path for geometry work, privacy-
 sensitive runs, and CPU-only smoke testing. It skips both damage detection and
 scope generation; it does not skip reconstruction or export.
