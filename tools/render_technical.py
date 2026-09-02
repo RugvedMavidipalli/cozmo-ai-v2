@@ -219,7 +219,7 @@ def _footer(canvas, doc):
     canvas.saveState()
     canvas.setFont("Helvetica", 6.5)
     canvas.setFillColor(colors.HexColor("#52606d"))
-    canvas.drawString(12 * mm, 7 * mm, "Cozmo AI v2 · evidence cutoff 2026-09-01")
+    canvas.drawString(12 * mm, 7 * mm, "Cozmo AI v2 · evidence cutoff 2026-09-02")
     canvas.drawRightString(A4[0] - 12 * mm, 7 * mm, f"page {doc.page}")
     canvas.restoreState()
 
