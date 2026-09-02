@@ -129,12 +129,19 @@ The fix loop has three evidence-backed steps:
    `no-bounded-wall-faces` and `no-observed-free-cells` [R5].
 3. **Recordings-2 topology failure.** The required failure is present in the
    untracked zero-room artifact: the same 5,443-frame/90.74-second capture
-   yields 0 rooms and 31 walls, with no geometry diagnostics. The old output
-   cannot say whether wall loss, endpoint connectivity, polygonization, or
-   floor evidence was decisive [R10]. Worker-9's audit could not recover the
-   producing checkout, build/configuration, or terminal invocation; the Phase-1
-   snapshot and previously reported command are context only, not reproducible
-   producer provenance [R14][R16].
+   yields 0 rooms and 31 walls; `result.json` itself has no geometry
+   diagnostics [R10]. A read-only replay over its saved walls confirms the
+   immediate mechanism: polygonization at the implemented 0.08 m gap threshold
+   returns 0 faces; endpoint-gap median/p75/p90/max are 0.545/1.152/1.734/2.592
+   m, with only 5 incidences within 0.08 m. There is no face through 0.75 m and
+   one face at 0.80 m. The saved grid has 23,959 occupied cells, 35,191 accepted
+   free cells, and 154 free components; its largest free union is a roughly
+   6,512-piece MultiPolygon, while fallback accepts one simple Polygon. The
+   replay confirms non-closure but does not isolate whether pose, depth,
+   filtering, or corner logic caused the gaps [R17]. Worker-9's audit could not
+   recover the producing checkout, build/configuration, or terminal invocation;
+   the Phase-1 snapshot and previously reported command are context only, not
+   reproducible producer provenance [R14][R16].
 
    Recovery restored a separate raw-LiDAR/ARKit stride-60 smoke: 91 requested
    timestamps, 265,689 cloud points, 29 exported walls, 0 openings, and 0
@@ -194,10 +201,11 @@ coverage plus variable unvalidated trials—not closure or success [R10].
   GrabCut on failure; those names and branches are implementation facts, not
   accuracy evidence. Current damage accumulation allocates vote grids only for
   walls, so floor/ceiling detections have no accumulation target [R11].
-- **Capture integrity can still limit output.** Closure-10 reports RGB decode
-  ending at index 5441 with three terminal sidecars unavailable out of an
-  expected 5443; diagnostics expose this, but do not infer missing frames
-  [R10].
+- **Capture integrity can still limit output.** The audit measured native 4:3
+  RGB/depth, aligned labels/depth/confidence, and no MP4 orientation metadata;
+  OpenCV decoded 5,442 frames while sidecars contain 5,443. No per-frame input
+  manifest exists, so these are integrity limitations rather than proof of the
+  graph failure's cause [R17].
 
 The next evidence needed is narrow: run the pinned closure candidate and the
 plain-video/dense path with recorded environments, collect laser references,
@@ -210,7 +218,7 @@ standards-compliant estimator.
 
 Repository implementation links R1–R11 below point to commit
 `086e742c64edf132152bcd26b352c350561b2165` and were validated 2026-09-02.
-PR/source links in R13-R16 are separately pinned. The full claim-to-evidence ledger
+PR/source links in R13-R17 are separately pinned. The full claim-to-evidence ledger
 and authorized artifact hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R1] [`pipeline/cli.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L125-L148), [`docs/architecture.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/architecture.md#L22-L131).
@@ -276,6 +284,22 @@ the production rules file. Preserved audit command:
 → 60 passed. Read-only replay/diagnostic snippets have no preserved here-doc or
 transcript, so their metrics are measured observations with incomplete command
 provenance, not reproducible-run evidence.
+
+[R17] Worker-9 recordings-2 audit, verified 2026-09-02: measured read-only
+replay over the saved 31 walls at the 0.08 m graph threshold returned 0 faces;
+endpoint-gap median/p75/p90/max were 0.545/1.152/1.734/2.592 m, with 5
+incidences within threshold, no face through 0.75 m, and one at 0.80 m. Grid
+replay measured 23,959 occupied cells, 35,191 accepted free cells, 154 free
+components, and a largest free union of roughly 6,512 MultiPolygon pieces;
+fallback accepts one simple Polygon. Wall-stage replay counts were
+82 -> 42 -> 36 -> 31, with 6 quarantined, 13 clutter-in-front, and 5
+trimmed-at-junction tags. Pose/gravity comparisons (CSV c2w without an added
+flip ~4.80 cm versus alternatives ~24.59/70.41/99.44 cm; rotZ(-90) consistency
+~0.990 versus identity ~0.406) are internal consistency diagnostics, not
+absolute accuracy. Native RGB/depth and aligned labels/depth/confidence were
+measured; OpenCV decoded 5,442 frames versus 5,443 sidecars. Read-only replay
+snippets have incomplete command provenance and no immutable per-frame input
+manifest; these observations do not establish a causal root or accuracy.
 
 [R14] Recordings-2 audit handoff, verified 2026-09-02: Phase-1 commit
 [`30cfb4ce`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/30cfb4ce2f42e130f50ddb45a4bddfbcc396f595) is the audited/replay snapshot, not a verified producer of `/Users/rugved/Desktop/projects/outputs/recordings-2`. Integrated reader history includes [`897f1421`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/897f142140e15196430ab5408bec1999ee14b8dc) and merge [`d2021b83`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/d2021b83e2f0cf9e6a2e44a5214959b750d646c6). The result hash is now known, but the audit found no producing commit/config/invocation: `result.json` has none, the output was uncommitted, and no terminal transcript survives. The previously reported command and output paths are context only and are not reproducible producer evidence. Current input hashes and the measured result summary are recorded in the evidence register; no immutable per-frame input manifest exists. This baseline is not GPU or release acceptance evidence.
