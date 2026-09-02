@@ -134,7 +134,7 @@ The fix loop has three evidence-backed steps:
    floor evidence was decisive [R10]. Worker-9's audit could not recover the
    producing checkout, build/configuration, or terminal invocation; the Phase-1
    snapshot and previously reported command are context only, not reproducible
-   producer provenance [R14].
+   producer provenance [R14][R16].
 
    Recovery restored a separate raw-LiDAR/ARKit stride-60 smoke: 91 requested
    timestamps, 265,689 cloud points, 29 exported walls, 0 openings, and 0
@@ -210,7 +210,7 @@ standards-compliant estimator.
 
 Repository implementation links R1–R11 below point to commit
 `086e742c64edf132152bcd26b352c350561b2165` and were validated 2026-09-02.
-PR/source links in R13-R14 are separately pinned. The full claim-to-evidence ledger
+PR/source links in R13-R16 are separately pinned. The full claim-to-evidence ledger
 and authorized artifact hashes are in [`report/evidence_register.md`](evidence_register.md).
 
 [R1] [`pipeline/cli.py`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/src/cozmo_ai_v2/pipeline/cli.py#L125-L148), [`docs/architecture.md`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/blob/086e742c64edf132152bcd26b352c350561b2165/docs/architecture.md#L22-L131).
@@ -264,6 +264,18 @@ smoke-only, not floorplan/closure validation. Prior source/stages/output trees
 and stopped-job partial files were deleted; dense/all-frame jobs are not
 restored. Commits `5c09dff9`/`88ad7982` are not VM-validated for any claimed
 output.
+
+[R16] The exact recordings-2 producer command, checkout, configuration, and
+environment are unavailable. The previously reported `python -m ... run ...`
+command is context only. Replay defaults (`stride=4`, `voxel=0.02 m`,
+`max-depth=3.5 m`, `min-confidence=1`, 0.90 coverage, refinement enabled, and
+loop closure enabled) are not proven producer settings; an empty `damage[]`
+does not prove `--no-damage`, and observed `rules_version:3` does not identify
+the production rules file. Preserved audit command:
+`PYTHONPATH=/tmp/cozmo-audit-30cf/src pytest -q /tmp/cozmo-audit-30cf/tests`
+→ 60 passed. Read-only replay/diagnostic snippets have no preserved here-doc or
+transcript, so their metrics are measured observations with incomplete command
+provenance, not reproducible-run evidence.
 
 [R14] Recordings-2 audit handoff, verified 2026-09-02: Phase-1 commit
 [`30cfb4ce`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/30cfb4ce2f42e130f50ddb45a4bddfbcc396f595) is the audited/replay snapshot, not a verified producer of `/Users/rugved/Desktop/projects/outputs/recordings-2`. Integrated reader history includes [`897f1421`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/897f142140e15196430ab5408bec1999ee14b8dc) and merge [`d2021b83`](https://github.com/RugvedMavidipalli/cozmo-ai-v2/commit/d2021b83e2f0cf9e6a2e44a5214959b750d646c6). The result hash is now known, but the audit found no producing commit/config/invocation: `result.json` has none, the output was uncommitted, and no terminal transcript survives. The previously reported command and output paths are context only and are not reproducible producer evidence. Current input hashes and the measured result summary are recorded in the evidence register; no immutable per-frame input manifest exists. This baseline is not GPU or release acceptance evidence.

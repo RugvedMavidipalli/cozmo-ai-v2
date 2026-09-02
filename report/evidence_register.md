@@ -31,6 +31,8 @@ provenance remains unavailable.
 
 | R15 | The inspected local overlay attachment is identified by hash; it is visual evidence only, not a runtime acceptance artifact. | `/Users/rugved/.ao/data/worktrees/cozmo-ai-v2/orchestrator/cozmo-ai-v2-orchestrator/.ao/attachments/attachment-750e6b36428cf61e18ee054c29d14ff0.png`, SHA-256 `468dc6346a07aa843ac7320469aeb94461edc3db938c7bf7a305a441359e56e3`. |
 
+| R16 | The recordings-2 producer command, checkout, configuration, and environment are unavailable; replay defaults and an empty damage array do not establish producer settings. | Worker-9 command/config audit, verified 2026-09-02: the previously reported `python -m ... run ...` invocation is context only. Replay defaults (`stride=4`, `voxel=0.02 m`, `max-depth=3.5 m`, `min-confidence=1`, 0.90 coverage, refinement enabled, loop closure enabled) are not proven producer settings; `--no-damage` is not proven by an empty `damage[]`; observed `rules_version:3` does not identify the production rules file. Preserved audit command `PYTHONPATH=/tmp/cozmo-audit-30cf/src pytest -q /tmp/cozmo-audit-30cf/tests` reported 60 passed. Read-only replay/diagnostic snippets have no preserved here-doc or transcript, so their metrics have incomplete command provenance and are not reproducible-run evidence. |
+
 ## Reproducibility notes
 
 R13 exact recovery commands, retained under the VM validation root, were:
