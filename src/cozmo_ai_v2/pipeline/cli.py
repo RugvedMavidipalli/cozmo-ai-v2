@@ -730,6 +730,8 @@ def run(args: argparse.Namespace) -> int:
             scene_measurements=scene_measurements,
             reference_validation=reference_validation,
             structural_planes=structural_planes,
+            plane_threshold=getattr(args, "plane_threshold", 0.03),
+            plane_min_inliers=getattr(args, "plane_min_inliers", 30),
         )
         if mast3r_integration is not None:
             alignment = mast3r_integration.alignment
@@ -1107,6 +1109,8 @@ def _assemble(
     scene_measurements=None,
     reference_validation=None,
     structural_planes=None,
+    plane_threshold=0.03,
+    plane_min_inliers=30,
 ) -> dict:
     """Puts everything the pipeline produced together into one dictionary,
     ready to be saved as `result.json`.
@@ -1486,13 +1490,9 @@ def _assemble(
             "plane_extraction": {
                 "algorithm": "seeded_ransac_region_growing_tls_3d",
                 "refit": "total_least_squares_svd_perpendicular_residual",
-                "candidate_threshold": float(
-                    getattr(args, "plane_threshold", 0.03)
-                ),
-                "support_threshold": int(getattr(args, "plane_min_inliers", 30)),
-                "residual_threshold": float(
-                    getattr(args, "plane_threshold", 0.03)
-                ),
+                "candidate_threshold": float(plane_threshold),
+                "support_threshold": int(plane_min_inliers),
+                "residual_threshold": float(plane_threshold),
                 "plane_count": len(structural_plane_docs),
                 "kept_count": sum(not plane.quarantined for plane in structural_planes),
                 "quarantined_count": sum(plane.quarantined for plane in structural_planes),
