@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from cozmo_ai_v2.cli import build_parser
+from cozmo_ai_v2.mast3r_slam import Mast3rSlamError
 from cozmo_ai_v2.pipeline.orchestrator import (
     PipelineOrchestrationError,
     _selected_indices,
@@ -180,6 +181,30 @@ def test_required_rgb_depth_failure_is_nonzero_and_recorded(synthetic_video, tmp
     assert manifest["status"] == "failed"
     assert "Metric3D weights unavailable" in manifest["failure_reason"]
     assert any(item["stage"] == "depth" and item["status"] == "failed" for item in manifest["stages"])
+
+
+def test_mast3r_exit_failure_is_nonzero_and_preserves_pose_diagnostics(
+    synthetic_video, tmp_path, monkeypatch
+):
+    def fail_mast3r(*_args, **_kwargs):
+        raise Mast3rSlamError(
+            "MASt3R-SLAM exited with status 120; partial trajectory has 1 pose row"
+        )
+
+    monkeypatch.setattr("cozmo_ai_v2.pipeline.orchestrator.run_rgb_video", fail_mast3r)
+    args = build_parser().parse_args([
+        "pipeline", str(synthetic_video), "--out", str(tmp_path / "out"),
+        "--mast3r-slam-dir", str(tmp_path / "MASt3R-SLAM"),
+    ])
+
+    assert run_pipeline(args) == 1
+    output = tmp_path / "out"
+    failure = json.loads((output / "pose_provenance.json").read_text())
+    manifest = json.loads((output / "stage_manifest.json").read_text())
+    assert failure["status"] == "failed"
+    assert "status 120" in failure["failure_diagnostics"][0]
+    assert manifest["status"] == "failed"
+    assert "status 120" in manifest["failure_reason"]
 
 
 def test_explicit_rgb_dense_artifact_is_handed_off_without_model(
