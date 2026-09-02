@@ -1,0 +1,21 @@
+{
+  "pipeline_module": "cozmo_ai_v2.pipeline",
+  "pipeline_arguments": ["--no-damage"],
+  "defaults": {
+    "stride": 4,
+    "voxel": 0.02,
+    "max_depth_m": 3.5,
+    "plane_threshold_m": 0.03,
+    "plane_min_inliers": 30,
+    "max_planes": 80,
+    "plane_seed": 0,
+    "min_confidence": 1,
+    "depth_source": "auto",
+    "frame_association": "pts",
+    "coverage": 0.9,
+    "wall_thickness_m": 0.15
+  },
+  "benchmark_module": "bench/run.py",
+  "benchmark_arguments": ["--result", "<result.json>", "--out", "<metrics.json>"],
+  "notes": "Geometry-only run; no laser/damage reference input is available in origin/main."
+}

@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "base_sha": "64102d088c754112707d86e59067342395e6b16c",
+  "capture": {
+    "path": "/Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-1",
+    "file_count": 7998,
+    "tree_sha256": "b86744f1298859e1120c750d675b6d6b3dc21517a3cd2e682d75728b1ca2b375",
+    "pipeline_command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-1 --out /tmp/cozmo-fix-loop-18/baseline/recordings-1 --no-damage",
+    "pipeline_log": "/tmp/cozmo-fix-loop-18/baseline/recordings-1.log",
+    "pipeline_log_sha256": "c8f7f2a200b43d4e55ae02f945542f9af5d85e1f4cf9d0bccc90e9237581e6a2",
+    "exit_code": 1,
+    "result_present": false,
+    "observed": {
+      "frames": 3997,
+      "keyframes": 253,
+      "walls_after_crossing_resolution": 30,
+      "drift_median_mm": 13.6,
+      "rooms": 0,
+      "exception": "NameError: name 'args' is not defined"
+    }
+  },
+  "second_capture_confirmation": {
+    "path": "/Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2",
+    "file_count": 10890,
+    "tree_sha256": "cd6e3e054c417a2e6b48093b032b8fd2e276c1d93ba63caa58c5e2e759b7a851",
+    "pipeline_command": "uv run python -m cozmo_ai_v2.pipeline run /Users/rugved/Desktop/projects/cozmo-ai-v2/recordings-2 --out /tmp/cozmo-fix-loop-18/baseline/recordings-2 --no-damage",
+    "pipeline_log": "/tmp/cozmo-fix-loop-18/baseline/recordings-2.log",
+    "pipeline_log_sha256": "e9d2dfb6391f7d6546fd24b45532717bd398ee018cfcbee7c1fbc17cf9fbafcb",
+    "exit_code": 1,
+    "result_present": false,
+    "observed": {
+      "frames": 5443,
+      "keyframes": 331,
+      "walls_after_crossing_resolution": 33,
+      "drift_median_mm": 19.5,
+      "rooms": 0,
+      "exception": "NameError: name 'args' is not defined"
+    }
+  },
+  "config": {
+    "path": "report/fix_loop_config.json",
+    "sha256": "7993e48b98a1d3062fba3e7737b171bf49f877c090827594fe93a93d013d6768",
+    "rules_sha256": "d4aa5729f27cfd17157954f1ba4d61b6d63d828987b80fa0b53e44f28017723d",
+    "schema_sha256": "4a2892886952da424086f0d7d9a64ca35cbdf7be2f3c7f599cfa1a241c0ded64",
+    "pyproject_sha256": "f802df35e771e143291a660c492e9d9d3c252b1f11d62ab9ee145db2392406eb",
+    "uv_lock_sha256": "281f50e91d0e4b160bec8587fe8b0dcc2671aacf14e4f870e3b924fed8b74b31",
+    "ground_truth_template_sha256": "16c2a26da99291ef7140068664274d39baf3f9b635de77ba6b32cfa068fd0b1d"
+  },
+  "environment": {
+    "python": "3.11.16",
+    "python_executable": "/Users/rugved/.ao/data/worktrees/cozmo-ai-v2/cozmo-ai-v2-18/.venv/bin/python3",
+    "platform": "macOS-26.5.1-x86_64-i386-64bit",
+    "machine": "x86_64",
+    "uv": "0.12.7 (61291a8ca 2026-08-27 x86_64-apple-darwin)",
+    "packages": {
+      "cozmo-ai-v2": "0.1.0",
+      "numpy": "1.26.4",
+      "open3d": "0.19.0",
+      "scipy": "1.17.1",
+      "shapely": "2.1.2",
+      "jsonschema": "4.26.0"
+    }
+  },
+  "gate_ranking": {
+    "rule": "Include only gates with a concrete metric, threshold, available input, and regenerable command. Rank failures by normalized shortfall from threshold; an equality gate uses abs(actual-threshold).",
+    "selected": "pipeline_completion",
+    "gates": [
+      {
+        "name": "pipeline_completion",
+        "metric": "pipeline process exit code",
+        "threshold": "== 0",
+        "actual": "1 on 2/2 captures",
+        "normalized_shortfall": 1.0,
+        "pass": false,
+        "command": "the capture-specific pipeline_command above"
+      }
+    ],
+    "not_evaluable": [
+      {
+        "name": "room_consistency",
+        "reason": "bench/run.py requires result.json; both baseline runs crashed before export"
+      },
+      {
+        "name": "laser_accuracy_gates",
+        "reason": "bench/gt_TEMPLATE.csv is the only GT file; no populated laser GT exists"
+      },
+      {
+        "name": "footprint_error_and_damage_reference_gates",
+        "reason": "no footprint scalar or damage/scope reference inputs are supplied"
+      },
+      {
+        "name": "runtime_per_room",
+        "reason": "no result.json timings were exported and room count is unavailable"
+      }
+    ]
+  }
+}
