@@ -2,8 +2,6 @@
 
 **Print this page. Follow every step in order.** The goal is one continuous, connected floor/area with the same device pose throughout. `[OFFICIAL]` means the app or its published data format says it; `[PROJECT]` is the capture rule for this pipeline.
 
-**Capture log:** Site/claim ____________________  Floor/area ____________________  Operator ____________________  Date/time ____________________  Known marker length __________ m
-
 ## 1. Install and check the device
 
 - `[OFFICIAL]` Install **Stray Scanner** (developer **Kenneth Blomqvist**, free) from the App Store. Grant Camera access. The App Store currently lists iOS 18.6 or later.
@@ -19,7 +17,7 @@
 ## 3. Set the app and preflight the files
 
 - Open **Record new session**. On the recording screen tap the fps control until it reads **30 fps**. `[PROJECT]` This is the recommended setting; the app also offers 60, 15, 5, and 1 fps. Keep the app in portrait.
-- Make a 5-second test: tap Record, hold still, tap Stop, open the test recording, tap **Share**, and choose **Save to Files**. Confirm the resulting folder/ZIP opens and contains `rgb.mp4`, `depth/`, `confidence/`, `odometry.csv`, `imu.csv`, and `camera_matrix.csv`. Delete the test only after this check passes. If any item is absent, do not capture the property.
+- Make a **60-frame test**: tap Record, hold still until 60 RGB frames are captured (about 2 seconds at 30 fps), tap Stop, open the test recording, tap **Share**, and choose **Save to Files**. Confirm the resulting folder/ZIP opens and contains `rgb.mp4`, `depth/`, `confidence/`, `odometry.csv`, `imu.csv`, and `camera_matrix.csv`. Delete the test only after this check passes. If any item is absent, do not capture the property.
 - `[OFFICIAL]` Do not alter the data contract: `depth/000000.png` is 16-bit depth in millimetres; `confidence/000000.png` is a 0/1/2 confidence map; matching six-digit stems index RGB frames; odometry/IMU timestamps are seconds, odometry positions are metres, IMU acceleration is m/s2 and angular rate is rad/s, and `camera_matrix.csv` is a 3x3 pixel-intrinsics matrix.
 - `[PROJECT]` The final check is: nonblank timestamp rows in `odometry.csv` = `depth/*.png` count = `confidence/*.png` count; decoded RGB frames should be the same count. A mismatch, unreadable PNG, or missing terminal video frame means **FAIL and recapture**.
 

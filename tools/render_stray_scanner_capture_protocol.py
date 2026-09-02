@@ -105,25 +105,16 @@ def draw_header(canvas: Canvas) -> float:
     canvas.drawString(MARGIN_X, PAGE_H - 56, "Print it. Follow every step. [OFFICIAL] = app fact; [PROJECT] = capture rule.")
     canvas.drawRightString(PAGE_W - MARGIN_X, PAGE_H - 56, "Checked 2026-09-02")
 
-    canvas.setFillColor(colors.HexColor("#EAF4F8"))
-    canvas.roundRect(MARGIN_X, PAGE_H - 98, CONTENT_W, 13, 3, fill=1, stroke=0)
-    canvas.setFillColor(NAVY)
-    canvas.setFont("Helvetica", 5.9)
-    canvas.drawString(MARGIN_X + 7, PAGE_H - 94, "Capture log:")
-    canvas.setFont("Helvetica", 5.5)
-    canvas.drawString(MARGIN_X + 47, PAGE_H - 94, "Site/claim ____________________   Floor/area ____________________   Operator ____________________")
-    canvas.drawString(MARGIN_X + 323, PAGE_H - 94, "Date/time __________   Marker ______ m")
-
     canvas.setFillColor(PALE_RED)
-    canvas.roundRect(MARGIN_X, PAGE_H - 129, CONTENT_W, 24, 4, fill=1, stroke=0)
+    canvas.roundRect(MARGIN_X, PAGE_H - 106, CONTENT_W, 24, 4, fill=1, stroke=0)
     canvas.setFillColor(RED)
     canvas.setFont("Helvetica-Bold", 6.8)
-    canvas.drawString(MARGIN_X + 8, PAGE_H - 114, "STOP RULE")
+    canvas.drawString(MARGIN_X + 8, PAGE_H - 91, "STOP RULE")
     canvas.setFillColor(INK)
     canvas.setFont("Helvetica", 6.3)
-    canvas.drawString(MARGIN_X + 67, PAGE_H - 114, "If an avoid/restart condition occurs, stop, mark the folder BAD, fix the room, and start a new capture at the marker.")
-    canvas.drawString(MARGIN_X + 67, PAGE_H - 122, "Never resume a failed file or join captures: one pipeline run is one continuous coordinate frame.")
-    return PAGE_H - 139
+    canvas.drawString(MARGIN_X + 67, PAGE_H - 91, "If an avoid/restart condition occurs, stop, mark the folder BAD, fix the room, and start a new capture at the marker.")
+    canvas.drawString(MARGIN_X + 67, PAGE_H - 99, "Never resume a failed file or join captures: one pipeline run is one continuous coordinate frame.")
+    return PAGE_H - 116
 
 
 def render(output: Path) -> None:
@@ -157,7 +148,7 @@ def render(output: Path) -> None:
         (
             "3 | APP SETTINGS + PREFLIGHT",
             "Open <b>Record new session</b>. Tap the fps control until it reads <b>30 fps</b>. <b>[PROJECT]</b> 30 fps is recommended; the app also offers 60/15/5/1. Keep portrait.<br/>"
-            "Make a 5-second test: Record, hold still, Stop, open the test, Share -> Save to Files. Confirm it opens and contains <font name='Courier'>rgb.mp4</font>, <font name='Courier'>depth/</font>, <font name='Courier'>confidence/</font>, <font name='Courier'>odometry.csv</font>, <font name='Courier'>imu.csv</font>, <font name='Courier'>camera_matrix.csv</font>. Delete test only after pass.<br/>"
+            "Make a <b>60-frame test</b>: Record, hold still until 60 RGB frames (about 2 s at 30 fps), Stop, open the test, Share -> Save to Files. Confirm it opens and contains <font name='Courier'>rgb.mp4</font>, <font name='Courier'>depth/</font>, <font name='Courier'>confidence/</font>, <font name='Courier'>odometry.csv</font>, <font name='Courier'>imu.csv</font>, <font name='Courier'>camera_matrix.csv</font>. Delete test only after pass.<br/>"
             "<b>[OFFICIAL]</b> Contract: depth PNG = 16-bit millimetres; confidence PNG = 0/1/2; matching six-digit stems index RGB frames; odometry/IMU timestamps seconds, odometry positions metres, IMU accel m/s2 and angular rate rad/s, camera_matrix 3x3 pixel intrinsics.<br/>"
             "<b>[PROJECT]</b> Nonblank odometry timestamp rows = depth PNG count = confidence PNG count; decoded RGB count should match. Any mismatch, unreadable PNG, or terminal video frame loss = FAIL and recapture.",
             style["body_tight"], PALE_BLUE,
