@@ -133,3 +133,38 @@ def test_required_rgb_depth_failure_is_nonzero_and_recorded(synthetic_video, tmp
     assert manifest["status"] == "failed"
     assert "Metric3D weights unavailable" in manifest["failure_reason"]
     assert any(item["stage"] == "depth" and item["status"] == "failed" for item in manifest["stages"])
+
+
+def test_explicit_rgb_dense_artifact_is_handed_off_without_model(
+    synthetic_video, tmp_path, monkeypatch
+):
+    pose_path = tmp_path / "poses.json"
+    _write_pose_table(pose_path, 2)
+    dense_dir, dense_manifest = _write_dense_artifact(tmp_path, 2)
+    calls = {}
+
+    def fail_model(_args):
+        raise AssertionError("an approved explicit dense artifact must not load Metric3D")
+
+    def fake_run(reconstruction_args):
+        calls["reconstruction"] = reconstruction_args
+        output = Path(reconstruction_args.out)
+        for name in (
+            "result.json", "floorplan.svg", "scene.glb", "cloud.ply", "mesh.ply",
+            "planes.json", "fusion_manifest.json", "openings.csv",
+        ):
+            (output / name).write_text("artifact")
+        return 0
+
+    monkeypatch.setattr("cozmo_ai_v2.pipeline.orchestrator._model_or_error", fail_model)
+    monkeypatch.setattr("cozmo_ai_v2.pipeline.cli.run", fake_run)
+    args = build_parser().parse_args([
+        "pipeline", str(synthetic_video), "--out", str(tmp_path / "out"),
+        "--slam-poses", str(pose_path), "--dense-depth-dir", str(dense_dir),
+        "--densify-manifest", str(dense_manifest),
+    ])
+
+    assert run_pipeline(args) == 0
+    assert calls["reconstruction"].dense_depth_dir == dense_dir
+    manifest = json.loads((tmp_path / "out" / "stage_manifest.json").read_text())
+    assert manifest["status"] == "completed"

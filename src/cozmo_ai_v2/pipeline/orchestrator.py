@@ -175,8 +175,14 @@ def _has_approved_dense(manifest_path: Path | None) -> bool:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    def approved(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "approved", "qc_approved"}
+        return bool(value)
+
     return any(
-        bool(frame.get("qc_approved")) or frame.get("status") in {"approved", "accepted", "qc_approved"}
+        approved(frame.get("qc_approved"))
+        or frame.get("status") in {"approved", "accepted", "qc_approved"}
         for frame in payload.get("frames", [])
         if isinstance(frame, dict)
     )
@@ -458,6 +464,10 @@ def run_pipeline(args) -> int:
         with manifest.stage("depth", inputs=[detected.video_path], outputs=[dense_manifest or out_dir / "preprocessing" / "densify_manifest.json"]):
             if dense_dir is not None and _has_approved_dense(dense_manifest):
                 manifest.set_context(depth_provenance="existing_qc_approved_dense_depth")
+            elif getattr(args, "dense_depth_dir", None) is not None:
+                raise PipelineOrchestrationError(
+                    "explicit --dense-depth-dir requires a readable manifest with at least one QC-approved frame"
+                )
             elif detected.kind is InputKind.STRAY_SCANNER and (detected.video_path.parent / "depth").is_dir() and any((detected.video_path.parent / "depth").glob("*.png")):
                 weights = getattr(args, "metric3d_weights", None)
                 repository = getattr(args, "metric3d_repository", None)
