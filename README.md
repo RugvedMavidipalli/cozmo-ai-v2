@@ -1,10 +1,12 @@
 # cozmo-ai-v2
 
 cozmo-ai-v2 is a Python capture-processing pipeline for turning a calibrated
-handheld walkthrough into inspectable reconstruction and scope artifacts. The
-merged path is strongest for Stray Scanner captures that contain RGB video,
-per-frame LiDAR depth, and ARKit/Stray odometry. It can also consume
-QC-approved dense-depth artifacts and can launch or ingest MASt3R-SLAM poses.
+handheld walkthrough or standalone RGB video into inspectable reconstruction
+and scope artifacts. The merged path is strongest for Stray Scanner captures
+that contain RGB video, per-frame LiDAR depth, and ARKit/Stray odometry. The
+top-level `cozmo-ai-v2 pipeline` command also accepts standalone RGB video; that
+path requires external pose/depth dependencies and remains unqualified for
+RGB-only production use.
 
 The core stages are:
 
@@ -49,7 +51,7 @@ a completed external-model run. See Known limitations and Validation status.
 | Local RGB opening models | Optional and local-only when explicitly enabled. The adapters require a local Hugging Face-compatible Grounding DINO directory, an installed sam2 package, a local SAM2 checkpoint, and a package-local SAM2 config. |
 | RoomFormer | Adapter-only. The pipeline reads precomputed RoomFormer SD-TQ JSON; it does not load RoomFormer checkpoints or run RoomFormer. Without JSON, deterministic wall-graph/fallback room extraction is used. Pixel-only hints remain unmeasured until metric mapping/evidence validation. |
 | Accuracy and performance | Not qualified here. No unsupported historical accuracy or runtime figures are part of this guide. Intervals remain uncalibrated until calibration is fit against real ground truth. |
-| RGB-only full reconstruction | Not a merged one-command capability. Standalone RGB tracking is available; full reconstruction needs a pose table, calibration, and usable depth artifact. |
+| RGB-only full reconstruction | Merged as `cozmo-ai-v2 pipeline`: standalone video uses external MASt3R-SLAM or `--slam-poses`, then Metric3D or an approved dense artifact, then reconstruction. It requires the external checkouts/weights or precomputed artifacts and is not accuracy/device-qualified. |
 
 The --no-damage mode is the recommended path for geometry work, privacy-
 sensitive runs, and CPU-only smoke testing. It skips both damage detection and
@@ -74,10 +76,38 @@ cozmo-ai-v2 pipeline /data/recordings-2 --out out/recordings-2 \
   --metric3d-repository /models/Metric3D --no-damage
 ```
 
-Standalone RGB video inputs run MASt3R-SLAM and Metric3D internally. Supply
-`--mast3r-slam-dir`, `--mast3r-python`, and local Metric3D paths; `--intrinsics`
-is optional and otherwise an explicitly labelled uncalibrated pinhole prior is
-used. Every run writes `stage_manifest.json`, including unavailable optional
+Standalone RGB video inputs run the external MASt3R-SLAM checkout unless
+`--slam-poses` supplies a precomputed pose table, then run local Metric3D
+unless an approved dense artifact is supplied, and then run reconstruction.
+Supply `--mast3r-slam-dir` and `--mast3r-python` for the external pose stage,
+plus `--metric3d-repository` and `--metric3d-weights` for local monocular depth
+when those artifacts are not already available. `--intrinsics` is optional;
+without it the orchestrator records and uses an explicitly uncalibrated
+pinhole prior. Metric3D monocular depth is likewise recorded as uncalibrated;
+these dependencies make the path operational, not accuracy-qualified. For
+example:
+
+~~~bash
+# External MASt3R-SLAM, local Metric3D, then reconstruction.
+uv run cozmo-ai-v2 pipeline <recording.mp4> --out <rgb-output> \
+  --mast3r-slam-dir <MAST3R_ROOT> \
+  --mast3r-python <MAST3R_PYTHON> \
+  --metric3d-repository <METRIC3D_ROOT> \
+  --metric3d-weights <METRIC3D_CHECKPOINT> \
+  --no-damage
+
+# Precomputed poses and an approved dense-depth artifact; no live MASt3R or
+# Metric3D stage is needed.
+uv run cozmo-ai-v2 pipeline <recording.mp4> --out <rgb-output> \
+  --slam-poses <POSE_TABLE> \
+  --intrinsics <INTRINSICS> \
+  --dense-depth-dir <dense-output>/dense_depth \
+  --densify-manifest <dense-output>/densify_manifest.json \
+  --depth-source dense \
+  --no-damage
+~~~
+
+Every run writes `stage_manifest.json`, including unavailable optional
 features and required-stage failures. It also writes `ingest_qc.json`,
 `pose_provenance.json`, `result.json`, `floorplan.svg`, `scene.glb`,
 `cloud.ply`, `mesh.ply`, `planes.json`, `fusion_manifest.json`,
@@ -124,11 +154,15 @@ The core Stray/LiDAR geometry path is written to run with the base dependencies
 and does not require an NVIDIA GPU. There is no current CPU performance or RAM
 qualification. The optional stages have different requirements:
 
-- `uv sync --group depth` installs PyTorch and TorchVision. Metric3D can be
-  selected with `--device cpu`, `cuda`, or `mps`; model inference is optional
-  and no device benchmark is promised here.
+- `uv sync --group depth` installs PyTorch and TorchVision. The top-level
+  pipeline selects Metric3D with `--depth-device`; `cozmo-ai-v2 densify` uses
+  `--device`. CPU, CUDA, and MPS may be accepted by those paths, but no device
+  benchmark is promised here.
 - MASt3R-SLAM is an external GPU-oriented checkout. Its official setup asks for
   a matching PyTorch/CUDA installation and checkpoint files.
+- Standalone RGB orchestration requires an external MASt3R-SLAM checkout and
+  Python plus local Metric3D source/weights, unless `--slam-poses` and an
+  approved dense-depth artifact are supplied instead.
 - --rgb-openings defaults to --rgb-device cuda because it loads Grounding DINO
   and SAM2. Passing --rgb-device cpu is accepted by this project, but
   external-model CPU behavior is not validated here.
@@ -226,15 +260,16 @@ sensitive because they can contain derived or encoded capture content.
 
 ## Input tiers and device matrix
 
-The full reconstruction command consumes a directory containing rgb.mp4. The
-top-level prepare and densify commands additionally recognize a Stray Scanner
-folder only when it contains camera_matrix.csv.
+The top-level full reconstruction command accepts either a directory
+containing `rgb.mp4` or a standalone RGB video. The top-level prepare and
+densify commands additionally recognize a Stray Scanner folder only when it
+contains `camera_matrix.csv`.
 
 | Tier | Runner/device expectation | Minimum input for the relevant command | Pose and calibration contract | Depth and scale behavior | Status |
 |---|---|---|---|---|---|
 | Stray / LiDAR + ARKit | `pipeline run` uses base dependencies on CPU; `densify` accepts `cpu`, `cuda`, or `mps`; optional MASt3R uses its external environment. | rgb.mp4, odometry.csv, and non-empty depth/*.png for pipeline run; camera_matrix.csv and non-empty confidence/*.png are also required by cozmo-ai-v2 densify. imu.csv is optional. | odometry.csv contains timestamp,x,y,z,qx,qy,qz,qw,fx,fy,cx,cy columns. Poses are camera-to-world in the measured OpenCV convention; no second ARKit-to-OpenCV flip is applied. | Raw depth PNGs are interpreted as unsigned millimetres and converted to metres. Missing confidence for the core run is treated as high confidence; the densifier requires confidence frames. | Full geometry path; optional refinement, densification, MASt3R pose validation, damage, and openings. |
 | Dense capture / handoff | Consuming an approved artifact needs only the core pipeline; producing it uses `densify --device cpu|cuda|mps`. | rgb.mp4, a pose/calibration source, and a Stage 4 output containing dense_depth/, dense_confidence/, dense_qc/, and densify_manifest.json. Raw depth/ may also be present. | With ARKit, use odometry.csv. With SLAM, use --pose-source slam --slam-poses ... and camera_matrix.csv, intrinsics.yaml, or intrinsics.json as accepted by the loader. SLAM tables are camera-to-world 4x4 poses or x/y/z/quaternion rows. | A dense frame is usable only when its manifest entry is qc_approved and its QC mask, depth unit, and RGB scale are valid. auto falls back to the same index of raw LiDAR; dense rejects rather than silently falling back. Densifier output is millimetres and records scale/shift and registration in the manifest. | Implemented handoff. Dense-only full Track B is not qualified: the current damage keyframe path reads raw ingest frames, while geometry/TSDF consume the frame contract. |
-| RGB-only tracking | `cozmo-ai-v2 run` delegates to the external MASt3R-SLAM environment, whose upstream setup is GPU/CUDA-oriented; CPU behavior is not validated here. | A standalone video file such as recording.mp4 for cozmo-ai-v2 run, plus an installed MASt3R-SLAM checkout. | Standalone MASt3R-SLAM is intentionally launched without --calib; its trajectory remains in MASt3R-SLAM coordinates unless a Stray odometry.csv prior is supplied for post-run alignment. | Tracking alone has no metric scale guarantee. The top-level command writes the external trajectory and pose_provenance.json; it does not write the project's result.json. | Implemented tracking adapter; full RGB-only reconstruction is not a merged one-command path. |
+| RGB-only reconstruction | `cozmo-ai-v2 pipeline` accepts a standalone video and runs external MASt3R-SLAM (or consumes `--slam-poses`), then Metric3D (or an approved dense artifact), then reconstruction. The external model path is GPU/CUDA-oriented; CPU behavior is not validated here. | A standalone video plus an MASt3R-SLAM checkout/Python and local Metric3D repository/weights, or precomputed poses and an approved dense-depth artifact. | `--intrinsics` is optional; otherwise the orchestrator writes an explicitly uncalibrated pinhole prior. Precomputed pose tables must match the decoded video frame count. | When monocular Metric3D depth is used it is recorded as `metric3d_v2_monocular_uncalibrated`; tracking/depth/model accuracy and scale are not qualified. | Merged orchestration path; no successful or qualified RGB-only end-to-end result is claimed. |
 
 Raw Stray odometry uses the convention recorded in code as
 camera_to_world_opencv_csv_no_arkit_to_cv_flip. MASt3R trajectory ingestion
@@ -364,6 +399,27 @@ translation maximum over 0.75 m, rotation RMSE over 15 degrees, rotation
 maximum over 45 degrees, or scale divergence over 15%. See
 mast3r_pose_provenance.json for the actual verdict. These are safety gates,
 not measured accuracy claims.
+
+### Run the merged RGB-only reconstruction path
+
+The top-level `pipeline` command composes standalone-video pose preparation,
+depth preparation, and reconstruction. With no `--slam-poses`, it launches
+external MASt3R-SLAM using `--mast3r-slam-dir`, `--mast3r-python`, and the
+optional `--mast3r-config`/`--mast3r-save-as` controls. With `--slam-poses`, it
+validates and uses the supplied pose table instead. It then needs either local
+Metric3D source and weights (`--metric3d-repository` and
+`--metric3d-weights`) or an approved dense artifact supplied with
+`--dense-depth-dir` and `--densify-manifest`. `--intrinsics` is optional; the
+default is explicitly recorded as an uncalibrated pinhole prior.
+
+The exact top-level flags are visible in `uv run cozmo-ai-v2 pipeline --help`.
+Use a fresh output directory. A pose table supplied with `--slam-poses` must
+contain one valid pose for every decoded video frame.
+
+This path is implemented but not qualified: a prior VM validation failed
+safely because the MASt3R trajectory did not span the capture timestamps. Do
+not treat that failure, or the existence of the orchestration path, as a
+successful RGB-only end-to-end result or an accuracy claim.
 
 ### Densify a Stray capture with Metric3D v2
 
@@ -1073,9 +1129,13 @@ diagnostics.warnings, cache/vlm, cache/masks, and the requested flags. Use
 - Dense-only bundles are consumable by the frame contract and geometry/TSDF
   stages, but the current damage keyframe path reads raw ingest depth frames;
   do not present dense-only damage output as validated.
-- Standalone RGB MASt3R-SLAM tracking is implemented, but the merged main does
-  not expose a one-command plain-video-to-result.json workflow. A full run
-  needs compatible pose/calibration/depth artifacts in a capture directory.
+- Standalone RGB orchestration is merged and accepts a plain video, but it
+  depends on the external MASt3R-SLAM/Python and Metric3D repository/weights,
+  unless precomputed poses and approved dense artifacts are supplied. The
+  default intrinsics are an explicitly uncalibrated pinhole prior and
+  monocular depth is uncalibrated. A prior VM validation failed safely because
+  the MASt3R trajectory did not span capture timestamps; no successful or
+  qualified RGB-only end-to-end result is claimed.
 - RoomFormer predictions are imported as hints. Pixel-only or unassociated
   predictions remain unmeasured and cannot change metric geometry.
 - Local RGB opening adapters depend on external package/model compatibility and
@@ -1105,7 +1165,7 @@ checkout; every parser/help command exited 0.
 
 | Status | Command or group | Evidence |
 |---|---|---|
-| [x] | `uv run cozmo-ai-v2 --help`, `prepare --help`, `densify --help`, `validate-scale --help`, `run --help` | Top-level installed CLI help. |
+| [x] | `uv run cozmo-ai-v2 --help`, `prepare --help`, `densify --help`, `validate-scale --help`, `run --help`, `pipeline --help` | Top-level installed CLI help, including the merged orchestration command. |
 | [x] | `uv run python -m cozmo_ai_v2.pipeline --help`, `run --help`, `validate-scale --help` | Reconstruction module parser help. |
 | [x] | `uv run python bench/run.py --help` | Benchmark parser help. |
 | [x] | `uv run python tools/make_report.py --help`, `tools/view_plan.py --help` | Report and floor-plan helper help. |
@@ -1130,15 +1190,6 @@ git diff --check
 The command audit for this README is intentionally help/smoke based; commands
 that would require private captures, credentials, external checkouts, or
 weights are documented but not represented as successful local runs.
-
-## Unmerged orchestration note
-
-An orchestration implementation is present on worker17's pushed branch but is
-not part of origin/main at this audit. Its proposed command is
-cozmo-ai-v2 pipeline ...; it is not a mainline command and must not be used as
-the compatibility contract for this README until the worker's PR lands and the
-command is re-audited. The merged commands above remain the supported operator
-interface.
 
 ## Privacy and security
 
